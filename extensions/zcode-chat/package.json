@@ -1,0 +1,254 @@
+{
+  "name": "zcode-chat",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "version": "0.1.0",
+  "publisher": "zcode",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "enabledApiProposals": [
+    "chatParticipantAdditions",
+    "defaultChatParticipant"
+  ],
+  "icon": "media/icon.png",
+  "categories": [
+    "AI",
+    "Chat",
+    "Other"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "%capability.untrusted%"
+    }
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension",
+  "scripts": {
+    "compile": "gulp compile-extension:zcode-chat",
+    "watch": "gulp watch-extension:zcode-chat"
+  },
+  "contributes": {
+    "configuration": {
+      "title": "%config.title%",
+      "properties": {
+        "zcode.providerMode": {
+          "type": "string",
+          "default": "startPlan",
+          "enum": [
+            "startPlan",
+            "bigmodel"
+          ],
+          "enumDescriptions": [
+            "%config.providerMode.startPlan%",
+            "%config.providerMode.bigmodel%"
+          ],
+          "description": "%config.providerMode%"
+        },
+        "zcode.model": {
+          "type": "string",
+          "default": "GLM-5.3-Flash",
+          "description": "%config.model%"
+        },
+        "zcode.reasoningLevel": {
+          "type": "string",
+          "default": "high",
+          "description": "%config.reasoningLevel%"
+        },
+        "zcode.bridge.mode": {
+          "type": "string",
+          "default": "agent",
+          "enum": [
+            "agent",
+            "stub",
+            "http"
+          ],
+          "enumDescriptions": [
+            "%config.bridge.mode.agent%",
+            "%config.bridge.mode.stub%",
+            "%config.bridge.mode.http%"
+          ],
+          "description": "%config.bridge.mode%"
+        },
+
+        "zcode.bridge.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:4096/api/chat",
+          "description": "%config.bridge.endpoint%"
+        },
+        "zcode.oauth.apiOrigin": {
+          "type": "string",
+          "default": "https://zcode.z.ai",
+          "description": "%config.oauth.apiOrigin%"
+        }
+      }
+    },
+    "authentication": [
+      {
+        "id": "zcode",
+        "label": "ZCode"
+      }
+    ],
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "zcode",
+          "title": "%container.title%",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "zcode": [
+        {
+          "type": "webview",
+          "id": "zcode.chatView",
+          "name": "%view.chat%",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "chatParticipants": [
+      {
+        "id": "zcode.chat",
+        "fullName": "%chat.fullName%",
+        "name": "zcode",
+        "description": "%chat.description%",
+        "isDefault": true,
+        "modes": [
+          "ask",
+          "agent",
+          "edit"
+        ],
+        "commands": [
+          {
+            "name": "provider",
+            "description": "%chat.command.provider%"
+          }
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "zcode.openChat",
+        "title": "%command.openChat%",
+        "category": "%command.category%",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "zcode.newChat",
+        "title": "%command.newChat%",
+        "category": "%command.category%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "zcode.switchProvider",
+        "title": "%command.switchProvider%",
+        "category": "%command.category%",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "zcode.switchModel",
+        "title": "%command.switchModel%",
+        "category": "%command.category%",
+        "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "zcode.switchReasoningLevel",
+        "title": "%command.switchReasoningLevel%",
+        "category": "%command.category%",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "zcode.showBridgeStatus",
+        "title": "%command.showBridgeStatus%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "zcode.manageAccount",
+        "title": "%command.manageAccount%",
+        "category": "%command.category%",
+        "icon": "$(account)"
+      },
+      {
+        "command": "zcode.signIn",
+        "title": "%command.signIn%",
+        "category": "%command.category%",
+        "icon": "$(sign-in)"
+      },
+      {
+        "command": "zcode.signOut",
+        "title": "%command.signOut%",
+        "category": "%command.category%",
+        "icon": "$(sign-out)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "zcode.openChat"
+        },
+        {
+          "command": "zcode.newChat"
+        },
+        {
+          "command": "zcode.switchProvider"
+        },
+        {
+          "command": "zcode.switchModel"
+        },
+        {
+          "command": "zcode.switchReasoningLevel"
+        },
+        {
+          "command": "zcode.showBridgeStatus"
+        },
+        {
+          "command": "zcode.manageAccount"
+        },
+        {
+          "command": "zcode.signIn"
+        },
+        {
+          "command": "zcode.signOut"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "zcode.newChat",
+          "when": "view == zcode.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "zcode.manageAccount",
+          "when": "view == zcode.chatView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "zcode.switchProvider",
+          "when": "view == zcode.chatView",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "zcode.openChat",
+        "key": "ctrl+shift+;",
+        "mac": "cmd+shift+;"
+      }
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "24.x"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/microsoft/vscode.git"
+  }
+}

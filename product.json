@@ -242,6 +242,18 @@
 			"type": "light"
 		}
 	],
+	"extensionEnabledApiProposals": {
+		"zcode.zcode-chat": [
+			"chatParticipantAdditions",
+			"defaultChatParticipant"
+		]
+	},
+	"extensionEnabledApiProposals": {
+		"zcode.zcode-chat": [
+			"chatParticipantAdditions",
+			"defaultChatParticipant"
+		]
+	},
 	"builtInExtensionsEnabledWithAutoUpdates": [
 		"GitHub.copilot-chat"
 	],
