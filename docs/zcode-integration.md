@@ -1,44 +1,55 @@
-# ZCode × VS Code shell
+# ZCode × Cursor × VS Code shell
 
-Product direction: keep this repo as the **editor shell** (Code-OSS) and embed the **ZCode brain** (providers, agent, Start Plan OAuth) via a built-in extension + runtime bridge.
+Product direction: keep this repo as the **editor shell** (Code-OSS) and embed peer AI brains via a built-in extension.
 
 ## Layout
 
 - Left: VS Code editor / explorer
-- Right: Secondary Side Bar → **ZCode** chat (`extensions/zcode-chat`)
+- Right: Secondary Side Bar → **AI Chat** (`extensions/zcode-chat`)
+- Top of the panel: **ZCode | Cursor** (peer brains, not nested providers)
 
-## P0 (shipped)
+## Brains
 
-Built-in extension `extensions/zcode-chat`:
+| Brain | Runtime | Auth |
+|---|---|---|
+| **ZCode** | Local tool loop → BigModel Coding Plan / Start Plan | `~/.zcode/v2/credentials.json` + CLI OAuth poll |
+| **Cursor** | Official Cursor Agent CLI over **ACP** (`agent acp`) | `agent login` or `CURSOR_API_KEY` |
 
-- Webview chat in `secondarySidebar`
-- Provider switch: Start Plan / BigModel (aligned with ZCode)
-- Default chat participant `@zcode`
-- Bridge: `agent` (default) talks to BigModel Coding Plan / Start Plan and edits the workspace via tools; `stub` / `http` still available
-- **Account (bottom-left status bar)**: reuses `~/.zcode/v2/credentials.json` (same encrypted store as ZCode desktop). Fresh login uses ZCode **CLI OAuth polling** (browser → poll), not `zcode://` deep link into Code-OSS.
+ZCode still has sub-providers **Start Plan** / **BigModel**. Cursor has ACP modes **agent** / **plan** / **ask** and optional model id.
 
-See `extensions/zcode-chat/README.md`.
+## Shared history (highest layer)
 
-## Auth model
+`~/.zcode/v2/ide-chat/` is brain-agnostic:
 
-| Path | Behavior |
+- Canonical field: `messages` (`user` / `assistant`) — ZCode and Cursor both continue the same thread
+- Optional: `timeline` / `todos` for rich UI
+- `source` records who last wrote (`zcode` / `cursor`)
+- API: activate `zcode.zcode-chat` → `exports.ideChat` / `exports.sources.cursor`
+
+## File edits
+
+Both brains feed the same `FileEditSession` + workbench `ZCodeChatEditingBridge` (Chat Keep/Undo markers). Cursor ACP writes are tracked via workspace file watchers during a turn.
+
+## Settings
+
+| Setting | Meaning |
 |---|---|
-| Reuse desktop | Decrypt shared `~/.zcode/v2/credentials.json` with ZCode’s machine-local cipher |
-| Sign in | `POST /api/v1/oauth/cli/init` → open browser → poll `/api/v1/oauth/cli/poll/:id` → write tokens back into the shared credentials file |
-| Why not URI callback? | Z.ai/BigModel OAuth apps are registered for `zcode://oauth/callback`; fighting desktop for that scheme is brittle. CLI poll is the supported headless path. |
+| `zcode.activeBrain` | `zcode` \| `cursor` |
+| `zcode.cursor.agentPath` | Path to `agent` (default `~/.local/bin/agent`) |
+| `zcode.cursor.mode` | `agent` \| `plan` \| `ask` |
+| `zcode.cursor.model` | Cursor model id (empty = CLI default) |
+| `zcode.providerMode` | ZCode only: `startPlan` \| `bigmodel` |
 
-## Global IDE chat history
+## P0 shipped
 
-Shared session store (ZCode now; DeepSeek later): `~/.zcode/v2/ide-chat/`.
-
-- Canonical field: `messages` (`user` / `assistant`) — any module can continue the same thread
-- Optional: ZCode `timeline` / `todos` for rich UI
-- API: activate `zcode.zcode-chat` and use `exports.ideChat` (`IdeChatStore`)
+- Peer brain switch in the chat webview
+- Cursor ACP client + progress mapping into the shared timeline
+- Shared global history
+- Working set / editor review decorations for both brains
 
 ## P1+
 
-1. Run ZCode runtime from `/Users/xiang/apps/ZCode` (server / zcode-server-cli) as a sidecar
-2. Point `zcode.bridge.mode=http` at its chat endpoint; bridge already sends JWT when `providerMode=zcode`
-3. Agent file edits / terminal / diff against the shell workspace
-4. Optional product rename / default auxiliary bar visibility
-5. DeepSeek module: same `IdeChatStore` / `messages` for cross-provider continuity
+1. Richer Cursor chrome (input / timeline skins) behind `data-brain="cursor"` hooks
+2. Permission UI instead of auto `allow-once`
+3. ZCode sidecar HTTP runtime
+4. DeepSeek as another peer brain on the same history store

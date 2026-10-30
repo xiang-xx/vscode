@@ -5,6 +5,8 @@
 
 /** Timeline items — subset of ZCode conversation rows (user / reasoning / tools / assistant / work). */
 
+import type { AskUserAnswer, AskUserQuestion } from './askUser';
+
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 
 export interface TodoItem {
@@ -40,6 +42,21 @@ export type ConversationItem =
 		toolName: string;
 		summary: string;
 		status: 'running' | 'done' | 'error';
+		/** Expandable preview (diff / file snippet / list output). */
+		detail?: string;
+		path?: string;
+		uri?: string;
+		added?: number;
+		removed?: number;
+		expanded?: boolean;
+	}
+	| {
+		id: string;
+		kind: 'question';
+		title?: string;
+		questions: AskUserQuestion[];
+		status: 'pending' | 'answered' | 'skipped';
+		answers?: AskUserAnswer[];
 	}
 	| {
 		id: string;
@@ -63,18 +80,86 @@ export function newItemId(prefix: string): string {
 export function toolDisplayName(name: string): string {
 	switch (name) {
 		case 'read_file':
+		case 'Read':
 			return 'Read';
 		case 'write_file':
+		case 'Write':
 			return 'Write';
 		case 'str_replace':
+		case 'Edit':
 			return 'Edit';
+		case 'delete_file':
+		case 'Delete':
+			return 'Delete';
 		case 'list_dir':
 			return 'List';
+		case 'run_terminal_cmd':
+		case 'Bash':
+		case 'bash':
+			return 'Bash';
+		case 'get_diagnostics':
+			return 'Diagnostics';
+		case 'web_fetch':
+		case 'WebFetch':
+			return 'Fetch';
+		case 'grep':
+		case 'Grep':
+			return 'Grep';
+		case 'glob':
+		case 'Glob':
+			return 'Glob';
 		case 'TodoWrite':
 			return 'Todos';
+		case 'AskUserQuestion':
+			return 'Question';
 		default:
 			return name;
 	}
+}
+
+/**
+ * Compact line diff for tool previews. Not a full Myers diff — enough to scan edits inline.
+ */
+export function formatLineDiff(before: string, after: string, maxLines = 80): string {
+	if (before === after) {
+		return '(no textual change)';
+	}
+	const a = before.split(/\r?\n/);
+	const b = after.split(/\r?\n/);
+	let start = 0;
+	while (start < a.length && start < b.length && a[start] === b[start]) {
+		start++;
+	}
+	let endA = a.length - 1;
+	let endB = b.length - 1;
+	while (endA >= start && endB >= start && a[endA] === b[endB]) {
+		endA--;
+		endB--;
+	}
+	const ctx = 2;
+	const from = Math.max(0, start - ctx);
+	const toA = Math.min(a.length - 1, endA + ctx);
+	const toB = Math.min(b.length - 1, endB + ctx);
+	const lines: string[] = [];
+	for (let i = from; i < start; i++) {
+		lines.push(`  ${a[i] ?? ''}`);
+	}
+	for (let i = start; i <= endA; i++) {
+		lines.push(`- ${a[i] ?? ''}`);
+	}
+	for (let i = start; i <= endB; i++) {
+		lines.push(`+ ${b[i] ?? ''}`);
+	}
+	for (let i = endA + 1; i <= toA && i < a.length; i++) {
+		const mirror = endB + 1 + (i - (endA + 1));
+		if (mirror <= toB && b[mirror] === a[i]) {
+			lines.push(`  ${a[i]}`);
+		}
+	}
+	if (lines.length > maxLines) {
+		return `${lines.slice(0, maxLines).join('\n')}\n… (${lines.length - maxLines} more lines)`;
+	}
+	return lines.join('\n') || '(changed)';
 }
 
 /** Match ZCode `formatConversationWorkDuration` style (zh-friendly). */

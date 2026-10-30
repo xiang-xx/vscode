@@ -14,11 +14,14 @@
 	const undoAllBtn = document.getElementById('undoAllBtn');
 	const viewAllBtn = document.getElementById('viewAllBtn');
 	const chipsEl = document.getElementById('chips');
+	const queuePanel = document.getElementById('queuePanel');
+	const queueList = document.getElementById('queueList');
+	const queuePausedBanner = document.getElementById('queuePausedBanner');
+	const queuePausedText = document.getElementById('queuePausedText');
+	const queueResume = document.getElementById('queueResume');
 	const inputEl = document.getElementById('input');
 	const sendBtn = document.getElementById('send');
 	const accountBtn = document.getElementById('account');
-	const historyBtn = document.getElementById('historyBtn');
-	const newChatBtn = document.getElementById('newChatBtn');
 	const historyDrawer = document.getElementById('historyDrawer');
 	const historyList = document.getElementById('historyList');
 	const historyClose = document.getElementById('historyClose');
@@ -29,60 +32,74 @@
 	const providerLabel = document.getElementById('providerLabel');
 	const modelLabel = document.getElementById('modelLabel');
 	const thoughtLabel = document.getElementById('thoughtLabel');
+	const zcodePills = document.getElementById('zcodePills');
+	const cursorPills = document.getElementById('cursorPills');
+	const cursorModeBtn = document.getElementById('cursorModeBtn');
+	const cursorModelBtn = document.getElementById('cursorModelBtn');
+	const cursorModeLabel = document.getElementById('cursorModeLabel');
+	const cursorModelLabel = document.getElementById('cursorModelLabel');
+	const brainZcode = document.getElementById('brainZcode');
+	const brainCursor = document.getElementById('brainCursor');
 	const hintEl = document.getElementById('hint');
+	const scheduleTipEl = document.getElementById('scheduleTip');
 	const plusMenu = document.getElementById('plusMenu');
 	const pickerMenu = document.getElementById('pickerMenu');
 	const composer = document.getElementById('composer');
+	const timelineRoot = document.getElementById('timeline');
+	const contextUsageBtn = document.getElementById('contextUsageBtn');
+	const contextUsagePct = document.getElementById('contextUsagePct');
+	const contextPanel = document.getElementById('contextPanel');
+	const contextPanelSummary = document.getElementById('contextPanelSummary');
+	const contextPanelFill = document.getElementById('contextPanelFill');
+	const contextBreakdown = document.getElementById('contextBreakdown');
+	const contextPanelNote = document.getElementById('contextPanelNote');
 
 	let busy = false;
 	let state = null;
 	let openMenu = null;
 	let historyOpen = false;
+	let contextPanelOpen = false;
+	const CONTEXT_RING_R = 10;
+	const CONTEXT_RING_C = 2 * Math.PI * CONTEXT_RING_R;
+	const BREAKDOWN_LABELS = {
+		messages: '消息',
+		reasoning: '思考',
+		tools: '工具',
+		draft: '输入草稿',
+		system: '系统提示',
+	};
+	const BREAKDOWN_COLORS = [
+		'var(--vscode-charts-blue, #3794ff)',
+		'color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 72%, #fff)',
+		'color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 52%, #fff)',
+		'color-mix(in srgb, var(--vscode-charts-purple, #b180d7) 70%, transparent)',
+		'color-mix(in srgb, var(--vscode-descriptionForeground) 55%, transparent)',
+	];
 	/** @type {Record<string, { top: number, stickBottom: boolean }>} */
 	const reasoningScroll = Object.create(null);
 	/** Stick timeline to bottom unless the user scrolls up. */
 	let timelineStickBottom = true;
 	let workingSetCollapsed = false;
+	/** Local draft selections for pending question cards: askId -> { [qId]: { selected: string[], freeText: string } } */
+	const questionDrafts = Object.create(null);
 
 	function escapeHtml(text) {
-		return String(text)
+		if (window.ZCodeMarkdown && window.ZCodeMarkdown.escapeHtml) {
+			return window.ZCodeMarkdown.escapeHtml(text);
+		}
+		return String(text || '')
 			.replace(/&/g, '&amp;')
 			.replace(/</g, '&lt;')
 			.replace(/>/g, '&gt;')
-			.replace(/"/g, '&quot;');
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
 	}
 
 	function renderMarkdown(text) {
-		const escaped = escapeHtml(text || '');
-		const withCode = escaped.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code}</code></pre>`);
-		const withInline = withCode.replace(/`([^`]+)`/g, '<code>$1</code>');
-		const withBold = withInline.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-		const lines = withBold.split('\n');
-		const out = [];
-		let inList = false;
-		for (const line of lines) {
-			if (/^###\s+/.test(line)) {
-				if (inList) { out.push('</ul>'); inList = false; }
-				out.push(`<h3>${line.replace(/^###\s+/, '')}</h3>`);
-			} else if (/^##\s+/.test(line)) {
-				if (inList) { out.push('</ul>'); inList = false; }
-				out.push(`<h2>${line.replace(/^##\s+/, '')}</h2>`);
-			} else if (/^#\s+/.test(line)) {
-				if (inList) { out.push('</ul>'); inList = false; }
-				out.push(`<h1>${line.replace(/^#\s+/, '')}</h1>`);
-			} else if (/^[-*]\s+/.test(line)) {
-				if (!inList) { out.push('<ul>'); inList = true; }
-				out.push(`<li>${line.replace(/^[-*]\s+/, '')}</li>`);
-			} else if (!line.trim()) {
-				if (inList) { out.push('</ul>'); inList = false; }
-				out.push('<br/>');
-			} else {
-				if (inList) { out.push('</ul>'); inList = false; }
-				out.push(`<p>${line}</p>`);
-			}
+		if (window.ZCodeMarkdown && typeof window.ZCodeMarkdown.render === 'function') {
+			return window.ZCodeMarkdown.render(text);
 		}
-		if (inList) out.push('</ul>');
-		return out.join('');
+		return `<p>${escapeHtml(text).replace(/\n/g, '<br/>')}</p>`;
 	}
 
 	function toolGlyph(status) {
@@ -93,12 +110,210 @@
 
 	function toolTitle(name) {
 		switch (name) {
-			case 'read_file': return 'Read';
-			case 'write_file': return 'Write';
-			case 'str_replace': return 'Edit';
+			case 'read_file':
+			case 'Read': return 'Read';
+			case 'write_file':
+			case 'Write': return 'Write';
+			case 'str_replace':
+			case 'Edit': return 'Edit';
+			case 'delete_file':
+			case 'Delete': return 'Delete';
 			case 'list_dir': return 'List';
+			case 'run_terminal_cmd':
+			case 'Bash':
+			case 'bash': return 'Bash';
+			case 'get_diagnostics': return 'Diagnostics';
+			case 'web_fetch':
+			case 'WebFetch': return 'Fetch';
+			case 'grep':
+			case 'Grep': return 'Grep';
+			case 'glob':
+			case 'Glob': return 'Glob';
 			case 'TodoWrite': return 'Todos';
+			case 'AskUserQuestion': return 'Question';
 			default: return name;
+		}
+	}
+
+	function ensureQuestionDraft(item) {
+		if (!questionDrafts[item.id]) {
+			questionDrafts[item.id] = Object.create(null);
+		}
+		const draft = questionDrafts[item.id];
+		(item.questions || []).forEach((q) => {
+			if (!draft[q.id]) {
+				draft[q.id] = { selected: [], freeText: '' };
+			}
+		});
+		return draft;
+	}
+
+	function renderQuestion(item, host) {
+		const card = document.createElement('div');
+		card.className = 'question-card' + (item.status === 'pending' ? ' pending' : ' settled');
+		card.setAttribute('data-ask-id', item.id);
+
+		const title = document.createElement('div');
+		title.className = 'question-card-title';
+		title.textContent = item.title || (item.status === 'pending' ? '需要你的选择' : '已回答');
+		card.appendChild(title);
+
+		if (item.status !== 'pending') {
+			(item.questions || []).forEach((q) => {
+				const block = document.createElement('div');
+				block.className = 'question-block settled';
+				const prompt = document.createElement('div');
+				prompt.className = 'question-prompt';
+				prompt.textContent = q.header ? `${q.header} · ${q.prompt}` : q.prompt;
+				block.appendChild(prompt);
+				const answer = (item.answers || []).find((a) => a.questionId === q.id);
+				const summary = document.createElement('div');
+				summary.className = 'question-answer-summary';
+				if (!answer) {
+					summary.textContent = item.status === 'skipped' ? '已跳过' : '—';
+				} else {
+					const labels = (answer.selectedOptionIds || [])
+						.map((id) => (q.options || []).find((o) => o.id === id)?.label || id)
+						.filter(Boolean);
+					const free = (answer.freeText || '').trim();
+					summary.textContent = free
+						? (labels.length ? `${labels.join('、')}；其他：${free}` : free)
+						: (labels.join('、') || '—');
+				}
+				block.appendChild(summary);
+				card.appendChild(block);
+			});
+			host.appendChild(card);
+			delete questionDrafts[item.id];
+			return;
+		}
+
+		const draft = ensureQuestionDraft(item);
+		(item.questions || []).forEach((q) => {
+			const block = document.createElement('div');
+			block.className = 'question-block';
+			const prompt = document.createElement('div');
+			prompt.className = 'question-prompt';
+			prompt.textContent = q.header ? `${q.header} · ${q.prompt}` : q.prompt;
+			block.appendChild(prompt);
+
+			const opts = document.createElement('div');
+			opts.className = 'question-options';
+			const qDraft = draft[q.id];
+			(q.options || []).forEach((opt) => {
+				const btn = document.createElement('button');
+				btn.type = 'button';
+				btn.className = 'question-option' + (qDraft.selected.includes(opt.id) ? ' selected' : '');
+				const label = document.createElement('span');
+				label.className = 'option-label';
+				label.textContent = opt.label;
+				btn.appendChild(label);
+				if (opt.description) {
+					const desc = document.createElement('span');
+					desc.className = 'option-desc';
+					desc.textContent = opt.description;
+					btn.appendChild(desc);
+				}
+				btn.onclick = () => {
+					if (q.allowMultiple) {
+						const idx = qDraft.selected.indexOf(opt.id);
+						if (idx >= 0) {
+							qDraft.selected.splice(idx, 1);
+						} else {
+							qDraft.selected.push(opt.id);
+						}
+					} else {
+						qDraft.selected = [opt.id];
+					}
+					syncQuestionCard(card, item);
+				};
+				opts.appendChild(btn);
+			});
+			block.appendChild(opts);
+
+			if (q.allowFreeform) {
+				const free = document.createElement('input');
+				free.type = 'text';
+				free.className = 'question-free';
+				free.placeholder = '其他（可选）';
+				free.value = qDraft.freeText || '';
+				free.addEventListener('input', () => {
+					qDraft.freeText = free.value;
+					syncQuestionCard(card, item);
+				});
+				block.appendChild(free);
+			}
+			card.appendChild(block);
+		});
+
+		const actions = document.createElement('div');
+		actions.className = 'question-actions';
+		const submit = document.createElement('button');
+		submit.type = 'button';
+		submit.className = 'question-submit';
+		submit.textContent = '提交';
+		submit.onclick = () => {
+			const answers = collectQuestionAnswers(item);
+			if (!answers) {
+				return;
+			}
+			vscode.postMessage({ type: 'answerQuestion', id: item.id, answers });
+		};
+		const skip = document.createElement('button');
+		skip.type = 'button';
+		skip.className = 'question-skip';
+		skip.textContent = '跳过';
+		skip.onclick = () => {
+			vscode.postMessage({ type: 'skipQuestion', id: item.id });
+		};
+		actions.appendChild(submit);
+		actions.appendChild(skip);
+		card.appendChild(actions);
+		syncQuestionCard(card, item);
+		host.appendChild(card);
+	}
+
+	function collectQuestionAnswers(item) {
+		const draft = ensureQuestionDraft(item);
+		const answers = [];
+		for (const q of item.questions || []) {
+			const qDraft = draft[q.id] || { selected: [], freeText: '' };
+			const free = (qDraft.freeText || '').trim();
+			if (!qDraft.selected.length && !free) {
+				return null;
+			}
+			answers.push({
+				questionId: q.id,
+				selectedOptionIds: [...qDraft.selected],
+				freeText: free || undefined,
+			});
+		}
+		return answers;
+	}
+
+	function syncQuestionCard(card, item) {
+		const draft = ensureQuestionDraft(item);
+		(item.questions || []).forEach((q) => {
+			const qDraft = draft[q.id];
+			const block = [...card.querySelectorAll('.question-block')].find((el) => {
+				const prompt = el.querySelector('.question-prompt');
+				const expected = q.header ? `${q.header} · ${q.prompt}` : q.prompt;
+				return prompt && prompt.textContent === expected;
+			});
+			if (!block) {
+				return;
+			}
+			block.querySelectorAll('.question-option').forEach((btn, idx) => {
+				const opt = (q.options || [])[idx];
+				if (!opt) {
+					return;
+				}
+				btn.classList.toggle('selected', qDraft.selected.includes(opt.id));
+			});
+		});
+		const submit = card.querySelector('.question-submit');
+		if (submit) {
+			submit.disabled = !collectQuestionAnswers(item);
 		}
 	}
 
@@ -116,12 +331,186 @@
 		providerBtn.setAttribute('aria-expanded', 'false');
 		modelBtn.setAttribute('aria-expanded', 'false');
 		thoughtBtn.setAttribute('aria-expanded', 'false');
+		setContextPanelOpen(false);
+	}
+
+	function formatCompactTokens(value) {
+		if (!Number.isFinite(value) || value < 0) return '0';
+		if (value < 1000) return String(Math.round(value));
+		if (value < 1000000) {
+			const k = value / 1000;
+			return (k >= 100 ? Math.round(k) : Number(k.toFixed(k >= 10 ? 0 : 1))) + 'K';
+		}
+		const m = value / 1000000;
+		return (m >= 10 ? Math.round(m) : Number(m.toFixed(1))) + 'M';
+	}
+
+	function setContextPanelOpen(open) {
+		contextPanelOpen = !!open;
+		if (contextPanel) contextPanel.hidden = !contextPanelOpen;
+		if (contextUsageBtn) {
+			contextUsageBtn.classList.toggle('open', contextPanelOpen);
+			contextUsageBtn.setAttribute('aria-expanded', contextPanelOpen ? 'true' : 'false');
+		}
+	}
+
+	function renderContextUsage(usage) {
+		if (!contextUsageBtn) return;
+		if (!usage || !usage.size || usage.used <= 0) {
+			contextUsageBtn.hidden = true;
+			setContextPanelOpen(false);
+			return;
+		}
+		contextUsageBtn.hidden = false;
+		const percent = Math.min(1, Math.max(0, usage.percent ?? (usage.used / usage.size)));
+		const pctLabel = (percent * 100).toFixed(percent >= 0.1 ? 0 : 1) + '%';
+		const tone = percent >= 0.9 ? 'danger' : percent >= 0.75 ? 'warning' : '';
+		contextUsageBtn.classList.toggle('warning', tone === 'warning');
+		contextUsageBtn.classList.toggle('danger', tone === 'danger');
+		contextUsageBtn.title = `上下文容量 ${formatCompactTokens(usage.used)} / ${formatCompactTokens(usage.size)} (${pctLabel})`;
+		if (contextUsagePct) contextUsagePct.textContent = pctLabel;
+		const arc = contextUsageBtn.querySelector('.ring-arc');
+		if (arc) {
+			arc.setAttribute('stroke-dasharray', String(CONTEXT_RING_C));
+			arc.setAttribute('stroke-dashoffset', String(CONTEXT_RING_C * (1 - percent)));
+		}
+		if (contextPanelSummary) {
+			contextPanelSummary.textContent =
+				`${formatCompactTokens(usage.used)} / ${formatCompactTokens(usage.size)} (${pctLabel})`;
+		}
+		if (contextPanelFill) {
+			contextPanelFill.style.width = `${Math.max(2, percent * 100)}%`;
+			contextPanelFill.classList.toggle('warning', tone === 'warning');
+			contextPanelFill.classList.toggle('danger', tone === 'danger');
+		}
+		if (contextBreakdown) {
+			contextBreakdown.innerHTML = '';
+			(usage.breakdown || []).forEach((row, index) => {
+				const li = document.createElement('li');
+				li.innerHTML = '<span class="swatch"></span><span class="label"></span><span class="value"></span>';
+				li.querySelector('.swatch').style.background =
+					BREAKDOWN_COLORS[Math.min(index, BREAKDOWN_COLORS.length - 1)];
+				li.querySelector('.label').textContent = BREAKDOWN_LABELS[row.source] || row.source;
+				const share = usage.used > 0 ? row.tokens / usage.used : 0;
+				li.querySelector('.value').textContent = `${(share * 100).toFixed(0)}%`;
+				contextBreakdown.appendChild(li);
+			});
+		}
+		if (contextPanelNote) {
+			contextPanelNote.textContent = usage.estimated
+				? '当前为估算值（按会话内容估算 token）。'
+				: '来自模型返回的用量。';
+		}
+	}
+
+	function hasComposerPayload() {
+		return !!(inputEl.value.trim() || (state && state.attachments && state.attachments.length));
+	}
+
+	function updateSendButton() {
+		sendBtn.disabled = false;
+		const queueing = busy && hasComposerPayload();
+		if (queueing) {
+			sendBtn.textContent = '↑';
+			sendBtn.title = '加入队列 (Enter)';
+			sendBtn.setAttribute('aria-label', '加入队列');
+			sendBtn.classList.remove('stopping');
+			sendBtn.classList.add('queueing');
+		} else if (busy) {
+			sendBtn.textContent = '■';
+			sendBtn.title = 'Stop';
+			sendBtn.setAttribute('aria-label', 'Stop');
+			sendBtn.classList.add('stopping');
+			sendBtn.classList.remove('queueing');
+		} else {
+			sendBtn.textContent = '↑';
+			sendBtn.title = 'Send (Enter)';
+			sendBtn.setAttribute('aria-label', 'Send');
+			sendBtn.classList.remove('stopping', 'queueing');
+		}
+		[plusBtn, providerBtn, modelBtn, thoughtBtn, inputEl].forEach((el) => {
+			if (el) el.disabled = false;
+		});
 	}
 
 	function setBusy(next) {
 		busy = next;
-		[sendBtn, plusBtn, providerBtn, modelBtn, thoughtBtn, inputEl].forEach((el) => {
-			el.disabled = next;
+		updateSendButton();
+	}
+
+	function previewQueueText(text) {
+		const line = String(text || '').replace(/\s+/g, ' ').trim();
+		if (line.length <= 80) return line;
+		return line.slice(0, 80) + '…';
+	}
+
+	function renderQueue(queue, paused) {
+		const items = Array.isArray(queue) ? queue : [];
+		if (!queuePanel || !queueList) return;
+		queuePanel.hidden = items.length === 0;
+		if (queuePausedBanner) {
+			queuePausedBanner.hidden = !paused || items.length === 0;
+		}
+		if (queuePausedText) {
+			queuePausedText.textContent = '队列已暂停 — 停止或出错后不会自动发送';
+		}
+		queueList.innerHTML = '';
+		items.forEach((item) => {
+			const li = document.createElement('li');
+			li.className = 'queue-item';
+			li.dataset.id = item.id;
+
+			const textBtn = document.createElement('button');
+			textBtn.type = 'button';
+			textBtn.className = 'queue-item-text';
+			textBtn.title = item.text;
+			textBtn.textContent = previewQueueText(item.text);
+			textBtn.addEventListener('click', () => {
+				vscode.postMessage({ type: 'editQueueItem', id: item.id });
+			});
+
+			const actions = document.createElement('div');
+			actions.className = 'queue-item-actions';
+
+			const sendNow = document.createElement('button');
+			sendNow.type = 'button';
+			sendNow.className = 'queue-item-btn';
+			sendNow.title = '立即发送';
+			sendNow.setAttribute('aria-label', '立即发送');
+			sendNow.textContent = '↑';
+			sendNow.addEventListener('click', (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: 'runQueueItem', id: item.id });
+			});
+
+			const edit = document.createElement('button');
+			edit.type = 'button';
+			edit.className = 'queue-item-btn';
+			edit.title = '编辑';
+			edit.setAttribute('aria-label', '编辑');
+			edit.textContent = '✎';
+			edit.addEventListener('click', (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: 'editQueueItem', id: item.id });
+			});
+
+			const remove = document.createElement('button');
+			remove.type = 'button';
+			remove.className = 'queue-item-btn';
+			remove.title = '移除';
+			remove.setAttribute('aria-label', '移除');
+			remove.textContent = '×';
+			remove.addEventListener('click', (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: 'removeQueueItem', id: item.id });
+			});
+
+			actions.appendChild(sendNow);
+			actions.appendChild(edit);
+			actions.appendChild(remove);
+			li.appendChild(textBtn);
+			li.appendChild(actions);
+			queueList.appendChild(li);
 		});
 	}
 
@@ -221,6 +610,99 @@
 		}
 		row.innerHTML = '<span class="dot"></span><span class="text"></span>';
 		row.querySelector('.text').textContent = text;
+		host.appendChild(row);
+	}
+
+	function renderDiffDetail(container, detail) {
+		const pre = document.createElement('pre');
+		pre.className = 'tool-diff';
+		String(detail || '').split('\n').forEach((line) => {
+			const span = document.createElement('div');
+			span.className = 'diff-line';
+			if (line.startsWith('+') && !line.startsWith('+++')) {
+				span.classList.add('add');
+			} else if (line.startsWith('-') && !line.startsWith('---')) {
+				span.classList.add('del');
+			} else if (line.startsWith('  ')) {
+				span.classList.add('ctx');
+			}
+			span.textContent = line;
+			pre.appendChild(span);
+		});
+		container.appendChild(pre);
+	}
+
+	function renderTool(item, host) {
+		const expandable = !!(item.detail || item.uri);
+		const row = document.createElement('div');
+		row.className = 'tool-row ' + (item.status || '')
+			+ (item.expanded ? ' expanded' : ' collapsed')
+			+ (expandable ? ' expandable' : '');
+
+		const header = document.createElement(expandable ? 'button' : 'div');
+		if (expandable) header.type = 'button';
+		header.className = 'tool-header';
+		const chev = expandable ? (item.expanded ? '▾' : '▸') : '';
+		header.innerHTML =
+			(expandable ? `<span class="chev">${chev}</span>` : '') +
+			'<span class="glyph"></span>' +
+			'<div class="meta"><div class="name"></div><div class="summary"></div></div>' +
+			((item.added || item.removed)
+				? '<span class="tool-stats"><span class="add"></span><span class="del"></span></span>'
+				: '');
+		header.querySelector('.glyph').textContent = toolGlyph(item.status);
+		header.querySelector('.name').textContent = toolTitle(item.toolName);
+		let summaryText = item.summary || '';
+		if (item.path) {
+			summaryText = (item.status === 'done' ? 'completed · ' : '') + item.path;
+		} else if (item.status === 'done' && summaryText) {
+			summaryText = summaryText;
+		}
+		header.querySelector('.summary').textContent = summaryText;
+		const stats = header.querySelector('.tool-stats');
+		if (stats) {
+			stats.querySelector('.add').textContent = item.added ? `+${item.added}` : '';
+			stats.querySelector('.del').textContent = item.removed ? `-${item.removed}` : '';
+		}
+		if (expandable) {
+			header.onclick = () => vscode.postMessage({ type: 'toggleTool', id: item.id });
+		}
+		row.appendChild(header);
+
+		if (item.expanded && (item.detail || item.uri)) {
+			const body = document.createElement('div');
+			body.className = 'tool-detail';
+			if (item.detail) {
+				renderDiffDetail(body, item.detail);
+			} else {
+				const empty = document.createElement('div');
+				empty.className = 'tool-detail-empty';
+				empty.textContent = '暂无预览内容';
+				body.appendChild(empty);
+			}
+			if (item.uri) {
+				const actions = document.createElement('div');
+				actions.className = 'tool-detail-actions';
+				const openDiff = document.createElement('button');
+				openDiff.type = 'button';
+				openDiff.textContent = '打开 Diff';
+				openDiff.onclick = (e) => {
+					e.stopPropagation();
+					vscode.postMessage({ type: 'openFileChange', uri: item.uri, mode: 'diff' });
+				};
+				const openFile = document.createElement('button');
+				openFile.type = 'button';
+				openFile.textContent = '打开文件';
+				openFile.onclick = (e) => {
+					e.stopPropagation();
+					vscode.postMessage({ type: 'openFileChange', uri: item.uri, mode: 'file' });
+				};
+				actions.appendChild(openDiff);
+				actions.appendChild(openFile);
+				body.appendChild(actions);
+			}
+			row.appendChild(body);
+		}
 		host.appendChild(row);
 	}
 
@@ -360,20 +842,22 @@
 				const row = mark(document.createElement('div'), item.id);
 				row.className = 'assistant-row';
 				const body = document.createElement('div');
-				body.className = 'assistant-body' + (item.streaming ? ' streaming' : '');
+				body.className = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
 				body.innerHTML = renderMarkdown(item.text || '');
 				row.appendChild(body);
 				host.appendChild(row);
 				return;
 			}
 			if (item.kind === 'tool') {
-				const row = mark(document.createElement('div'), item.id);
-				row.className = 'tool-row ' + item.status;
-				row.innerHTML = `<span class="glyph"></span><div class="meta"><div class="name"></div><div class="summary"></div></div>`;
-				row.querySelector('.glyph').textContent = toolGlyph(item.status);
-				row.querySelector('.name').textContent = toolTitle(item.toolName);
-				row.querySelector('.summary').textContent = item.summary || '';
-				host.appendChild(row);
+				renderTool(item, host);
+				const last = host.lastElementChild;
+				if (last) mark(last, item.id);
+				return;
+			}
+			if (item.kind === 'question') {
+				renderQuestion(item, host);
+				const last = host.lastElementChild;
+				if (last) mark(last, item.id);
 				return;
 			}
 			if (item.kind === 'status') {
@@ -438,8 +922,29 @@
 
 	function sourceLabel(source) {
 		if (source === 'deepseek') return 'DeepSeek';
+		if (source === 'cursor') return 'Cursor';
 		if (source === 'zcode') return 'ZCode';
 		return source || 'AI';
+	}
+
+	function historyGroupKey(ts) {
+		if (!ts) return '更早';
+		const d = new Date(ts);
+		const now = new Date();
+		const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+		const startYesterday = startToday - 86400000;
+		if (ts >= startToday) return '今天';
+		if (ts >= startYesterday) return '昨天';
+		if (ts >= startToday - 6 * 86400000) return '近 7 天';
+		return '更早';
+	}
+
+	function setHistoryOpen(open, notifyHost) {
+		historyOpen = !!open;
+		renderHistory((state && state.sessions) || []);
+		if (notifyHost !== false) {
+			vscode.postMessage({ type: 'setHistoryOpen', open: historyOpen });
+		}
 	}
 
 	function renderHistory(sessions) {
@@ -453,15 +958,38 @@
 			historyList.appendChild(empty);
 			return;
 		}
+
+		let lastGroup = '';
 		sessions.forEach((s) => {
+			const group = historyGroupKey(s.updatedAt);
+			if (group !== lastGroup) {
+				lastGroup = group;
+				const label = document.createElement('li');
+				label.className = 'history-group-label';
+				label.textContent = group;
+				historyList.appendChild(label);
+			}
+
 			const li = document.createElement('li');
 			const row = document.createElement('div');
 			row.className = 'history-item' + (s.active ? ' active' : '');
-			row.innerHTML = '<button type="button" class="meta"><span class="title"></span><span class="sub"></span></button><button type="button" class="del" title="删除">×</button>';
+			row.innerHTML =
+				'<button type="button" class="meta">' +
+				'<span class="title-row"><span class="title"></span><span class="source-pill"></span></span>' +
+				'<span class="sub"></span>' +
+				'</button>' +
+				'<span class="row-mark" hidden></span>' +
+				'<button type="button" class="del" title="删除">×</button>';
 			row.querySelector('.title').textContent = s.title || '新对话';
-			row.querySelector('.sub').textContent = `${sourceLabel(s.source)} · ${formatTime(s.updatedAt)}`;
+			row.querySelector('.source-pill').textContent = sourceLabel(s.source);
+			row.querySelector('.sub').textContent = formatTime(s.updatedAt);
+			const mark = row.querySelector('.row-mark');
+			if (s.running || s.done) {
+				mark.hidden = false;
+				mark.className = 'row-mark ' + (s.running ? 'running' : 'done');
+			}
 			row.querySelector('.meta').onclick = () => {
-				historyOpen = false;
+				setHistoryOpen(false);
 				vscode.postMessage({ type: 'openSession', sessionId: s.id });
 			};
 			row.querySelector('.del').onclick = (e) => {
@@ -510,7 +1038,7 @@
 				'<span class="insertions-and-deletions"><span class="insertions"></span><span class="deletions"></span></span>' +
 				'<span class="chat-summary-list-icon-actions">' +
 				'<button type="button" class="keep">Keep</button>' +
-				'<button type="button" class="undo">Undo</button>' +
+				'<button type="button" class="undo" title="撤销此文件（需确认）">Undo</button>' +
 				'</span>';
 			li.querySelector('.file-label').textContent = f.relativePath || f.name;
 			li.querySelector('.file-label').title = f.fsPath || f.relativePath;
@@ -532,6 +1060,7 @@
 			const chip = document.createElement('span');
 			chip.className = 'chip';
 			chip.innerHTML = '<span></span><button type="button" title="Remove">×</button>';
+			chip.title = a.title || a.name;
 			chip.querySelector('span').textContent = a.name;
 			chip.querySelector('button').onclick = () =>
 				vscode.postMessage({ type: 'removeAttachment', attachmentId: a.id });
@@ -585,7 +1114,13 @@
 			pickerMenu.appendChild(btn);
 		});
 		pickerMenu.classList.add('open');
-		const map = { provider: providerBtn, model: modelBtn, thought: thoughtBtn };
+		const map = {
+			provider: providerBtn,
+			model: modelBtn,
+			thought: thoughtBtn,
+			cursorMode: cursorModeBtn,
+			cursorModel: cursorModelBtn,
+		};
 		if (map[kind]) map[kind].setAttribute('aria-expanded', 'true');
 	}
 
@@ -594,9 +1129,18 @@
 		inputEl.style.height = Math.min(inputEl.scrollHeight, 180) + 'px';
 	}
 
+	/** Chat stream text size, pushed from the `zcode.chatFontSize` setting. */
+	function applyFontSize(fontSize) {
+		if (typeof fontSize !== 'number' || !Number.isFinite(fontSize) || fontSize <= 0) {
+			return;
+		}
+		document.documentElement.style.setProperty('--zcode-chat-font-size', `${fontSize}px`);
+	}
+
 	function render(next) {
 		const wasBusy = busy;
 		state = next;
+		applyFontSize(next.fontSize);
 		setBusy(!!next.busy);
 		if (next.busy && !wasBusy) {
 			pinTimelineToBottom();
@@ -625,25 +1169,65 @@
 			vscode.postMessage({ type: 'draft', draft: inputEl.value });
 			autosize();
 		}
+		if (next.focusInput) {
+			inputEl.focus();
+		}
+
+		const brain = next.brain || 'zcode';
+		document.body.dataset.brain = brain;
+		if (timelineRoot) timelineRoot.dataset.brain = brain;
+		if (brainZcode) brainZcode.classList.toggle('active', brain === 'zcode');
+		if (brainCursor) brainCursor.classList.toggle('active', brain === 'cursor');
+		if (zcodePills) zcodePills.hidden = brain !== 'zcode';
+		if (cursorPills) cursorPills.hidden = brain !== 'cursor';
 
 		providerLabel.textContent =
 			(next.providers || []).find((p) => p.id === next.provider)?.label || next.provider;
 		modelLabel.textContent = next.model || 'Model';
 		thoughtLabel.textContent = next.reasoningLabel || next.reasoningLevel || 'Thinking';
-		accountBtn.textContent = next.signedIn ? next.accountLabel : 'Sign in';
-		hintEl.textContent =
-			(next.model || '') +
-			' · ' +
-			(next.reasoningLabel || next.reasoningLevel || '') +
-			' · ' +
-			(next.bridgeMode || '');
+		if (cursorModeLabel) {
+			cursorModeLabel.textContent =
+				(next.cursorModes || []).find((m) => m.id === next.cursorMode)?.label || next.cursorMode || 'Agent';
+		}
+		if (cursorModelLabel) {
+			cursorModelLabel.textContent = next.model || 'Default';
+		}
+		if (accountBtn) {
+			accountBtn.textContent = next.signedIn ? next.accountLabel : (brain === 'cursor' ? 'Cursor login' : 'Sign in');
+		}
+		const rootLabel = next.workspaceRoot
+			? String(next.workspaceRoot).split(/[/\\]/).filter(Boolean).slice(-2).join('/')
+			: 'no folder';
+		hintEl.textContent = [
+			brain === 'cursor' ? 'Cursor' : 'ZCode',
+			rootLabel,
+			next.model || (brain === 'cursor' ? 'default model' : ''),
+			brain === 'zcode' ? (next.reasoningLabel || next.reasoningLevel || '') : (next.cursorMode || 'agent'),
+		].filter(Boolean).join(' · ');
 
+		if (scheduleTipEl) {
+			const tip = next.scheduleTip;
+			if (tip && tip.message) {
+				scheduleTipEl.hidden = false;
+				scheduleTipEl.dataset.kind = tip.kind || '';
+				scheduleTipEl.textContent = tip.message;
+			} else {
+				scheduleTipEl.hidden = true;
+				scheduleTipEl.textContent = '';
+				scheduleTipEl.removeAttribute('data-kind');
+			}
+		}
+
+		historyOpen = !!next.historyOpen;
 		renderTimeline(next.items || []);
 		renderTodos(next.todos || []);
 		renderWorkingSet(next.fileChanges || []);
 		renderHistory(next.sessions || []);
 		renderChips(next.attachments);
+		renderQueue(next.queue, !!next.queuePaused);
 		renderPlusMenu(next.plusSections);
+		renderContextUsage(next.contextUsage);
+		updateSendButton();
 
 		if (next.openPlus) {
 			openMenu = 'plus';
@@ -653,9 +1237,12 @@
 	}
 
 	function send() {
-		if (busy) return;
 		const text = inputEl.value;
-		if (!text.trim() && !(state && state.attachments && state.attachments.length)) return;
+		if (busy && !hasComposerPayload()) {
+			vscode.postMessage({ type: 'stop' });
+			return;
+		}
+		if (!hasComposerPayload()) return;
 		closeMenus();
 		pinTimelineToBottom();
 		vscode.postMessage({ type: 'send', text });
@@ -691,25 +1278,53 @@
 			vscode.postMessage({ type: 'setReasoningLevel', reasoningLevel: id }),
 		);
 	});
-	sendBtn.addEventListener('click', send);
-	accountBtn.addEventListener('click', () => vscode.postMessage({ type: 'manageAccount' }));
-	if (historyBtn) {
-		historyBtn.addEventListener('click', () => {
-			historyOpen = !historyOpen;
-			renderHistory((state && state.sessions) || []);
+	if (cursorModeBtn) {
+		cursorModeBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			if (!state) return;
+			openPicker('cursorMode', state.cursorModes || [], state.cursorMode, (id) =>
+				vscode.postMessage({ type: 'setCursorMode', mode: id }),
+			);
 		});
+	}
+	if (cursorModelBtn) {
+		cursorModelBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			if (!state) return;
+			const models = (state.models && state.models.length)
+				? state.models
+				: [{ id: '', label: 'CLI default' }];
+			openPicker('cursorModel', models, state.model || '', (id) =>
+				vscode.postMessage({ type: 'setCursorModel', model: id }),
+			);
+		});
+	}
+	if (brainZcode) {
+		brainZcode.addEventListener('click', () => vscode.postMessage({ type: 'setBrain', brain: 'zcode' }));
+	}
+	if (brainCursor) {
+		brainCursor.addEventListener('click', () => vscode.postMessage({ type: 'setBrain', brain: 'cursor' }));
+	}
+	sendBtn.addEventListener('click', send);
+	if (queueResume) {
+		queueResume.addEventListener('click', () => vscode.postMessage({ type: 'resumeQueue' }));
+	}
+	if (accountBtn) {
+		accountBtn.addEventListener('click', () => vscode.postMessage({ type: 'manageAccount' }));
 	}
 	if (historyClose) {
 		historyClose.addEventListener('click', () => {
-			historyOpen = false;
-			renderHistory((state && state.sessions) || []);
+			setHistoryOpen(false);
 		});
 	}
-	if (newChatBtn) {
-		newChatBtn.addEventListener('click', () => {
-			historyOpen = false;
-			vscode.postMessage({ type: 'newChat' });
+	if (contextUsageBtn) {
+		contextUsageBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			setContextPanelOpen(!contextPanelOpen);
 		});
+	}
+	if (contextPanel) {
+		contextPanel.addEventListener('click', (e) => e.stopPropagation());
 	}
 	if (keepAllBtn) {
 		keepAllBtn.addEventListener('click', () => vscode.postMessage({ type: 'keepFileChanges' }));
@@ -732,6 +1347,7 @@
 	inputEl.addEventListener('keydown', (e) => {
 		if (e.key === 'Escape') {
 			closeMenus();
+			if (historyOpen) setHistoryOpen(false);
 			return;
 		}
 		if (e.key === 'Enter' && !e.shiftKey) {
@@ -741,14 +1357,58 @@
 	});
 	inputEl.addEventListener('input', () => {
 		autosize();
+		updateSendButton();
 		vscode.postMessage({ type: 'draft', draft: inputEl.value });
 	});
+	async function copyCodeBlock(btn) {
+		const block = btn.closest('.codeblock');
+		const codeEl = block && block.querySelector('pre code');
+		if (!codeEl) return;
+		const text = codeEl.innerText.replace(/\n$/, '');
+		try {
+			await navigator.clipboard.writeText(text);
+		} catch {
+			const ta = document.createElement('textarea');
+			ta.value = text;
+			ta.style.position = 'fixed';
+			ta.style.left = '-9999px';
+			document.body.appendChild(ta);
+			ta.select();
+			document.execCommand('copy');
+			ta.remove();
+		}
+		btn.classList.add('copied');
+		const prev = btn.textContent;
+		btn.textContent = '已复制';
+		setTimeout(() => {
+			btn.classList.remove('copied');
+			btn.textContent = prev || '复制';
+		}, 1400);
+	}
+
 	document.addEventListener('click', (e) => {
+		const copyBtn = e.target && e.target.closest && e.target.closest('.codeblock-copy');
+		if (copyBtn) {
+			e.preventDefault();
+			e.stopPropagation();
+			void copyCodeBlock(copyBtn);
+			return;
+		}
 		if (!composer.contains(e.target)) closeMenus();
+		if (historyOpen && historyDrawer && !historyDrawer.contains(e.target)) {
+			setHistoryOpen(false);
+		}
+	});
+	document.addEventListener('keydown', (e) => {
+		if (e.key === 'Escape' && historyOpen) {
+			setHistoryOpen(false);
+		}
 	});
 	window.addEventListener('message', (event) => {
 		const data = event.data;
-		if (data && data.type === 'state') render(data);
+		if (!data) return;
+		if (data.type === 'state') render(data);
+		if (data.type === 'contextUsage') renderContextUsage(data.contextUsage);
 	});
 	vscode.postMessage({ type: 'ready' });
 })();

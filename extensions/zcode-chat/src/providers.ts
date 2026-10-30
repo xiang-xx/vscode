@@ -17,7 +17,7 @@ export const PROVIDER_LABELS: Record<ProviderMode, string> = {
 
 export const PROVIDER_HINTS: Record<ProviderMode, string> = {
 	startPlan: 'Uses your ZCode account JWT (Start Plan quota / discount).',
-	bigmodel: 'Uses your BigModel OAuth session from the shared ZCode credentials.',
+	bigmodel: 'Uses BigModel Coding Plan API key → /api/coding/paas/v4 (not the pay-as-you-go wallet).',
 };
 
 export function isProviderMode(value: unknown): value is ProviderMode {

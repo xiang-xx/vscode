@@ -5,12 +5,16 @@
 
 import * as vscode from 'vscode';
 import { runWorkspaceAgent, type AgentProgressEvent } from './agentRuntime';
+import type { AskUserHandler } from './askUser';
 import { getAuthService } from './authSession';
+import { BRAIN_LABELS, getActiveBrain, getCursorAgentMode, getCursorModel, type ActiveBrain } from './brains';
+import { runCursorAgent } from './cursorAgentRuntime';
+import { getCursorAuthStatus } from './cursorAuth';
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, PROVIDER_HINTS, PROVIDER_LABELS, type ProviderMode } from './providers';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
 
-export type BridgeMode = 'agent' | 'stub' | 'http';
+export type BridgeMode = 'agent' | 'stub' | 'http' | 'cursor-acp';
 
 export interface ChatMessage {
 	role: 'system' | 'user' | 'assistant';
@@ -20,16 +24,19 @@ export interface ChatMessage {
 export interface ChatTurnRequest {
 	messages: ChatMessage[];
 	provider: ProviderMode;
+	brain?: ActiveBrain;
 	model?: string;
 	reasoningLevel?: string;
 	workspaceRoot?: string;
 	onProgress?: (event: AgentProgressEvent) => void;
 	initialTodos?: import('./conversation').TodoItem[];
+	askUser?: AskUserHandler;
 }
 
 export interface ChatTurnResult {
 	content: string;
 	provider: ProviderMode;
+	brain: ActiveBrain;
 	bridgeMode: BridgeMode;
 	stub?: boolean;
 	todos?: import('./conversation').TodoItem[];
@@ -49,6 +56,16 @@ export function getBridgeEndpoint(): string {
 }
 
 export function getBridgeStatusText(): string {
+	const brain = getActiveBrain();
+	if (brain === 'cursor') {
+		return [
+			`Brain: ${BRAIN_LABELS.cursor}`,
+			`Mode: ${getCursorAgentMode()}`,
+			`Model: ${getCursorModel() || '(CLI default)'}`,
+			`Bridge: cursor-acp (agent acp)`,
+			'Auth: Cursor CLI (`agent login` / CURSOR_API_KEY)',
+		].join('\n');
+	}
 	const provider = getProviderMode();
 	const model = getSelectedModelId(provider);
 	const reasoningLevel = getSelectedReasoningLevel(provider, model);
@@ -56,6 +73,7 @@ export function getBridgeStatusText(): string {
 	const endpoint = getBridgeEndpoint();
 	const session = safeSession();
 	return [
+		`Brain: ${BRAIN_LABELS.zcode}`,
 		`Provider: ${PROVIDER_LABELS[provider]} (${provider})`,
 		`Model: ${model} · thinking ${reasoningLevel}`,
 		`Account: ${session ? `${session.accountLabel} (${session.provider})` : 'signed out'}`,
@@ -68,13 +86,17 @@ export function getBridgeStatusText(): string {
 }
 
 /**
- * Default `agent` mode talks to BigModel Coding Plan (or Start Plan JWT) and
- * runs a local tool loop (read/write/str_replace/list_dir) against the workspace.
+ * Routes by top-level brain. ZCode uses BigModel/Start Plan tool loop (or stub/http);
+ * Cursor uses official `agent acp`.
  */
 export async function completeChatTurn(
 	request: ChatTurnRequest,
 	token: vscode.CancellationToken,
 ): Promise<ChatTurnResult> {
+	const brain = request.brain ?? getActiveBrain();
+	if (brain === 'cursor') {
+		return completeViaCursorAcp(request, token);
+	}
 	const bridgeMode = getBridgeMode();
 	if (bridgeMode === 'http') {
 		return completeViaHttp(request, token);
@@ -83,6 +105,29 @@ export async function completeChatTurn(
 		return completeViaStub(request);
 	}
 	return completeViaAgent(request, token);
+}
+
+async function completeViaCursorAcp(
+	request: ChatTurnRequest,
+	token: vscode.CancellationToken,
+): Promise<ChatTurnResult> {
+	const result = await runCursorAgent({
+		messages: request.messages,
+		workspaceRoot: request.workspaceRoot,
+		token,
+		onProgress: request.onProgress,
+		initialTodos: request.initialTodos,
+		mode: getCursorAgentMode(),
+		model: request.model || getCursorModel() || undefined,
+		askUser: request.askUser,
+	});
+	return {
+		content: result.text,
+		provider: request.provider,
+		brain: 'cursor',
+		bridgeMode: 'cursor-acp',
+		todos: result.todos,
+	};
 }
 
 async function completeViaAgent(
@@ -101,10 +146,12 @@ async function completeViaAgent(
 		token,
 		onProgress: request.onProgress,
 		initialTodos: request.initialTodos,
+		askUser: request.askUser,
 	});
 	return {
 		content: result.text,
 		provider,
+		brain: 'zcode',
 		bridgeMode: 'agent',
 		todos: result.todos,
 	};
@@ -134,6 +181,7 @@ async function completeViaStub(request: ChatTurnRequest): Promise<ChatTurnResult
 	return {
 		content,
 		provider,
+		brain: 'zcode',
 		bridgeMode: 'stub',
 		stub: true,
 	};
@@ -193,11 +241,21 @@ async function completeViaHttp(
 		return {
 			content,
 			provider: request.provider,
+			brain: 'zcode',
 			bridgeMode: 'http',
 		};
 	} finally {
 		cancel.dispose();
 	}
+}
+
+/** Async status line for Cursor brain (CLI login). */
+export async function getCursorBrainStatusLine(): Promise<string> {
+	const status = await getCursorAuthStatus();
+	if (status.loggedIn) {
+		return status.email ? `Cursor · ${status.email}` : 'Cursor · signed in';
+	}
+	return 'Cursor · not logged in';
 }
 
 async function resolveHttpApiKey(provider: ProviderMode): Promise<string | undefined> {
@@ -228,6 +286,17 @@ function truncate(text: string, max: number): string {
 	return `${text.slice(0, max)}…`;
 }
 
+/**
+ * Workspace folder the agents should run in: prefer the folder that owns the
+ * active editor, else the first workspace folder. Never prompts for a path.
+ */
 export function workspaceRoot(): string | undefined {
+	const active = vscode.window.activeTextEditor?.document.uri;
+	if (active && (active.scheme === 'file' || active.scheme === 'vscode-remote')) {
+		const folder = vscode.workspace.getWorkspaceFolder(active);
+		if (folder) {
+			return folder.uri.fsPath;
+		}
+	}
 	return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 }

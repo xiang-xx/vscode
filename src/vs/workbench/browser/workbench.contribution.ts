@@ -634,6 +634,16 @@ const registry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Con
 				'description': localize('secondarySideBarForceMaximized', "Controls whether the secondary side bar is enforced to always show maximized on startup and when there are no open editors, in layouts that support a maximized secondary side bar."),
 				agentsWindow: { default: false, readOnly: true },
 			},
+			'zcode.layout.chatPosition': {
+				'type': 'string',
+				'enum': ['center', 'side'],
+				'default': 'center',
+				'description': localize('zcode.layout.chatPosition', "Controls where the AI Chat (secondary side bar) sits relative to the editor."),
+				'enumDescriptions': [
+					localize('zcode.layout.chatPosition.center', "Place Chat between Explorer and the editor (Explorer | Chat | Editor). The bottom panel (terminal) stays under Chat."),
+					localize('zcode.layout.chatPosition.side', "Use the default VS Code side placement (Editor | Chat when the primary side bar is on the left).")
+				]
+			},
 			'workbench.secondarySideBar.showLabels': {
 				'type': 'boolean',
 				'default': true,

@@ -110,3 +110,185 @@
 .monaco-workbench .auxiliarybar.pane-composite-part > .title.has-composite-bar > .title-actions .monaco-action-bar .action-item {
 	max-width: 150px;
 }
+
+/* ZCode AI Chat: session tabs copy the flat editor-group file tabs. */
+.monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title {
+	display: flex !important;
+	align-items: stretch;
+	gap: 0;
+	position: relative;
+	box-sizing: border-box;
+	overflow: hidden;
+	padding: 0;
+	background-color: var(--vscode-editorGroupHeader-tabsBackground);
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .title-label,
+.monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .composite-bar-container {
+	display: none !important;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .zcode-title-tabs-host {
+	order: 0;
+	flex: 1 1 auto;
+	min-width: 0;
+	height: 100%;
+	display: flex;
+	align-items: stretch;
+	justify-content: flex-start;
+	gap: 0;
+	overflow: hidden;
+	padding: 0;
+	-webkit-app-region: no-drag;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .title-actions,
+.monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .global-actions {
+	order: 1;
+	flex: 0 0 auto !important;
+	align-self: center;
+	margin-left: 0;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tabs {
+	display: flex;
+	align-items: stretch;
+	justify-content: flex-start;
+	gap: 0;
+	flex: 1 1 auto;
+	min-width: 0;
+	height: 100%;
+	overflow-x: auto;
+	overflow-y: hidden;
+	scrollbar-width: none;
+	padding: 0;
+	-webkit-app-region: no-drag;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tabs::-webkit-scrollbar {
+	display: none;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-chrome-actions {
+	display: inline-flex;
+	align-items: center;
+	align-self: center;
+	gap: 2px;
+	flex-shrink: 0;
+	height: 100%;
+	padding: 0 4px 0 2px;
+	-webkit-app-region: no-drag;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-chrome-action {
+	appearance: none;
+	border: none;
+	background: transparent;
+	color: var(--vscode-icon-foreground, var(--vscode-foreground));
+	cursor: pointer;
+	width: 22px;
+	height: 22px;
+	border-radius: 5px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0;
+	opacity: 0.85;
+	-webkit-app-region: no-drag;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-chrome-action:hover {
+	opacity: 1;
+	background: var(--vscode-toolbar-hoverBackground);
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab {
+	position: relative;
+	appearance: none;
+	display: flex;
+	align-items: center;
+	align-self: center;
+	gap: 0;
+	min-width: 80px;
+	max-width: fit-content;
+	flex: 1 1 0;
+	height: 26px;
+	margin: 0 2px;
+	padding: 0 2px 0 10px;
+	border: none;
+	border-radius: var(--vscode-cornerRadius-small, 4px);
+	background-color: transparent;
+	color: var(--vscode-tab-inactiveForeground);
+	font-family: inherit;
+	font-size: 13px;
+	font-weight: 400;
+	line-height: 1;
+	cursor: pointer;
+	box-sizing: border-box;
+	box-shadow: none;
+	outline-offset: -2px;
+	-webkit-app-region: no-drag;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab:hover:not(.active) {
+	background-color: var(--vscode-tab-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 6%, transparent));
+	color: var(--vscode-tab-hoverForeground, var(--vscode-tab-inactiveForeground));
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.active {
+	align-self: stretch;
+	height: auto;
+	margin: 4px 2px 0;
+	border-radius: var(--vscode-cornerRadius-medium, 6px) var(--vscode-cornerRadius-medium, 6px) 0 0;
+	background-color: var(--vscode-tab-activeBackground);
+	color: var(--vscode-tab-activeForeground);
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-mark {
+	width: 8px;
+	height: 8px;
+	margin-right: 6px;
+	border-radius: 50%;
+	flex-shrink: 0;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-mark.running {
+	background: var(--vscode-charts-green, #3fb950);
+	box-shadow: 0 0 0 0 color-mix(in srgb, var(--vscode-charts-green, #3fb950) 55%, transparent);
+	animation: zcode-tab-pulse 1.6s ease-out infinite;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-mark.done {
+	background: var(--vscode-charts-blue, #3794ff);
+}
+@keyframes zcode-tab-pulse {
+	0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--vscode-charts-green, #3fb950) 50%, transparent); }
+	70% { box-shadow: 0 0 0 6px transparent; }
+	100% { box-shadow: 0 0 0 0 transparent; }
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-title {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	flex: 1 1 auto;
+	min-width: 0;
+	margin-right: 4px;
+	text-align: left;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-close {
+	border: none;
+	background: transparent;
+	color: inherit;
+	opacity: 0;
+	cursor: pointer;
+	padding: 0;
+	width: 14px;
+	height: 14px;
+	margin-right: 4px;
+	border-radius: 4px;
+	font-size: 12px;
+	line-height: 14px;
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	box-sizing: border-box;
+	-webkit-app-region: no-drag;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-close::before {
+	font-size: 12px;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab:hover .zcode-tab-close,
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.active .zcode-tab-close,
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-close:focus {
+	opacity: 1;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-close:hover {
+	background: var(--vscode-toolbar-hoverBackground);
+}

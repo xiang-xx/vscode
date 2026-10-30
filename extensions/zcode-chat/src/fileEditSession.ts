@@ -16,6 +16,7 @@
 
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { formatLineDiff } from './conversation';
 
 export const ORIGINAL_SCHEME = 'zcode-chat-original';
 
@@ -113,6 +114,87 @@ export class FileEditSession {
 	/** Baseline snapshot for a workspace file URI (for decorations / lenses). */
 	getOriginalForFile(fileUri: vscode.Uri): string | undefined {
 		return this.entries.get(fileUri.toString())?.original ?? this.originals.get(fileUri.toString());
+	}
+
+	/** Inline diff preview for an entry currently in the working set. */
+	async getDiffPreview(uriString: string, maxLines = 80): Promise<{
+		detail: string;
+		path: string;
+		added: number;
+		removed: number;
+	} | undefined> {
+		const entry = this.entries.get(uriString);
+		if (!entry) {
+			return undefined;
+		}
+		let next = entry.original;
+		try {
+			const bytes = await vscode.workspace.fs.readFile(entry.uri);
+			next = Buffer.from(bytes).toString('utf8');
+		} catch {
+			// keep original as fallback
+		}
+		return {
+			detail: formatLineDiff(entry.original, next, maxLines),
+			path: entry.relativePath,
+			added: entry.added,
+			removed: entry.removed,
+		};
+	}
+
+	/**
+	 * Record a file that an external agent (e.g. Cursor ACP) already wrote to disk.
+	 * Does not rewrite content; only seeds review/working-set state.
+	 */
+	async trackExternalWrite(
+		fsPath: string,
+		nextContent: string,
+		root: string,
+		baseline?: string,
+	): Promise<void> {
+		const uri = vscode.Uri.file(fsPath);
+		const key = uri.toString();
+		let kind: FileChangeKind = 'edit';
+		let original = this.entries.get(key)?.original ?? baseline;
+
+		if (original === undefined) {
+			try {
+				original = baseline ?? '';
+				if (baseline === undefined) {
+					const bytes = await vscode.workspace.fs.readFile(uri);
+					// Content already new — cannot recover prior; treat empty as create if missing.
+					original = Buffer.from(bytes).toString('utf8') === nextContent ? nextContent : '';
+					if (original === nextContent) {
+						// Lost the true baseline; skip review noise.
+						return;
+					}
+				}
+				if (original === '') {
+					kind = 'create';
+				}
+			} catch {
+				original = '';
+				kind = 'create';
+			}
+			this.originals.set(key, original);
+		} else if (this.entries.get(key)?.kind === 'create') {
+			kind = 'create';
+		}
+
+		const stats = lineStats(original, nextContent);
+		const relativePath = root ? (path.relative(root, fsPath) || path.basename(fsPath)) : fsPath;
+		this.entries.set(key, {
+			uri,
+			fsPath,
+			relativePath: relativePath.split(path.sep).join('/'),
+			kind,
+			added: stats.added,
+			removed: stats.removed,
+			original,
+		});
+		this.originals.set(key, original);
+		this._onDidChange.fire();
+		await this.applyViaChatEditing(uri, nextContent, original, kind);
 	}
 
 	/**
@@ -216,7 +298,21 @@ export class FileEditSession {
 	}
 
 	async undo(uris?: string[]): Promise<void> {
-		const keys = uris?.length ? uris : [...this.entries.keys()];
+		const keys = (uris?.length ? uris : [...this.entries.keys()]).filter(key => this.entries.has(key));
+		if (!keys.length) {
+			return;
+		}
+		const label = keys.length === 1
+			? (this.entries.get(keys[0])?.relativePath || path.basename(keys[0]))
+			: `${keys.length} 个文件`;
+		const confirmed = await vscode.window.showWarningMessage(
+			`确定撤销对「${label}」的修改？此操作不可恢复。`,
+			{ modal: true },
+			'撤销',
+		);
+		if (confirmed !== '撤销') {
+			return;
+		}
 		for (const key of keys) {
 			const entry = this.entries.get(key);
 			if (!entry) {

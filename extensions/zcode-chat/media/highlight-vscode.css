@@ -1,0 +1,65 @@
+/* Token colors mapped to VS Code theme variables (works in light + dark). */
+.assistant-body.rendered-markdown .hljs {
+	color: var(--vscode-editor-foreground);
+	background: transparent;
+}
+.assistant-body.rendered-markdown .hljs-comment,
+.assistant-body.rendered-markdown .hljs-quote {
+	color: var(--vscode-editorLineNumber-foreground, #6a737d);
+	font-style: italic;
+}
+.assistant-body.rendered-markdown .hljs-keyword,
+.assistant-body.rendered-markdown .hljs-selector-tag,
+.assistant-body.rendered-markdown .hljs-literal,
+.assistant-body.rendered-markdown .hljs-section,
+.assistant-body.rendered-markdown .hljs-link {
+	color: var(--vscode-symbolIcon-keywordForeground, var(--vscode-charts-purple, #d73a49));
+}
+.assistant-body.rendered-markdown .hljs-string,
+.assistant-body.rendered-markdown .hljs-doctag,
+.assistant-body.rendered-markdown .hljs-template-variable,
+.assistant-body.rendered-markdown .hljs-attr {
+	color: var(--vscode-symbolIcon-stringForeground, var(--vscode-charts-orange, #032f62));
+}
+.assistant-body.rendered-markdown .hljs-title,
+.assistant-body.rendered-markdown .hljs-title.function_,
+.assistant-body.rendered-markdown .hljs-title.class_,
+.assistant-body.rendered-markdown .hljs-name,
+.assistant-body.rendered-markdown .hljs-type {
+	color: var(--vscode-symbolIcon-functionForeground, var(--vscode-charts-blue, #6f42c1));
+}
+.assistant-body.rendered-markdown .hljs-number,
+.assistant-body.rendered-markdown .hljs-symbol,
+.assistant-body.rendered-markdown .hljs-bullet {
+	color: var(--vscode-symbolIcon-numberForeground, var(--vscode-charts-green, #005cc5));
+}
+.assistant-body.rendered-markdown .hljs-built_in,
+.assistant-body.rendered-markdown .hljs-builtin-name,
+.assistant-body.rendered-markdown .hljs-meta,
+.assistant-body.rendered-markdown .hljs-meta .hljs-keyword {
+	color: var(--vscode-symbolIcon-variableForeground, var(--vscode-charts-blue, #e36209));
+}
+.assistant-body.rendered-markdown .hljs-variable,
+.assistant-body.rendered-markdown .hljs-params,
+.assistant-body.rendered-markdown .hljs-template-tag {
+	color: var(--vscode-symbolIcon-variableForeground, var(--vscode-foreground));
+}
+.assistant-body.rendered-markdown .hljs-attribute,
+.assistant-body.rendered-markdown .hljs-property {
+	color: var(--vscode-symbolIcon-propertyForeground, var(--vscode-charts-blue, #005cc5));
+}
+.assistant-body.rendered-markdown .hljs-regexp,
+.assistant-body.rendered-markdown .hljs-selector-id,
+.assistant-body.rendered-markdown .hljs-selector-class {
+	color: var(--vscode-charts-red, #d73a49);
+}
+.assistant-body.rendered-markdown .hljs-addition {
+	color: var(--vscode-gitDecoration-addedResourceForeground, #22863a);
+	background: color-mix(in srgb, var(--vscode-gitDecoration-addedResourceForeground, #22863a) 12%, transparent);
+}
+.assistant-body.rendered-markdown .hljs-deletion {
+	color: var(--vscode-gitDecoration-deletedResourceForeground, #b31d28);
+	background: color-mix(in srgb, var(--vscode-gitDecoration-deletedResourceForeground, #b31d28) 12%, transparent);
+}
+.assistant-body.rendered-markdown .hljs-emphasis { font-style: italic; }
+.assistant-body.rendered-markdown .hljs-strong { font-weight: 700; }

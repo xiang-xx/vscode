@@ -467,6 +467,11 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 					this.setAuxiliaryBarMaximized(false);
 				}
 			}
+
+			// ZCode chat center layout: rebuild part order
+			if (e.affectsConfiguration(WorkbenchLayoutSettings.ZCODE_CHAT_POSITION)) {
+				this.adjustPartPositions(this.getSideBarPosition(), this.getPanelAlignment(), this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_POSITION));
+			}
 		}));
 
 		// Fullscreen changes
@@ -2007,10 +2012,14 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 
 		const focusedPart = [Parts.PANEL_PART, Parts.SIDEBAR_PART, Parts.AUXILIARYBAR_PART].find(part => this.hasFocus(part)) as SINGLE_WINDOW_PARTS | undefined;
 
+		const chatInCenter = this.isZcodeChatInCenter();
 		if (sideBarPosition === Position.LEFT) {
 			this.workbenchGrid.moveViewTo(this.activityBarPartView, [2, 0]);
 			this.workbenchGrid.moveView(this.sideBarPartView, preMoveSideBarSize, sideBarSiblingToEditor ? this.editorPartView : this.activityBarPartView, sideBarSiblingToEditor ? Direction.Left : Direction.Right);
-			if (auxiliaryBarSiblingToEditor) {
+			if (chatInCenter) {
+				// Always [sidebar | chat | editor], independent of panel alignment.
+				this.workbenchGrid.moveView(this.auxiliaryBarPartView, preMoveAuxiliaryBarSize, this.editorPartView, Direction.Left);
+			} else if (auxiliaryBarSiblingToEditor) {
 				this.workbenchGrid.moveView(this.auxiliaryBarPartView, preMoveAuxiliaryBarSize, this.editorPartView, Direction.Right);
 			} else {
 				this.workbenchGrid.moveViewTo(this.auxiliaryBarPartView, [2, -1]);
@@ -2037,6 +2046,18 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 			this.workbenchGrid.resizeView(this.panelPartView, {
 				height: preMovePanelHeight as number,
 				width: preMovePanelWidth as number
+			});
+		} else if (chatInCenter && sideBarPosition === Position.LEFT) {
+			// ZCode: terminal stays under Chat (middle column), not under the editor on the right.
+			this.workbenchGrid.moveView(
+				this.panelPartView,
+				preMovePanelHeight,
+				this.auxiliaryBarPartView,
+				panelPosition === Position.BOTTOM ? Direction.Down : Direction.Up,
+			);
+			this.workbenchGrid.resizeView(this.panelPartView, {
+				height: preMovePanelHeight as number,
+				width: this.workbenchGrid.getViewSize(this.auxiliaryBarPartView).width,
 			});
 		}
 
@@ -2463,10 +2484,12 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 
 		const hadFocus = this.hasFocus(Parts.PANEL_PART);
 
+		const chatInCenter = this.isZcodeChatInCenter() && this.isVisible(Parts.AUXILIARYBAR_PART);
+		const horizontalPanelAnchor = chatInCenter ? this.auxiliaryBarPartView : this.editorPartView;
 		if (position === Position.BOTTOM) {
-			this.workbenchGrid.moveView(this.panelPartView, editorHidden ? size.height : this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_LAST_NON_MAXIMIZED_HEIGHT), this.editorPartView, Direction.Down);
+			this.workbenchGrid.moveView(this.panelPartView, editorHidden ? size.height : this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_LAST_NON_MAXIMIZED_HEIGHT), horizontalPanelAnchor, Direction.Down);
 		} else if (position === Position.TOP) {
-			this.workbenchGrid.moveView(this.panelPartView, editorHidden ? size.height : this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_LAST_NON_MAXIMIZED_HEIGHT), this.editorPartView, Direction.Up);
+			this.workbenchGrid.moveView(this.panelPartView, editorHidden ? size.height : this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_LAST_NON_MAXIMIZED_HEIGHT), horizontalPanelAnchor, Direction.Up);
 		} else if (position === Position.RIGHT) {
 			this.workbenchGrid.moveView(this.panelPartView, editorHidden ? size.width : this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_LAST_NON_MAXIMIZED_WIDTH), this.editorPartView, Direction.Right);
 		} else {
@@ -2556,6 +2579,10 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 		this.workbenchGrid.setViewVisible(this.titleBarPartView, shouldShowCustomTitleBar(this.configurationService, mainWindow, this.state.runtime.menuBar.toggled));
 	}
 
+	private isZcodeChatInCenter(): boolean {
+		return this.configurationService.getValue<string>(WorkbenchLayoutSettings.ZCODE_CHAT_POSITION) !== 'side';
+	}
+
 	private arrangeEditorNodes(nodes: { editor: ISerializedNode; sideBar?: ISerializedNode; auxiliaryBar?: ISerializedNode }, availableHeight: number, availableWidth: number): ISerializedNode {
 		if (!nodes.sideBar && !nodes.auxiliaryBar) {
 			nodes.editor.size = availableHeight;
@@ -2564,8 +2591,9 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 
 		const result = [nodes.editor];
 		nodes.editor.size = availableWidth;
+		const sideBarPosition = this.stateModel.getRuntimeValue(LayoutStateKeys.SIDEBAR_POSITON);
 		if (nodes.sideBar) {
-			if (this.stateModel.getRuntimeValue(LayoutStateKeys.SIDEBAR_POSITON) === Position.LEFT) {
+			if (sideBarPosition === Position.LEFT) {
 				result.splice(0, 0, nodes.sideBar);
 			} else {
 				result.push(nodes.sideBar);
@@ -2575,7 +2603,11 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 		}
 
 		if (nodes.auxiliaryBar) {
-			if (this.stateModel.getRuntimeValue(LayoutStateKeys.SIDEBAR_POSITON) === Position.RIGHT) {
+			if (this.isZcodeChatInCenter() && sideBarPosition === Position.LEFT) {
+				// [sidebar | chat | editor]
+				const editorIndex = result.indexOf(nodes.editor);
+				result.splice(editorIndex < 0 ? result.length : editorIndex, 0, nodes.auxiliaryBar);
+			} else if (sideBarPosition === Position.RIGHT) {
 				result.splice(0, 0, nodes.auxiliaryBar);
 			} else {
 				result.push(nodes.auxiliaryBar);
@@ -2612,14 +2644,41 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 			}
 
 			if (sideBarPosition === Position.LEFT) {
-				result.push(nodes.auxiliaryBar);
-				result.splice(0, 0, nodes.sideBar);
-				result.splice(0, 0, nodes.activityBar);
+				if (this.isZcodeChatInCenter()) {
+					// [activity | sidebar | chat | editor]
+					result.splice(0, 0, nodes.auxiliaryBar);
+					result.splice(0, 0, nodes.sideBar);
+					result.splice(0, 0, nodes.activityBar);
+				} else {
+					result.push(nodes.auxiliaryBar);
+					result.splice(0, 0, nodes.sideBar);
+					result.splice(0, 0, nodes.activityBar);
+				}
 			} else {
 				result.splice(0, 0, nodes.auxiliaryBar);
 				result.push(nodes.sideBar);
 				result.push(nodes.activityBar);
 			}
+		} else if (this.isZcodeChatInCenter() && sideBarPosition === Position.LEFT) {
+			// ZCode chat-first: [activity | sidebar | (chat over terminal) | editor]
+			const chatColumnWidth = auxiliaryBarSize;
+			const editorWidth = Math.max(0, availableWidth - activityBarSize - sideBarSize - chatColumnWidth);
+			const stackedPanelSize = this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_HIDDEN) ? 0 : nodes.panel.size;
+
+			nodes.editor.size = editorWidth;
+			nodes.auxiliaryBar.size = Math.max(0, availableHeight - stackedPanelSize);
+
+			const chatColumnData = panelPostion === Position.BOTTOM
+				? [nodes.auxiliaryBar, nodes.panel]
+				: [nodes.panel, nodes.auxiliaryBar];
+			const chatColumn: ISerializedNode = {
+				type: 'branch',
+				data: chatColumnData,
+				size: chatColumnWidth,
+				visible: chatColumnData.some(node => node.visible !== false)
+			};
+
+			result.push(nodes.activityBar, nodes.sideBar, chatColumn, nodes.editor);
 		} else {
 			const panelAlignment = this.stateModel.getRuntimeValue(LayoutStateKeys.PANEL_ALIGNMENT);
 			const sideBarNextToEditor = !(panelAlignment === 'center' || (sideBarPosition === Position.LEFT && panelAlignment === 'right') || (sideBarPosition === Position.RIGHT && panelAlignment === 'left'));
@@ -2924,6 +2983,8 @@ enum WorkbenchLayoutSettings {
 	ZEN_MODE_CONFIG = 'zenMode',
 	EDITOR_CENTERED_LAYOUT_AUTO_RESIZE = 'workbench.editor.centeredLayoutAutoResize',
 	EDITOR_RESTORE_EDITORS = 'workbench.editor.restoreEditors',
+	/** ZCode: put secondary side bar (AI Chat) between primary side bar and editor. */
+	ZCODE_CHAT_POSITION = 'zcode.layout.chatPosition',
 }
 
 enum LegacyWorkbenchLayoutSettings {

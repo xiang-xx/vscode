@@ -37,6 +37,19 @@
     "configuration": {
       "title": "%config.title%",
       "properties": {
+        "zcode.activeBrain": {
+          "type": "string",
+          "default": "zcode",
+          "enum": [
+            "zcode",
+            "cursor"
+          ],
+          "enumDescriptions": [
+            "%config.activeBrain.zcode%",
+            "%config.activeBrain.cursor%"
+          ],
+          "description": "%config.activeBrain%"
+        },
         "zcode.providerMode": {
           "type": "string",
           "default": "startPlan",
@@ -50,6 +63,31 @@
           ],
           "description": "%config.providerMode%"
         },
+        "zcode.cursor.agentPath": {
+          "type": "string",
+          "default": "",
+          "description": "%config.cursor.agentPath%"
+        },
+        "zcode.cursor.mode": {
+          "type": "string",
+          "default": "agent",
+          "enum": [
+            "agent",
+            "plan",
+            "ask"
+          ],
+          "enumDescriptions": [
+            "%config.cursor.mode.agent%",
+            "%config.cursor.mode.plan%",
+            "%config.cursor.mode.ask%"
+          ],
+          "description": "%config.cursor.mode%"
+        },
+        "zcode.cursor.model": {
+          "type": "string",
+          "default": "",
+          "description": "%config.cursor.model%"
+        },
         "zcode.model": {
           "type": "string",
           "default": "GLM-5.3-Flash",
@@ -59,6 +97,13 @@
           "type": "string",
           "default": "high",
           "description": "%config.reasoningLevel%"
+        },
+        "zcode.chatFontSize": {
+          "type": "number",
+          "default": 15,
+          "minimum": 11,
+          "maximum": 24,
+          "description": "%config.chatFontSize%"
         },
         "zcode.bridge.mode": {
           "type": "string",
@@ -94,6 +139,15 @@
         "label": "ZCode"
       }
     ],
+    "configurationDefaults": {
+      "workbench.sideBar.location": "left",
+      "zcode.layout.chatPosition": "center",
+      "workbench.panel.defaultLocation": "bottom",
+      "workbench.secondarySideBar.defaultVisibility": "maximizedInWorkspace",
+      "workbench.secondarySideBar.forceMaximized": true,
+      "workbench.activityBar.location": "default",
+      "workbench.startupEditor": "none"
+    },
     "viewsContainers": {
       "secondarySidebar": [
         {
@@ -119,7 +173,7 @@
         "fullName": "%chat.fullName%",
         "name": "zcode",
         "description": "%chat.description%",
-        "isDefault": true,
+        "isDefault": false,
         "modes": [
           "ask",
           "agent",
@@ -141,10 +195,33 @@
         "icon": "$(sparkle)"
       },
       {
+        "command": "zcode.addSelectionToChat",
+        "title": "%command.addSelectionToChat%",
+        "category": "%command.category%",
+        "icon": "$(add)"
+      },
+      {
         "command": "zcode.newChat",
         "title": "%command.newChat%",
         "category": "%command.category%",
-        "icon": "$(add)"
+        "icon": "$(plus)"
+      },
+      {
+        "command": "zcode.toggleHistory",
+        "title": "%command.toggleHistory%",
+        "category": "%command.category%",
+        "icon": "$(history)"
+      },
+      {
+        "command": "zcode.closeActiveTab",
+        "title": "%command.closeActiveTab%",
+        "category": "%command.category%"
+      },
+      {
+        "command": "zcode.switchBrain",
+        "title": "%command.switchBrain%",
+        "category": "%command.category%",
+        "icon": "$(hubot)"
       },
       {
         "command": "zcode.switchProvider",
@@ -194,7 +271,19 @@
           "command": "zcode.openChat"
         },
         {
+          "command": "zcode.addSelectionToChat"
+        },
+        {
           "command": "zcode.newChat"
+        },
+        {
+          "command": "zcode.toggleHistory"
+        },
+        {
+          "command": "zcode.closeActiveTab"
+        },
+        {
+          "command": "zcode.switchBrain"
         },
         {
           "command": "zcode.switchProvider"
@@ -218,21 +307,28 @@
           "command": "zcode.signOut"
         }
       ],
+      "editor/context": [
+        {
+          "command": "zcode.addSelectionToChat",
+          "when": "editorTextFocus",
+          "group": "navigation@100"
+        }
+      ],
       "view/title": [
         {
-          "command": "zcode.newChat",
+          "command": "zcode.switchBrain",
           "when": "view == zcode.chatView",
-          "group": "navigation@1"
-        },
-        {
-          "command": "zcode.manageAccount",
-          "when": "view == zcode.chatView",
-          "group": "navigation@2"
+          "group": "1_more@1"
         },
         {
           "command": "zcode.switchProvider",
           "when": "view == zcode.chatView",
-          "group": "navigation@3"
+          "group": "1_more@2"
+        },
+        {
+          "command": "zcode.manageAccount",
+          "when": "view == zcode.chatView",
+          "group": "1_more@3"
         }
       ]
     },
@@ -241,6 +337,18 @@
         "command": "zcode.openChat",
         "key": "ctrl+shift+;",
         "mac": "cmd+shift+;"
+      },
+      {
+        "command": "zcode.closeActiveTab",
+        "key": "ctrl+w",
+        "mac": "cmd+w",
+        "when": "focusedView == 'zcode.chatView'"
+      },
+      {
+        "command": "zcode.addSelectionToChat",
+        "key": "ctrl+l",
+        "mac": "cmd+l",
+        "when": "editorTextFocus"
       }
     ]
   },

@@ -7,12 +7,14 @@ import * as vscode from 'vscode';
 import { registerAuthProvider } from './authProvider';
 import { registerAuthStatusBar } from './authStatusBar';
 import { setAuthService, ZCodeAuthService } from './authSession';
+import { BRAIN_LABELS, getActiveBrain } from './brains';
 import { getBridgeStatusText } from './bridge';
 import { registerChatParticipant, switchModelCommand, switchReasoningLevelCommand } from './chatParticipant';
 import { registerChatPanel } from './chatPanel';
 import { EditDecorationController } from './editDecorations';
 import { getFileEditSession, resetFileEditSession } from './fileEditSession';
 import {
+	IDE_CHAT_SOURCE_CURSOR,
 	IDE_CHAT_SOURCE_DEEPSEEK,
 	IDE_CHAT_SOURCE_ZCODE,
 	IdeChatStore,
@@ -65,13 +67,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 	registerChatParticipant(context);
 
 	const providerStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-	providerStatus.command = 'zcode.switchProvider';
+	providerStatus.command = 'zcode.switchBrain';
 	const refreshProviderStatus = () => {
-		const mode = getProviderMode();
-		const model = getSelectedModelId(mode);
-		const thinking = getSelectedReasoningLevel(mode, model);
-		providerStatus.text = `$(sparkle) ${model}`;
-		providerStatus.tooltip = `${PROVIDER_LABELS[mode]} · thinking ${thinking}\n${getBridgeStatusText()}`;
+		const brain = getActiveBrain();
+		if (brain === 'cursor') {
+			providerStatus.text = `$(hubot) Cursor`;
+			providerStatus.tooltip = `${BRAIN_LABELS.cursor}\n${getBridgeStatusText()}`;
+		} else {
+			const mode = getProviderMode();
+			const model = getSelectedModelId(mode);
+			const thinking = getSelectedReasoningLevel(mode, model);
+			providerStatus.text = `$(sparkle) ${model}`;
+			providerStatus.tooltip = `${BRAIN_LABELS.zcode} · ${PROVIDER_LABELS[mode]} · thinking ${thinking}\n${getBridgeStatusText()}`;
+		}
 		providerStatus.show();
 	};
 	refreshProviderStatus();
@@ -93,15 +101,53 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 		vscode.commands.registerCommand('zcode.openChat', async () => {
 			await panel.open();
 		}),
+		vscode.commands.registerCommand('zcode.addSelectionToChat', async () => {
+			await panel.addEditorSelectionToChat();
+		}),
 		vscode.commands.registerCommand('zcode.newChat', async () => {
 			await panel.newChat();
 			await panel.open();
+		}),
+		vscode.commands.registerCommand('zcode.openSession', async (sessionId?: string) => {
+			if (typeof sessionId !== 'string' || !sessionId) {
+				return;
+			}
+			// Do not focus the webview here — title-tab clicks already sit in the
+			// auxiliary bar, and re-focusing steals the first click / feels like a no-op.
+			await panel.openSessionFromTitle(sessionId);
+		}),
+		vscode.commands.registerCommand('zcode.closeTab', async (sessionId?: string) => {
+			if (typeof sessionId !== 'string' || !sessionId) {
+				return;
+			}
+			await panel.closeTabFromTitle(sessionId);
+		}),
+		vscode.commands.registerCommand('zcode.closeActiveTab', async () => {
+			await panel.closeActiveTab();
+		}),
+		vscode.commands.registerCommand('zcode.clearTabDone', async (sessionId?: string) => {
+			if (typeof sessionId !== 'string' || !sessionId) {
+				return;
+			}
+			panel.clearTabDoneFromTitle(sessionId);
+		}),
+		vscode.commands.registerCommand('zcode.toggleHistory', async () => {
+			panel.toggleHistory();
+			await panel.open();
+		}),
+		vscode.commands.registerCommand('zcode.switchBrain', async () => {
+			await panel.switchBrain();
+			refreshProviderStatus();
 		}),
 		vscode.commands.registerCommand('zcode.switchProvider', async () => {
 			await panel.switchProvider();
 			refreshProviderStatus();
 		}),
 		vscode.commands.registerCommand('zcode.switchModel', async () => {
+			if (getActiveBrain() === 'cursor') {
+				await panel.switchBrain();
+				return;
+			}
 			await switchModelCommand();
 			panel.refresh();
 			refreshProviderStatus();
@@ -115,6 +161,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			await vscode.window.showInformationMessage(getBridgeStatusText(), { modal: false });
 		}),
 		vscode.commands.registerCommand('zcode.manageAccount', async () => {
+			if (getActiveBrain() === 'cursor') {
+				await vscode.commands.executeCommand('zcode.showBridgeStatus');
+				return;
+			}
 			await auth.showAccountMenu();
 		}),
 		vscode.commands.registerCommand('zcode.signIn', async () => {
@@ -140,6 +190,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 		ideChat,
 		sources: {
 			zcode: IDE_CHAT_SOURCE_ZCODE,
+			cursor: IDE_CHAT_SOURCE_CURSOR,
 			deepseek: IDE_CHAT_SOURCE_DEEPSEEK,
 		},
 	};

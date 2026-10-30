@@ -22,9 +22,14 @@ import type { ConversationItem, TodoItem } from './conversation';
 
 export const IDE_CHAT_STORE_VERSION = 1;
 export const IDE_CHAT_SOURCE_ZCODE = 'zcode';
+export const IDE_CHAT_SOURCE_CURSOR = 'cursor';
 export const IDE_CHAT_SOURCE_DEEPSEEK = 'deepseek';
 
-export type IdeChatSource = typeof IDE_CHAT_SOURCE_ZCODE | typeof IDE_CHAT_SOURCE_DEEPSEEK | string;
+export type IdeChatSource =
+	| typeof IDE_CHAT_SOURCE_ZCODE
+	| typeof IDE_CHAT_SOURCE_CURSOR
+	| typeof IDE_CHAT_SOURCE_DEEPSEEK
+	| string;
 
 export interface IdeChatMessage {
 	role: 'user' | 'assistant' | 'system';
@@ -53,6 +58,8 @@ export interface IdeChatSession extends IdeChatSessionMeta {
 interface IdeChatIndex {
 	version: number;
 	activeSessionId?: string;
+	/** Recently opened session tabs (Cursor-style); closed tabs stay in history. */
+	openTabIds?: string[];
 	sessions: IdeChatSessionMeta[];
 }
 
@@ -91,6 +98,28 @@ function toMeta(session: IdeChatSession): IdeChatSessionMeta {
 	};
 }
 
+function uniquePreserve(ids: string[]): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const id of ids) {
+		if (seen.has(id)) {
+			continue;
+		}
+		seen.add(id);
+		out.push(id);
+	}
+	return out;
+}
+
+/** Ensure `id` is in the open-tab list without reshuffling existing order. */
+function ensureTabPresent(existing: string[] | undefined, id: string, position: 'front' | 'end' = 'end'): string[] {
+	const tabs = uniquePreserve(existing ?? []);
+	if (tabs.includes(id)) {
+		return tabs;
+	}
+	return position === 'front' ? [id, ...tabs] : [...tabs, id];
+}
+
 export class IdeChatStore {
 	readonly rootDir: string;
 	private readonly indexPath: string;
@@ -122,6 +151,9 @@ export class IdeChatStore {
 			return {
 				version: parsed.version ?? IDE_CHAT_STORE_VERSION,
 				activeSessionId: parsed.activeSessionId,
+				openTabIds: Array.isArray(parsed.openTabIds)
+					? parsed.openTabIds.filter((id): id is string => typeof id === 'string')
+					: undefined,
 				sessions: parsed.sessions,
 			};
 		} catch {
@@ -177,9 +209,10 @@ export class IdeChatStore {
 		return this.getSession(id);
 	}
 
-	async createSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title'>>): Promise<IdeChatSession> {
+	/** In-memory draft only — not written to history until the first real message. */
+	createDraftSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title'>>): IdeChatSession {
 		const now = Date.now();
-		const session: IdeChatSession = {
+		return {
 			id: newId(),
 			title: partial?.title?.trim() || '新对话',
 			createdAt: now,
@@ -192,15 +225,52 @@ export class IdeChatStore {
 			timeline: [],
 			todos: [],
 		};
+	}
+
+	async createSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title'>>): Promise<IdeChatSession> {
+		const session = this.createDraftSession(partial);
 		await this.enqueue(async () => {
 			await this.ensureDirs();
 			await this.writeSessionFile(session);
 			const index = await this.readIndex();
 			index.sessions = [toMeta(session), ...index.sessions.filter(s => s.id !== session.id)];
 			index.activeSessionId = session.id;
+			index.openTabIds = ensureTabPresent(index.openTabIds, session.id, 'end');
 			await this.writeIndex(index);
 		});
 		return session;
+	}
+
+	/** Drop empty sessions that were never used (and clear active if it pointed at one). */
+	async pruneEmptySessions(): Promise<void> {
+		const index = await this.readIndex();
+		const emptyIds: string[] = [];
+		for (const meta of index.sessions) {
+			const session = await this.getSession(meta.id);
+			if (!session || session.messages.length === 0) {
+				emptyIds.push(meta.id);
+			}
+		}
+		if (!emptyIds.length) {
+			return;
+		}
+		await this.enqueue(async () => {
+			const current = await this.readIndex();
+			for (const id of emptyIds) {
+				try {
+					await fs.unlink(this.sessionPath(id));
+				} catch {
+					// missing ok
+				}
+			}
+			const drop = new Set(emptyIds);
+			current.sessions = current.sessions.filter(s => !drop.has(s.id));
+			current.openTabIds = (current.openTabIds ?? []).filter(id => !drop.has(id));
+			if (current.activeSessionId && drop.has(current.activeSessionId)) {
+				current.activeSessionId = current.openTabIds[0] ?? current.sessions[0]?.id;
+			}
+			await this.writeIndex(current);
+		});
 	}
 
 	async setActiveSession(id: string): Promise<IdeChatSession | undefined> {
@@ -211,12 +281,17 @@ export class IdeChatStore {
 		await this.enqueue(async () => {
 			const index = await this.readIndex();
 			index.activeSessionId = id;
+			index.openTabIds = ensureTabPresent(index.openTabIds, id, 'end');
 			await this.writeIndex(index);
 		});
 		return session;
 	}
 
-	async saveSession(session: IdeChatSession): Promise<void> {
+	/**
+	 * Persist a session. `background: true` is for writes that must not reopen a
+	 * closed tab or steal the active marker (flush of a parked / closed session).
+	 */
+	async saveSession(session: IdeChatSession, opts?: { background?: boolean }): Promise<void> {
 		const next: IdeChatSession = {
 			...session,
 			title: titleFromMessages(session.messages) || session.title?.trim() || '新对话',
@@ -228,7 +303,42 @@ export class IdeChatStore {
 			const index = await this.readIndex();
 			const meta = toMeta(next);
 			index.sessions = [meta, ...index.sessions.filter(s => s.id !== next.id)];
-			index.activeSessionId = next.id;
+			if (!opts?.background) {
+				index.activeSessionId = next.id;
+				index.openTabIds = ensureTabPresent(index.openTabIds, next.id, 'end');
+			}
+			await this.writeIndex(index);
+		});
+	}
+
+	async getOpenTabIds(): Promise<string[]> {
+		const index = await this.readIndex();
+		const known = new Set(index.sessions.map(s => s.id));
+		const tabs = (index.openTabIds ?? []).filter(id => known.has(id));
+		if (index.activeSessionId && known.has(index.activeSessionId) && !tabs.includes(index.activeSessionId)) {
+			tabs.push(index.activeSessionId);
+		}
+		return tabs;
+	}
+
+	async setOpenTabIds(ids: string[]): Promise<void> {
+		await this.enqueue(async () => {
+			const index = await this.readIndex();
+			const known = new Set(index.sessions.map(s => s.id));
+			index.openTabIds = uniquePreserve(ids.filter(id => known.has(id)));
+			await this.writeIndex(index);
+		});
+	}
+
+	async closeOpenTab(id: string): Promise<void> {
+		await this.enqueue(async () => {
+			const index = await this.readIndex();
+			index.openTabIds = (index.openTabIds ?? []).filter(tabId => tabId !== id);
+			// getOpenTabIds() force-appends activeSessionId; drop it as well so a
+			// closed tab cannot resurrect itself on the next read.
+			if (index.activeSessionId === id) {
+				index.activeSessionId = index.openTabIds?.[0] ?? index.sessions[0]?.id;
+			}
 			await this.writeIndex(index);
 		});
 	}
@@ -242,8 +352,9 @@ export class IdeChatStore {
 			}
 			const index = await this.readIndex();
 			index.sessions = index.sessions.filter(s => s.id !== id);
+			index.openTabIds = (index.openTabIds ?? []).filter(tabId => tabId !== id);
 			if (index.activeSessionId === id) {
-				index.activeSessionId = index.sessions[0]?.id;
+				index.activeSessionId = index.openTabIds?.[0] ?? index.sessions[0]?.id;
 			}
 			await this.writeIndex(index);
 		});
@@ -274,11 +385,12 @@ export class IdeChatStore {
 	}
 }
 
-/** API surface exported from the zcode-chat extension for DeepSeek / others. */
+/** API surface exported from the zcode-chat extension for DeepSeek / Cursor / others. */
 export interface IdeChatExtensionApi {
 	readonly ideChat: IdeChatStore;
 	readonly sources: {
 		zcode: typeof IDE_CHAT_SOURCE_ZCODE;
+		cursor: typeof IDE_CHAT_SOURCE_CURSOR;
 		deepseek: typeof IDE_CHAT_SOURCE_DEEPSEEK;
 	};
 }
