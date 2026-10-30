@@ -22,19 +22,19 @@ const START_PLAN_MODELS: readonly ZCodeModelOption[] = [
 		id: 'GLM-5.3-Flash',
 		label: 'GLM-5.3-Flash',
 		reasoningLevels: ['low', 'high', 'max'],
-		defaultReasoningLevel: 'high',
+		defaultReasoningLevel: 'low',
 	},
 	{
 		id: 'GLM-5.2',
 		label: 'GLM-5.2',
 		reasoningLevels: ['disabled', 'high', 'max'],
-		defaultReasoningLevel: 'high',
+		defaultReasoningLevel: 'disabled',
 	},
 	{
 		id: 'GLM-5-Turbo',
 		label: 'GLM-5-Turbo',
 		reasoningLevels: ['disabled', 'enabled'],
-		defaultReasoningLevel: 'enabled',
+		defaultReasoningLevel: 'disabled',
 	},
 ];
 
@@ -43,13 +43,13 @@ const BIGMODEL_MODELS: readonly ZCodeModelOption[] = [
 		id: 'GLM-5.3',
 		label: 'GLM-5.3',
 		reasoningLevels: ['low', 'high', 'max'],
-		defaultReasoningLevel: 'high',
+		defaultReasoningLevel: 'low',
 	},
 	{
 		id: 'GLM-5.3-Flash',
 		label: 'GLM-5.3-Flash',
 		reasoningLevels: ['low', 'high', 'max'],
-		defaultReasoningLevel: 'high',
+		defaultReasoningLevel: 'low',
 	},
 ];
 

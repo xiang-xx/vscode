@@ -98,6 +98,14 @@ class TestBrowserViewWorkbenchService implements IBrowserViewWorkbenchService {
 	}
 
 	async clearGlobalStorage(): Promise<void> { }
+	async importChromeBrowserData() {
+		return {
+			success: false,
+			cookies: { imported: 0, skipped: 0, failed: 0 },
+			localStorage: { originsImported: 0, entriesImported: 0, originsSkipped: 0, originsFailed: 0 },
+			error: 'chrome_import_not_supported',
+		};
+	}
 
 	async clearWorkspaceStorage(): Promise<void> { }
 }

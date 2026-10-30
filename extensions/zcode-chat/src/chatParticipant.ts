@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { completeChatTurn, workspaceRoot, type ChatMessage } from './bridge';
+import { buildPromptPreamble } from './promptContext';
 import { getFileEditSession } from './fileEditSession';
 import {
 	ensureModelForProvider,
@@ -59,6 +60,7 @@ export function registerChatParticipant(context: vscode.ExtensionContext): void 
 				model,
 				reasoningLevel,
 				workspaceRoot: root,
+				promptPreamble: buildPromptPreamble(root),
 				onProgress: event => {
 					if (event.type === 'status') {
 						response.progress(event.text);

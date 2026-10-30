@@ -8,7 +8,7 @@ import { VSBuffer } from '../../../../base/common/buffer.js';
 import { CancellationError } from '../../../../base/common/errors.js';
 import { Disposable, DisposableStore, IDisposable } from '../../../../base/common/lifecycle.js';
 import { URI } from '../../../../base/common/uri.js';
-import { IFileService } from '../../../files/common/files.js';
+import { FileOperationError, FileOperationResult, IFileService } from '../../../files/common/files.js';
 import { ILogService } from '../../../log/common/log.js';
 import { IDiffComputeService, IOffsetEdit } from '../../common/diffComputeService.js';
 import { AttributedToolResultFileEditContent, FILE_EDIT_ATTRIBUTION_PROPERTY, IAgentEditAttributionService, IFileEditAttributionMarker } from '../../common/fileEditAttribution.js';
@@ -335,8 +335,14 @@ export class FileEditTracker extends Disposable {
 			const content = await this._fileService.readFile(URI.file(filePath));
 			return { content: content.value, existed: true };
 		} catch (err) {
-			this._logService.trace(`[FileEditTracker] Could not read file for snapshot: ${filePath}`, err);
-			return { content: VSBuffer.fromString(''), existed: false };
+			// Only a confirmed "file not found" means the file did not exist yet;
+			// any other read failure must not look like a create, or the whole file
+			// would be reported as added lines.
+			if (err instanceof FileOperationError && err.fileOperationResult === FileOperationResult.FILE_NOT_FOUND) {
+				return { content: VSBuffer.fromString(''), existed: false };
+			}
+			this._logService.warn(`[FileEditTracker] Could not read file for snapshot: ${filePath}`, err);
+			throw err;
 		}
 	}
 }

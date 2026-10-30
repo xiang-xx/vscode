@@ -7,6 +7,8 @@ import * as vscode from 'vscode';
 import { registerAuthProvider } from './authProvider';
 import { registerAuthStatusBar } from './authStatusBar';
 import { setAuthService, ZCodeAuthService } from './authSession';
+import { disposeBrowserBridge, ensureBrowserBridge } from './browserBridgeHttp';
+import { setBrowserMcpExtensionRoot } from './browserMcp';
 import { BRAIN_LABELS, getActiveBrain } from './brains';
 import { getBridgeStatusText } from './bridge';
 import { registerChatParticipant, switchModelCommand, switchReasoningLevelCommand } from './chatParticipant';
@@ -24,6 +26,10 @@ import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
 
 export async function activate(context: vscode.ExtensionContext): Promise<IdeChatExtensionApi> {
+	setBrowserMcpExtensionRoot(context.extensionPath);
+	void ensureBrowserBridge().catch(() => { /* bridge starts lazily on first Cursor run */ });
+	context.subscriptions.push({ dispose: () => disposeBrowserBridge() });
+
 	const auth = new ZCodeAuthService(context.secrets);
 	setAuthService(auth);
 	registerAuthProvider(context, auth);
@@ -197,5 +203,5 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 }
 
 export function deactivate(): void {
-	// nothing
+	disposeBrowserBridge();
 }

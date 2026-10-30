@@ -20,16 +20,30 @@ export interface AcpSessionUpdate {
 	sessionUpdate?: string;
 	content?: { type?: string; text?: string };
 	toolCallId?: string;
+	/** Human-readable title for this invocation. */
 	title?: string;
+	/** Programmatic tool name (e.g. read_file). */
+	name?: string;
 	status?: string;
 	kind?: string;
 	raw: unknown;
+}
+
+export interface AcpMcpServerConfig {
+	type?: 'stdio' | 'http' | 'sse';
+	name: string;
+	command?: string;
+	args?: string[];
+	env?: Array<{ name: string; value: string }> | Record<string, string>;
+	url?: string;
 }
 
 export interface AcpClientOptions {
 	cwd: string;
 	mode?: CursorAgentMode;
 	model?: string;
+	/** Injected into session/new so Cursor can use IDE browser MCP tools. */
+	mcpServers?: AcpMcpServerConfig[];
 	onUpdate?: (update: AcpSessionUpdate) => void;
 	onPermission?: (params: unknown) => AcpPermissionOutcome | Promise<AcpPermissionOutcome>;
 	onCursorNotification?: (method: string, params: unknown) => void | Promise<void>;
@@ -89,6 +103,8 @@ export class CursorAcpClient {
 		if (this.options.model?.trim()) {
 			spawnArgs.push('--model', this.options.model.trim());
 		}
+		// Auto-approve project MCP (incl. zcode-ide-browser) when the CLI supports it.
+		spawnArgs.push('--approve-mcps');
 		spawnArgs.push('acp');
 
 		try {
@@ -132,9 +148,10 @@ export class CursorAcpClient {
 
 	async newSession(): Promise<string> {
 		const cwd = await assertDirectory(this.options.cwd, 'Cursor ACP cwd');
+		const mcpServers = (this.options.mcpServers ?? []).map(normalizeAcpMcpServer);
 		const result = await this.request('session/new', {
 			cwd,
-			mcpServers: [],
+			mcpServers,
 		}) as { sessionId?: string };
 		if (!result?.sessionId) {
 			throw new Error('ACP session/new did not return sessionId');
@@ -310,6 +327,7 @@ export class CursorAcpClient {
 				content: update.content as AcpSessionUpdate['content'],
 				toolCallId: typeof update.toolCallId === 'string' ? update.toolCallId : undefined,
 				title: typeof update.title === 'string' ? update.title : undefined,
+				name: typeof update.name === 'string' ? update.name : undefined,
 				status: typeof update.status === 'string' ? update.status : undefined,
 				kind: typeof update.kind === 'string' ? update.kind : undefined,
 				raw: update,
@@ -370,4 +388,26 @@ function defaultCursorResponse(method: string): unknown {
 		return { outcome: { outcome: 'accepted' } };
 	}
 	return { outcome: { outcome: 'cancelled' } };
+}
+
+function normalizeAcpMcpServer(server: AcpMcpServerConfig): Record<string, unknown> {
+	const envEntries = Array.isArray(server.env)
+		? server.env
+		: server.env
+			? Object.entries(server.env).map(([name, value]) => ({ name, value: String(value) }))
+			: [];
+	if (server.type === 'http' || server.type === 'sse') {
+		return {
+			type: server.type,
+			name: server.name,
+			url: server.url,
+		};
+	}
+	return {
+		type: 'stdio',
+		name: server.name,
+		command: server.command || '',
+		args: Array.isArray(server.args) ? server.args : [],
+		env: envEntries,
+	};
 }

@@ -65,6 +65,7 @@ import {
 	IBrowserViewNetwork,
 	IBrowserViewSessionOptions,
 	getBrowserViewSessionNetwork,
+	IChromeBrowserDataImportResult,
 } from '../../../../platform/browserView/common/browserView.js';
 import { ITelemetryService } from '../../../../platform/telemetry/common/telemetry.js';
 import { isLocalhostAuthority } from '../../../../platform/url/common/trustedDomains.js';
@@ -446,6 +447,11 @@ export interface IBrowserViewWorkbenchService {
 	 * Clear all storage data for the global browser session
 	 */
 	clearGlobalStorage(): Promise<void>;
+
+	/**
+	 * Import Chrome cookies / LocalStorage into the global browser session.
+	 */
+	importChromeBrowserData(options?: { allowElevatedChromeDecryption?: boolean }): Promise<IChromeBrowserDataImportResult>;
 
 	/**
 	 * Clear all storage data for the current workspace browser session

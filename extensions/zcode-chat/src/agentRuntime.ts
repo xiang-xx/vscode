@@ -15,6 +15,15 @@ import {
 import { getAuthService } from './authSession';
 import type { ChatMessage } from './bridge';
 import { formatLineDiff, type TodoItem, type TodoStatus } from './conversation';
+import {
+	buildPaceSystemLines,
+	buildReasoningRequestFields,
+	exploreNudgeAfterRounds,
+	getAgentPace,
+	isExploreTool,
+	maxToolTurnsForPace,
+	type AgentPace,
+} from './agentPace';
 import { getFileEditSession, type FileChangeKind } from './fileEditSession';
 import {
 	ellipsize,
@@ -24,6 +33,8 @@ import {
 	truncatePreview,
 } from './processUtils';
 import type { ProviderMode } from './providers';
+import { BROWSER_TOOL_DEFS, executeBrowserTool } from './browserTools';
+import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 import { normalizeToolArgs, normalizeToolName } from './toolNormalize';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
 
@@ -37,8 +48,11 @@ const READ_DEFAULT_MAX_LINES = 2_000;
  * @see ZCode config: account:bigmodel-*-coding-plan → /api/coding/paas/v4 (legacy OpenAI path)
  */
 const BIGMODEL_CODING_CHAT_URL = 'https://open.bigmodel.cn/api/coding/paas/v4/chat/completions';
-const START_PLAN_CHAT_URL = 'https://zcode.z.ai/api/v1/zcode-plan/chat/completions';
-const MAX_TOOL_TURNS = 48;
+/** ZCode Start Plan is Anthropic Messages — not OpenAI `/chat/completions` (that path 404s). */
+const START_PLAN_ANTHROPIC_URL = 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages';
+const MAX_TOOL_TURNS_FALLBACK = 96;
+
+type ProviderApiKind = 'openai' | 'anthropic';
 
 interface ToolCall {
 	id: string;
@@ -59,12 +73,13 @@ export type AgentProgressEvent =
 	| { type: 'status'; text: string }
 	| { type: 'reasoning'; text: string; done: boolean }
 	| { type: 'assistant'; text: string; done: boolean }
-	| { type: 'tool_start'; id: string; toolName: string; summary: string }
+	| { type: 'tool_start'; id: string; toolName: string; summary?: string; detail?: string }
+	| { type: 'tool_update'; id: string; summary?: string; detail?: string }
 	| {
 		type: 'tool_end';
 		id: string;
 		toolName: string;
-		summary: string;
+		summary?: string;
 		ok: boolean;
 		detail?: string;
 		path?: string;
@@ -400,7 +415,8 @@ const TOOLS = [
 			},
 		},
 	},
-] as const;
+	...BROWSER_TOOL_DEFS,
+];
 
 export async function runWorkspaceAgent(options: {
 	messages: ChatMessage[];
@@ -412,38 +428,52 @@ export async function runWorkspaceAgent(options: {
 	onProgress?: (event: AgentProgressEvent) => void;
 	initialTodos?: TodoItem[];
 	askUser?: AskUserHandler;
+	sessionAwareness?: SessionAwareness;
+	agentPace?: AgentPace;
+	/** Personal instructions, project AGENTS.md, and skill names. */
+	promptPreamble?: string;
 }): Promise<{ text: string; todos: TodoItem[] }> {
 	const root = options.workspaceRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 	if (!root) {
 		throw new Error('Open a folder/workspace first so the agent can edit files.');
 	}
 
+	const pace = options.agentPace ?? getAgentPace();
+	const maxToolTurns = maxToolTurnsForPace(pace) || MAX_TOOL_TURNS_FALLBACK;
+	const exploreNudgeAt = exploreNudgeAfterRounds(pace);
 	const emit = (event: AgentProgressEvent) => options.onProgress?.(event);
-	emit({ type: 'status', text: `${options.model} · ${root}` });
+	emit({ type: 'status', text: `${options.model} · ${pace} · ${root}` });
 
 	let todos = [...(options.initialTodos ?? [])];
 	const auth = await resolveAuth(options.provider);
+	const awareness = formatSessionAwareness(options.sessionAwareness);
+	const readFileState = new Map<string, { mtimeMs: number; size: number }>();
+	let exploreOnlyRounds = 0;
+	let exploreNudgeSent = false;
 	const apiMessages: ChatCompletionMessage[] = [
 		{
 			role: 'system',
 			content: [
 				'You are ZCode agent inside a VS Code fork (same tool philosophy as ZCode CLI).',
 				`Workspace root: ${root}`,
-				'Tools: read_file, write_file, str_replace, delete_file, list_dir, grep, glob, run_terminal_cmd, get_diagnostics, web_fetch, TodoWrite, AskUserQuestion.',
-				'ZCode CLI names also work (Read/Write/Edit/Bash/Grep/Glob/WebFetch). Prefer grep/glob before reading broadly.',
-				'Prefer str_replace for small edits; set replace_all when renaming a symbol across a file. Always Read before Edit when unsure of exact text.',
+				'Tools: read_file, write_file, str_replace, delete_file, list_dir, grep, glob, run_terminal_cmd, get_diagnostics, web_fetch, open_browser_page, browser_list_pages, browser_read_page, browser_click, browser_type, browser_hover, browser_screenshot, browser_navigate, browser_import_chrome_data, TodoWrite, AskUserQuestion.',
+				'ZCode CLI names also work (Read/Write/Edit/Bash/Grep/Glob/WebFetch).',
+				'Prefer str_replace for small edits; set replace_all when renaming a symbol across a file. Read a file before editing when you lack exact text.',
 				'Use run_terminal_cmd (Bash) for git/tests/builds — not for reading files. Use get_diagnostics after substantive edits.',
-				'For multi-step tasks, call TodoWrite first and keep it updated (one in_progress item).',
+				'Browser: always use the integrated Browser tools (open_browser_page → keep pageId → browser_read_page → browser_click/browser_type). Do not open an external browser. Sync Chrome login with browser_import_chrome_data only after asking the user.',
 				'When blocked on a user decision, call AskUserQuestion and wait for their choices before continuing.',
 				'After finishing, briefly summarize what you changed in plain language.',
 				'Do not dump raw tool logs or reasoning in the final answer; the UI shows those separately.',
+				...buildPaceSystemLines(pace),
 				`Thinking intensity preference: ${options.reasoningLevel}.`,
-			].join('\n'),
+				awareness,
+				options.promptPreamble,
+			].filter(Boolean).join('\n'),
 		},
 		...options.messages.map(m => ({ role: m.role, content: m.content }) as ChatCompletionMessage),
 	];
 
-	for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+	for (let turn = 0; turn < maxToolTurns; turn++) {
 		if (options.token.isCancellationRequested) {
 			throw new vscode.CancellationError();
 		}
@@ -451,10 +481,10 @@ export async function runWorkspaceAgent(options: {
 		emit({ type: 'status', text: turn === 0 ? 'Thinking…' : 'Continuing…' });
 
 		// Once near the cap, nudge the model to wrap up (only once).
-		if (turn === MAX_TOOL_TURNS - 3) {
+		if (turn === maxToolTurns - 3) {
 			apiMessages.push({
 				role: 'user',
-				content: `You are near the tool-turn limit (${turn + 1}/${MAX_TOOL_TURNS}). Finish remaining critical edits if any, then reply with a brief final summary and do not call more tools.`,
+				content: `You are near the tool-turn limit (${turn + 1}/${maxToolTurns}). Finish remaining critical edits if any, then reply with a brief final summary and do not call more tools.`,
 			});
 		}
 
@@ -463,7 +493,9 @@ export async function runWorkspaceAgent(options: {
 			choice = await streamOrCompleteChat({
 				url: auth.url,
 				apiKey: auth.apiKey,
+				api: auth.api,
 				model: options.model,
+				reasoningLevel: options.reasoningLevel,
 				messages: apiMessages,
 				token: options.token,
 				onReasoning: text => emit({ type: 'reasoning', text, done: false }),
@@ -495,8 +527,17 @@ export async function runWorkspaceAgent(options: {
 			return { text, todos };
 		}
 
-		// Content alongside tool_calls is not the final answer — keep it out of the timeline
-		// so the conclusion stays below tools when the loop finishes.
+		// Text already streamed stays in the timeline. Tool rows are appended after it,
+		// and the next round starts a new assistant segment.
+
+		const roundNames = toolCalls.map(call => normalizeToolName(call.function.name));
+		const roundIsExploreOnly = roundNames.length > 0
+			&& roundNames.every(name => isExploreTool(name) || name === 'TodoWrite');
+		if (roundIsExploreOnly) {
+			exploreOnlyRounds += 1;
+		} else {
+			exploreOnlyRounds = 0;
+		}
 
 		for (const call of toolCalls) {
 			if (options.token.isCancellationRequested) {
@@ -509,6 +550,7 @@ export async function runWorkspaceAgent(options: {
 				id: call.id,
 				toolName,
 				summary: preview,
+				detail: describeToolInvocation(toolName, call.function.arguments),
 			});
 
 			let result: ToolExecResult;
@@ -525,15 +567,19 @@ export async function runWorkspaceAgent(options: {
 					options.token,
 				);
 			} else {
-				result = await executeTool(toolName, call.function.arguments, root, change => {
-					emit({
-						type: 'file_change',
-						uri: change.uri.toString(),
-						path: change.path,
-						kind: change.kind,
-						added: change.added,
-						removed: change.removed,
-					});
+				result = await executeTool(toolName, call.function.arguments, root, {
+					sessionId: options.sessionAwareness?.sessionId,
+					readFileState,
+					onFileChange: change => {
+						emit({
+							type: 'file_change',
+							uri: change.uri.toString(),
+							path: change.path,
+							kind: change.kind,
+							added: change.added,
+							removed: change.removed,
+						});
+					},
 				});
 			}
 
@@ -555,6 +601,14 @@ export async function runWorkspaceAgent(options: {
 				tool_call_id: call.id,
 				name: toolName,
 				content: result.content,
+			});
+		}
+
+		if (!exploreNudgeSent && exploreOnlyRounds >= exploreNudgeAt) {
+			exploreNudgeSent = true;
+			apiMessages.push({
+				role: 'user',
+				content: 'Stop exploring. You have enough context — apply the code changes with write_file/str_replace now (or say what single fact is still blocking you).',
 			});
 		}
 	}
@@ -618,6 +672,30 @@ function normalizeTodoStatus(value: unknown): TodoStatus | undefined {
 	return undefined;
 }
 
+/** Full command or arguments shown when a running tool row is expanded. */
+function describeToolInvocation(name: string, argsJson: string): string | undefined {
+	try {
+		const args = JSON.parse(argsJson || '{}') as Record<string, unknown>;
+		if (name === 'run_terminal_cmd') {
+			const command = typeof args.command === 'string' ? args.command.trim() : '';
+			if (!command) {
+				return undefined;
+			}
+			const cwd = typeof args.cwd === 'string' ? args.cwd.trim() : '';
+			return cwd ? `$ ${command}\n# cwd: ${cwd}` : `$ ${command}`;
+		}
+		if (name === 'web_fetch') {
+			const url = typeof args.url === 'string' ? args.url.trim() : '';
+			return url || undefined;
+		}
+		const text = JSON.stringify(args, null, 2);
+		return text && text !== '{}' ? text : undefined;
+	} catch {
+		const raw = argsJson.trim();
+		return raw || undefined;
+	}
+}
+
 function previewToolArgs(name: string, argsJson: string): string {
 	try {
 		const args = JSON.parse(argsJson || '{}') as Record<string, unknown>;
@@ -658,6 +736,19 @@ function previewToolArgs(name: string, argsJson: string): string {
 		if (name === 'delete_file') {
 			const p = typeof args.path === 'string' ? args.path : '';
 			return p ? `delete ${p}` : 'delete';
+		}
+		if (name === 'open_browser_page' || name === 'browser_navigate') {
+			const url = typeof args.url === 'string' ? args.url : '';
+			return url ? `browser ${ellipsize(url, 80)}` : 'browser';
+		}
+		if (name === 'browser_click' || name === 'browser_type' || name === 'browser_hover') {
+			const el = typeof args.element === 'string' ? args.element
+				: typeof args.ref === 'string' ? args.ref
+					: typeof args.selector === 'string' ? args.selector : '';
+			return el ? `${name.replace(/_/g, ' ')} ${ellipsize(el, 48)}` : name.replace(/_/g, ' ');
+		}
+		if (name.startsWith('browser_')) {
+			return name.replace(/_/g, ' ');
 		}
 		const p = typeof args.path === 'string' ? args.path : '';
 		return p ? `${name} ${p}` : name;
@@ -710,12 +801,12 @@ async function executeAskUserQuestion(
 	};
 }
 
-async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKey: string }> {
+async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKey: string; api: ProviderApiKind }> {
 	if (provider === 'startPlan') {
 		try {
 			const jwt = getAuthService().getSession()?.zcodeJwtToken?.trim();
 			if (jwt) {
-				return { url: START_PLAN_CHAT_URL, apiKey: jwt };
+				return { url: START_PLAN_ANTHROPIC_URL, apiKey: jwt, api: 'anthropic' };
 			}
 		} catch {
 			// ignore
@@ -727,7 +818,7 @@ async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKe
 
 	const codingKey = await loadCodingPlanApiKey('bigmodel');
 	if (codingKey) {
-		return { url: BIGMODEL_CODING_CHAT_URL, apiKey: codingKey };
+		return { url: BIGMODEL_CODING_CHAT_URL, apiKey: codingKey, api: 'openai' };
 	}
 
 	throw new Error(
@@ -750,7 +841,121 @@ function annotateProviderError(message: string, provider: ProviderMode): Error {
 	);
 }
 
-async function streamOrCompleteChat(options: {
+function toAnthropicTools(): Array<{ name: string; description: string; input_schema: Record<string, unknown> }> {
+	return TOOLS.map(tool => ({
+		name: tool.function.name,
+		description: tool.function.description,
+		input_schema: tool.function.parameters as Record<string, unknown>,
+	}));
+}
+
+function toAnthropicPayload(messages: ChatCompletionMessage[]): {
+	system: string;
+	messages: Array<{ role: 'user' | 'assistant'; content: unknown }>;
+} {
+	const systemParts: string[] = [];
+	const out: Array<{ role: 'user' | 'assistant'; content: unknown }> = [];
+
+	const pushUser = (content: unknown) => {
+		const last = out[out.length - 1];
+		if (last?.role === 'user' && Array.isArray(last.content) && Array.isArray(content)) {
+			last.content = [...last.content, ...content];
+			return;
+		}
+		out.push({ role: 'user', content });
+	};
+
+	for (const message of messages) {
+		if (message.role === 'system') {
+			if (typeof message.content === 'string' && message.content.trim()) {
+				systemParts.push(message.content.trim());
+			}
+			continue;
+		}
+		if (message.role === 'user') {
+			pushUser(message.content ?? '');
+			continue;
+		}
+		if (message.role === 'assistant') {
+			const blocks: Array<Record<string, unknown>> = [];
+			if (typeof message.content === 'string' && message.content) {
+				blocks.push({ type: 'text', text: message.content });
+			}
+			for (const call of message.tool_calls ?? []) {
+				let input: unknown = {};
+				try {
+					input = JSON.parse(call.function.arguments || '{}');
+				} catch {
+					input = { raw: call.function.arguments };
+				}
+				blocks.push({
+					type: 'tool_use',
+					id: call.id,
+					name: call.function.name,
+					input,
+				});
+			}
+			out.push({ role: 'assistant', content: blocks.length ? blocks : '' });
+			continue;
+		}
+		if (message.role === 'tool') {
+			pushUser([{
+				type: 'tool_result',
+				tool_use_id: message.tool_call_id,
+				content: message.content ?? '',
+			}]);
+		}
+	}
+
+	// Anthropic requires the conversation to start with a user turn.
+	if (out.length && out[0].role !== 'user') {
+		out.unshift({ role: 'user', content: '(continue)' });
+	}
+
+	return { system: systemParts.join('\n\n'), messages: out };
+}
+
+function anthropicHeaders(apiKey: string): Record<string, string> {
+	return {
+		'Content-Type': 'application/json',
+		Authorization: `Bearer ${apiKey}`,
+		'anthropic-version': '2023-06-01',
+		'x-api-key': apiKey,
+	};
+}
+
+function parseAnthropicContent(content: unknown): { text: string; tool_calls?: ToolCall[] } {
+	if (typeof content === 'string') {
+		return { text: content };
+	}
+	if (!Array.isArray(content)) {
+		return { text: '' };
+	}
+	let text = '';
+	const toolCalls: ToolCall[] = [];
+	for (const block of content) {
+		if (!block || typeof block !== 'object') {
+			continue;
+		}
+		const row = block as Record<string, unknown>;
+		if (row.type === 'text' && typeof row.text === 'string') {
+			text += row.text;
+		}
+		if (row.type === 'tool_use' && typeof row.id === 'string' && typeof row.name === 'string') {
+			toolCalls.push({
+				id: row.id,
+				type: 'function',
+				function: {
+					name: row.name,
+					arguments: JSON.stringify(row.input ?? {}),
+				},
+			});
+		}
+	}
+	return { text, tool_calls: toolCalls.length ? toolCalls : undefined };
+}
+
+async function completeAnthropicMessages(options: {
 	url: string;
 	apiKey: string;
 	model: string;
@@ -759,6 +964,192 @@ async function streamOrCompleteChat(options: {
 	onReasoning: (text: string) => void;
 	onAssistant: (text: string) => void;
 }): Promise<{ content: string; reasoning: string; tool_calls?: ToolCall[] }> {
+	const { system, messages } = toAnthropicPayload(options.messages);
+	const controller = new AbortController();
+	const cancel = options.token.onCancellationRequested(() => controller.abort());
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			headers: anthropicHeaders(options.apiKey),
+			body: JSON.stringify({
+				model: options.model,
+				max_tokens: 16_384,
+				system: system || undefined,
+				messages,
+				tools: toAnthropicTools(),
+				stream: false,
+			}),
+			signal: controller.signal,
+		});
+		const raw = await response.text();
+		let data: { content?: unknown; error?: { message?: string }; msg?: string };
+		try {
+			data = JSON.parse(raw) as typeof data;
+		} catch {
+			throw new Error(`Provider returned non-JSON (${response.status}): ${raw.slice(0, 300)}`);
+		}
+		if (!response.ok) {
+			throw new Error(data.error?.message || data.msg || `HTTP ${response.status}: ${raw.slice(0, 300)}`);
+		}
+		const parsed = parseAnthropicContent(data.content);
+		if (parsed.text && !(parsed.tool_calls && parsed.tool_calls.length)) {
+			options.onAssistant(parsed.text);
+		}
+		return { content: parsed.text, reasoning: '', tool_calls: parsed.tool_calls };
+	} finally {
+		cancel.dispose();
+	}
+}
+
+async function streamAnthropicMessages(options: {
+	url: string;
+	apiKey: string;
+	model: string;
+	messages: ChatCompletionMessage[];
+	token: vscode.CancellationToken;
+	onReasoning: (text: string) => void;
+	onAssistant: (text: string) => void;
+}): Promise<{ content: string; reasoning: string; tool_calls?: ToolCall[] }> {
+	const { system, messages } = toAnthropicPayload(options.messages);
+	const controller = new AbortController();
+	const cancel = options.token.onCancellationRequested(() => controller.abort());
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			headers: {
+				...anthropicHeaders(options.apiKey),
+				Accept: 'text/event-stream',
+			},
+			body: JSON.stringify({
+				model: options.model,
+				max_tokens: 16_384,
+				system: system || undefined,
+				messages,
+				tools: toAnthropicTools(),
+				stream: true,
+			}),
+			signal: controller.signal,
+		});
+		if (!response.ok || !response.body) {
+			const raw = await response.text().catch(() => '');
+			throw new Error(`Stream HTTP ${response.status}: ${raw.slice(0, 300)}`);
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = '';
+		let content = '';
+		const toolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+		let lastContentEmit = 0;
+		let currentToolIndex = -1;
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			const parts = buffer.split('\n');
+			buffer = parts.pop() ?? '';
+
+			for (const line of parts) {
+				const trimmed = line.trim();
+				if (!trimmed.startsWith('data:')) {
+					continue;
+				}
+				const payload = trimmed.slice(5).trim();
+				if (!payload || payload === '[DONE]') {
+					continue;
+				}
+				let json: {
+					type?: string;
+					index?: number;
+					content_block?: { type?: string; id?: string; name?: string; text?: string };
+					delta?: { type?: string; text?: string; partial_json?: string };
+					error?: { message?: string };
+				};
+				try {
+					json = JSON.parse(payload) as typeof json;
+				} catch {
+					continue;
+				}
+				if (json.error?.message) {
+					throw new Error(json.error.message);
+				}
+				if (json.type === 'content_block_start' && json.content_block?.type === 'tool_use') {
+					currentToolIndex += 1;
+					toolCalls.set(currentToolIndex, {
+						id: json.content_block.id || `tool_${currentToolIndex}`,
+						name: json.content_block.name || '',
+						arguments: '',
+					});
+					continue;
+				}
+				if (json.type === 'content_block_delta') {
+					if (json.delta?.type === 'text_delta' && typeof json.delta.text === 'string') {
+						content += json.delta.text;
+						if (toolCalls.size === 0) {
+							const now = Date.now();
+							if (now - lastContentEmit > 80) {
+								options.onAssistant(content);
+								lastContentEmit = now;
+							}
+						}
+					}
+					if (json.delta?.type === 'input_json_delta' && typeof json.delta.partial_json === 'string') {
+						const index = typeof json.index === 'number' ? json.index : currentToolIndex;
+						const existing = toolCalls.get(index);
+						if (existing) {
+							existing.arguments += json.delta.partial_json;
+							toolCalls.set(index, existing);
+						}
+					}
+				}
+			}
+		}
+
+		if (content && toolCalls.size === 0) {
+			options.onAssistant(content);
+		}
+		const calls = [...toolCalls.values()]
+			.filter(call => call.name)
+			.map(call => ({
+				id: call.id,
+				type: 'function' as const,
+				function: { name: call.name, arguments: call.arguments || '{}' },
+			}));
+		return {
+			content,
+			reasoning: '',
+			tool_calls: calls.length ? calls : undefined,
+		};
+	} finally {
+		cancel.dispose();
+	}
+}
+
+async function streamOrCompleteChat(options: {
+	url: string;
+	apiKey: string;
+	api: ProviderApiKind;
+	model: string;
+	reasoningLevel: string;
+	messages: ChatCompletionMessage[];
+	token: vscode.CancellationToken;
+	onReasoning: (text: string) => void;
+	onAssistant: (text: string) => void;
+}): Promise<{ content: string; reasoning: string; tool_calls?: ToolCall[] }> {
+	if (options.api === 'anthropic') {
+		try {
+			return await streamAnthropicMessages(options);
+		} catch (error) {
+			if (options.token.isCancellationRequested) {
+				throw error;
+			}
+			return completeAnthropicMessages(options);
+		}
+	}
+
 	try {
 		return await streamChatCompletions(options);
 	} catch (error) {
@@ -804,6 +1195,7 @@ async function completeChatCompletions(options: {
 	url: string;
 	apiKey: string;
 	model: string;
+	reasoningLevel: string;
 	messages: ChatCompletionMessage[];
 	token: vscode.CancellationToken;
 }): Promise<{
@@ -827,6 +1219,7 @@ async function completeChatCompletions(options: {
 				tools: TOOLS,
 				tool_choice: 'auto',
 				stream: false,
+				...buildReasoningRequestFields(options.reasoningLevel),
 			}),
 			signal: controller.signal,
 		});
@@ -858,6 +1251,7 @@ async function streamChatCompletions(options: {
 	url: string;
 	apiKey: string;
 	model: string;
+	reasoningLevel: string;
 	messages: ChatCompletionMessage[];
 	token: vscode.CancellationToken;
 	onReasoning: (text: string) => void;
@@ -879,6 +1273,7 @@ async function streamChatCompletions(options: {
 				tools: TOOLS,
 				tool_choice: 'auto',
 				stream: true,
+				...buildReasoningRequestFields(options.reasoningLevel),
 			}),
 			signal: controller.signal,
 		});
@@ -1041,11 +1436,68 @@ interface ToolExecResult {
 	removed?: number;
 }
 
+interface ToolExecContext {
+	sessionId?: string;
+	readFileState?: Map<string, { mtimeMs: number; size: number }>;
+	onFileChange?: FileChangeReporter;
+}
+
+async function rememberReadState(
+	filePath: string,
+	readFileState: Map<string, { mtimeMs: number; size: number }> | undefined,
+): Promise<void> {
+	if (!readFileState) {
+		return;
+	}
+	try {
+		const st = await fs.stat(filePath);
+		readFileState.set(filePath, { mtimeMs: st.mtimeMs, size: st.size });
+	} catch {
+		readFileState.delete(filePath);
+	}
+}
+
+async function assertWritableFresh(
+	filePath: string,
+	pathLabel: string,
+	sessionId: string | undefined,
+	readFileState: Map<string, { mtimeMs: number; size: number }> | undefined,
+): Promise<ToolExecResult | undefined> {
+	const edits = getFileEditSession();
+	const owner = edits.ownerOf(filePath);
+	if (owner && sessionId && owner !== sessionId) {
+		return {
+			summary: `write blocked ${pathLabel}`,
+			content: `Error: write_file_conflict — another chat session (${owner}) already has pending edits on ${pathLabel}. Do not overwrite; work on a different file or ask the user.`,
+			path: pathLabel,
+			uri: vscode.Uri.file(filePath).toString(),
+		};
+	}
+	const prior = readFileState?.get(filePath);
+	if (!prior) {
+		return undefined;
+	}
+	try {
+		const st = await fs.stat(filePath);
+		if (st.mtimeMs !== prior.mtimeMs || st.size !== prior.size) {
+			return {
+				summary: `stale ${pathLabel}`,
+				content: `Error: write_file_stale — File has been modified since read (by the user, another session, or a tool). Read ${pathLabel} again before writing.`,
+				path: pathLabel,
+				uri: vscode.Uri.file(filePath).toString(),
+			};
+		}
+	} catch {
+		// File may be a create path; allow write.
+	}
+	return undefined;
+}
+
 async function executeTool(
 	rawName: string,
 	argsJson: string,
 	root: string,
-	onFileChange?: FileChangeReporter,
+	ctx?: ToolExecContext,
 ): Promise<ToolExecResult> {
 	const name = normalizeToolName(rawName);
 	let args: Record<string, unknown> = {};
@@ -1056,17 +1508,25 @@ async function executeTool(
 	}
 
 	const edits = getFileEditSession();
+	const onFileChange = ctx?.onFileChange;
+	const sessionId = ctx?.sessionId;
+	const readFileState = ctx?.readFileState;
 
 	try {
 		switch (name) {
 			case 'read_file': {
 				const filePath = resolvePath(String(args.path ?? ''), root);
 				const text = await fs.readFile(filePath, 'utf8');
+				await rememberReadState(filePath, readFileState);
 				const pathLabel = rel(filePath, root);
+				const peerOwner = edits.ownerOf(filePath);
+				const peerNote = peerOwner && sessionId && peerOwner !== sessionId
+					? `\n\n<system-reminder>Pending edits on this file belong to another chat session (${peerOwner}). Prefer not to write it unless the user explicitly asks.</system-reminder>`
+					: '';
 				if (!text) {
 					return {
 						summary: `read ${pathLabel} (empty)`,
-						content: `<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>`,
+						content: `<system-reminder>Warning: the file exists but the contents are empty.</system-reminder>${peerNote}`,
 						path: pathLabel,
 						uri: vscode.Uri.file(filePath).toString(),
 					};
@@ -1084,7 +1544,7 @@ async function executeTool(
 					summary: sliced.rangeLabel
 						? `read ${pathLabel} ${sliced.rangeLabel}`
 						: `read ${pathLabel} (${text.length} chars)`,
-					content: clipped,
+					content: `${clipped}${peerNote}`,
 					detail: clipped.length > 12_000 ? `${clipped.slice(0, 12_000)}\n…(preview)` : clipped,
 					path: pathLabel,
 					uri: vscode.Uri.file(filePath).toString(),
@@ -1092,6 +1552,11 @@ async function executeTool(
 			}
 			case 'write_file': {
 				const filePath = resolvePath(String(args.path ?? ''), root);
+				const pathLabel = rel(filePath, root);
+				const blocked = await assertWritableFresh(filePath, pathLabel, sessionId, readFileState);
+				if (blocked) {
+					return blocked;
+				}
 				const content = String(args.content ?? '');
 				let before = '';
 				try {
@@ -1099,8 +1564,8 @@ async function executeTool(
 				} catch {
 					before = '';
 				}
-				const applied = await edits.writeFile(filePath, content, root);
-				const pathLabel = rel(filePath, root);
+				const applied = await edits.writeFile(filePath, content, root, sessionId);
+				await rememberReadState(filePath, readFileState);
 				onFileChange?.({
 					uri: applied.uri,
 					path: pathLabel,
@@ -1120,6 +1585,11 @@ async function executeTool(
 			}
 			case 'str_replace': {
 				const filePath = resolvePath(String(args.path ?? ''), root);
+				const pathLabel = rel(filePath, root);
+				const blocked = await assertWritableFresh(filePath, pathLabel, sessionId, readFileState);
+				if (blocked) {
+					return blocked;
+				}
 				const oldString = String(args.old_string ?? '');
 				const newString = String(args.new_string ?? '');
 				const replaceAll = args.replace_all === true;
@@ -1129,7 +1599,7 @@ async function executeTool(
 				const text = await fs.readFile(filePath, 'utf8');
 				if (!text.includes(oldString)) {
 					return {
-						summary: `str_replace miss ${rel(filePath, root)}`,
+						summary: `str_replace miss ${pathLabel}`,
 						content: 'Error: old_string not found',
 					};
 				}
@@ -1143,8 +1613,8 @@ async function executeTool(
 					next = text.slice(0, index) + newString + text.slice(index + oldString.length);
 					count = 1;
 				}
-				const applied = await edits.writeFile(filePath, next, root);
-				const pathLabel = rel(filePath, root);
+				const applied = await edits.writeFile(filePath, next, root, sessionId);
+				await rememberReadState(filePath, readFileState);
 				onFileChange?.({
 					uri: applied.uri,
 					path: pathLabel,
@@ -1168,15 +1638,23 @@ async function executeTool(
 				const filePath = resolvePath(String(args.path ?? ''), root);
 				const pathLabel = rel(filePath, root);
 				const uri = vscode.Uri.file(filePath);
+				const blocked = await assertWritableFresh(filePath, pathLabel, sessionId, readFileState);
+				if (blocked) {
+					return {
+						...blocked,
+						summary: `delete blocked ${pathLabel}`,
+						content: blocked.content.replace('write_file_conflict', 'delete_file_conflict').replace('write_file_stale', 'delete_file_stale'),
+					};
+				}
 				try {
 					await fs.access(filePath);
 				} catch {
 					return { summary: `delete miss ${pathLabel}`, content: `Error: file not found: ${pathLabel}` };
 				}
-				await vscode.workspace.fs.delete(uri, { useTrash: true });
+				const removed = await edits.deleteFile(filePath, root, sessionId);
 				onFileChange?.({
-					uri,
-					path: pathLabel,
+					uri: removed.uri,
+					path: removed.path,
 					kind: 'delete',
 					added: 0,
 					removed: 0,
@@ -1211,8 +1689,13 @@ async function executeTool(
 				return executeGrep(args, root);
 			case 'glob':
 				return executeGlob(args, root);
-			default:
+			default: {
+				const browser = await executeBrowserTool(name, args);
+				if (browser) {
+					return browser;
+				}
 				return { summary: `unknown tool ${name}`, content: `Error: unknown tool ${name}` };
+			}
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -1593,24 +2076,29 @@ async function executeShell(
 		result.stderr ? `stderr:\n${result.stderr}` : '',
 		result.timedOut ? '(timed out)' : '',
 	].filter(Boolean);
+	const body = parts.join('\n\n');
+	const detail = `$ ${command}\n\n${body.length > 12_000 ? `${body.slice(0, 12_000)}\n…(truncated)` : body}`;
 	const label = description || command;
 	if (result.timedOut) {
 		return {
 			summary: `shell timed out · ${ellipsize(label, 48)}`,
-			content: truncatePreview(parts.join('\n\n'), 30_000),
+			content: truncatePreview(body, 30_000),
+			detail,
 		};
 	}
 	if (result.code === null && result.stderr) {
 		return {
 			summary: 'shell failed',
 			content: `Error: ${result.stderr}`,
+			detail,
 		};
 	}
 	return {
 		summary: result.code === 0
 			? `shell ok · ${ellipsize(label, 48)}`
 			: `shell exit ${result.code}`,
-		content: truncatePreview(parts.join('\n\n'), 30_000),
+		content: truncatePreview(body, 30_000),
+		detail,
 	};
 }
 

@@ -33,6 +33,8 @@ export interface FileChangeEntry {
 	original: string;
 	/** True once user kept the change. */
 	kept?: boolean;
+	/** IDE chat session that produced this pending edit (for multi-session awareness). */
+	ownerSessionId?: string;
 }
 
 export interface FileChangeView {
@@ -43,33 +45,80 @@ export interface FileChangeView {
 	added: number;
 	removed: number;
 	name: string;
+	ownerSessionId?: string;
 }
 
+/**
+ * Net line +/- between two snapshots (original → current), matching git-style
+ * counts. Index-aligned comparison falsely counts every shifted line as both
+ * deleted and added; LCS after trimming the common head/tail avoids that.
+ */
 function lineStats(before: string, after: string): { added: number; removed: number } {
 	if (before === after) {
 		return { added: 0, removed: 0 };
 	}
 	const a = before.split(/\r?\n/);
 	const b = after.split(/\r?\n/);
-	let added = 0;
-	let removed = 0;
-	const max = Math.max(a.length, b.length);
-	for (let i = 0; i < max; i++) {
-		if (a[i] === undefined) {
-			added++;
-		} else if (b[i] === undefined) {
-			removed++;
-		} else if (a[i] !== b[i]) {
-			added++;
-			removed++;
-		}
+	let start = 0;
+	while (start < a.length && start < b.length && a[start] === b[start]) {
+		start++;
 	}
-	return { added, removed };
+	let endA = a.length - 1;
+	let endB = b.length - 1;
+	while (endA >= start && endB >= start && a[endA] === b[endB]) {
+		endA--;
+		endB--;
+	}
+	const aa = a.slice(start, endA + 1);
+	const bb = b.slice(start, endB + 1);
+	if (aa.length === 0) {
+		return { added: bb.length, removed: 0 };
+	}
+	if (bb.length === 0) {
+		return { added: 0, removed: aa.length };
+	}
+	// Guard huge middles: fall back to whole-block counts (still better than
+	// index-aligned, and matches a single contiguous hunk).
+	if (aa.length * bb.length > 2_000_000) {
+		return { added: bb.length, removed: aa.length };
+	}
+	const lcs = longestCommonSubsequenceLength(aa, bb);
+	return { added: bb.length - lcs, removed: aa.length - lcs };
+}
+
+function longestCommonSubsequenceLength(xs: readonly string[], ys: readonly string[]): number {
+	const n = xs.length;
+	const m = ys.length;
+	if (n === 0 || m === 0) {
+		return 0;
+	}
+	const short = n <= m ? xs : ys;
+	const long = n <= m ? ys : xs;
+	const cols = short.length;
+	const rows = long.length;
+	let prev = new Uint32Array(cols + 1);
+	let curr = new Uint32Array(cols + 1);
+	for (let i = 1; i <= rows; i++) {
+		const rowVal = long[i - 1];
+		for (let j = 1; j <= cols; j++) {
+			curr[j] = rowVal === short[j - 1]
+				? prev[j - 1] + 1
+				: Math.max(prev[j], curr[j - 1]);
+		}
+		const swap = prev;
+		prev = curr;
+		curr = swap;
+		curr.fill(0);
+	}
+	return prev[cols];
 }
 
 export class FileEditSession {
 	private readonly entries = new Map<string, FileChangeEntry>();
 	private readonly originals = new Map<string, string>();
+	/** Per user-turn snapshots of file contents before that turn's edits. null means the file did not exist. */
+	private checkpoints: Array<{ id: string; sessionId: string; files: Map<string, string | null> }> = [];
+	private readonly activeBySession = new Map<string, string>();
 	private readonly _onDidChange = new vscode.EventEmitter<void>();
 	readonly onDidChange = this._onDidChange.event;
 
@@ -79,11 +128,15 @@ export class FileEditSession {
 		this._onDidChange.dispose();
 		this.entries.clear();
 		this.originals.clear();
+		this.checkpoints.length = 0;
+		this.activeBySession.clear();
 	}
 
 	clear(): void {
 		this.entries.clear();
 		this.originals.clear();
+		this.checkpoints.length = 0;
+		this.activeBySession.clear();
 		this._onDidChange.fire();
 		void vscode.commands.executeCommand('_zcode.editing.clear').then(undefined, () => { /* ignore */ });
 	}
@@ -91,15 +144,42 @@ export class FileEditSession {
 	list(): FileChangeView[] {
 		return [...this.entries.values()]
 			.filter(e => !e.kept)
-			.map(e => ({
-				uri: e.uri.toString(),
-				fsPath: e.fsPath,
-				relativePath: e.relativePath,
-				kind: e.kind,
-				added: e.added,
-				removed: e.removed,
-				name: path.basename(e.fsPath),
-			}));
+			.map(e => this.toView(e));
+	}
+
+	/** Pending edits attributed to other IDE chat sessions. */
+	listOwnedByOthers(sessionId: string): FileChangeView[] {
+		return [...this.entries.values()]
+			.filter(e => !e.kept && !!e.ownerSessionId && e.ownerSessionId !== sessionId)
+			.map(e => this.toView(e));
+	}
+
+	listOwnedBy(sessionId: string): FileChangeView[] {
+		return [...this.entries.values()]
+			.filter(e => !e.kept && e.ownerSessionId === sessionId)
+			.map(e => this.toView(e));
+	}
+
+	/** Owner of a pending (unkept) working-set entry, if any. */
+	ownerOf(fsPath: string): string | undefined {
+		const entry = this.entries.get(vscode.Uri.file(fsPath).toString());
+		if (!entry || entry.kept) {
+			return undefined;
+		}
+		return entry.ownerSessionId;
+	}
+
+	private toView(e: FileChangeEntry): FileChangeView {
+		return {
+			uri: e.uri.toString(),
+			fsPath: e.fsPath,
+			relativePath: e.relativePath,
+			kind: e.kind,
+			added: e.added,
+			removed: e.removed,
+			name: path.basename(e.fsPath),
+			ownerSessionId: e.ownerSessionId,
+		};
 	}
 
 	originalUriFor(fileUri: vscode.Uri): vscode.Uri {
@@ -151,11 +231,13 @@ export class FileEditSession {
 		nextContent: string,
 		root: string,
 		baseline?: string,
+		ownerSessionId?: string,
 	): Promise<void> {
 		const uri = vscode.Uri.file(fsPath);
 		const key = uri.toString();
+		const existing = this.entries.get(key);
 		let kind: FileChangeKind = 'edit';
-		let original = this.entries.get(key)?.original ?? baseline;
+		let original = existing?.original ?? baseline;
 
 		if (original === undefined) {
 			try {
@@ -177,9 +259,18 @@ export class FileEditSession {
 				kind = 'create';
 			}
 			this.originals.set(key, original);
-		} else if (this.entries.get(key)?.kind === 'create') {
+		} else if (existing?.kind === 'create') {
 			kind = 'create';
 		}
+
+		if (!existing && original === nextContent) {
+			return;
+		}
+
+		const before = !existing && kind === 'create'
+			? null
+			: (baseline !== undefined ? baseline : (existing?.original ?? original));
+		this.rememberBefore(ownerSessionId, key, before);
 
 		const stats = lineStats(original, nextContent);
 		const relativePath = root ? (path.relative(root, fsPath) || path.basename(fsPath)) : fsPath;
@@ -191,6 +282,7 @@ export class FileEditSession {
 			added: stats.added,
 			removed: stats.removed,
 			original,
+			ownerSessionId: ownerSessionId ?? existing?.ownerSessionId,
 		});
 		this.originals.set(key, original);
 		this._onDidChange.fire();
@@ -200,7 +292,12 @@ export class FileEditSession {
 	/**
 	 * Apply a full-file write while remembering the first original for Keep/Undo/diff.
 	 */
-	async writeFile(fsPath: string, nextContent: string, root: string): Promise<{
+	async writeFile(
+		fsPath: string,
+		nextContent: string,
+		root: string,
+		ownerSessionId?: string,
+	): Promise<{
 		summary: string;
 		kind: FileChangeKind;
 		added: number;
@@ -209,8 +306,9 @@ export class FileEditSession {
 	}> {
 		const uri = vscode.Uri.file(fsPath);
 		const key = uri.toString();
+		const existing = this.entries.get(key);
 		let kind: FileChangeKind = 'edit';
-		let original = this.entries.get(key)?.original;
+		let original = existing?.original;
 
 		if (original === undefined) {
 			try {
@@ -221,8 +319,24 @@ export class FileEditSession {
 				kind = 'create';
 			}
 			this.originals.set(key, original);
-		} else if (this.entries.get(key)?.kind === 'create') {
+			this.rememberBefore(ownerSessionId, key, kind === 'create' ? null : original);
+		} else if (existing?.kind === 'create') {
 			kind = 'create';
+			let current = original;
+			try {
+				current = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+			} catch {
+				current = original;
+			}
+			this.rememberBefore(ownerSessionId, key, current);
+		} else {
+			let current = original;
+			try {
+				current = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+			} catch {
+				current = original;
+			}
+			this.rememberBefore(ownerSessionId, key, current);
 		}
 
 		// Always persist first so the workspace model/disk agree, then ask the
@@ -240,6 +354,7 @@ export class FileEditSession {
 			added: stats.added,
 			removed: stats.removed,
 			original,
+			ownerSessionId: ownerSessionId ?? existing?.ownerSessionId,
 		});
 		this._onDidChange.fire();
 
@@ -282,8 +397,17 @@ export class FileEditSession {
 		}
 	}
 
-	async keep(uris?: string[]): Promise<void> {
-		const keys = uris?.length ? uris : [...this.entries.keys()];
+	async keep(uris?: string[], sessionId?: string): Promise<void> {
+		const keys = (uris?.length ? uris : [...this.entries.keys()]).filter(key => {
+			const entry = this.entries.get(key);
+			if (!entry || entry.kept) {
+				return false;
+			}
+			if (sessionId && entry.ownerSessionId && entry.ownerSessionId !== sessionId) {
+				return false;
+			}
+			return true;
+		});
 		for (const key of keys) {
 			const entry = this.entries.get(key);
 			if (!entry) {
@@ -294,11 +418,20 @@ export class FileEditSession {
 			this.originals.delete(key);
 		}
 		this._onDidChange.fire();
-		await this.syncToChatEditing();
+		await this.syncToChatEditing(sessionId);
 	}
 
-	async undo(uris?: string[]): Promise<void> {
-		const keys = (uris?.length ? uris : [...this.entries.keys()]).filter(key => this.entries.has(key));
+	async undo(uris?: string[], sessionId?: string): Promise<void> {
+		const keys = (uris?.length ? uris : [...this.entries.keys()]).filter(key => {
+			const entry = this.entries.get(key);
+			if (!entry) {
+				return false;
+			}
+			if (sessionId && entry.ownerSessionId && entry.ownerSessionId !== sessionId) {
+				return false;
+			}
+			return true;
+		});
 		if (!keys.length) {
 			return;
 		}
@@ -331,7 +464,7 @@ export class FileEditSession {
 			this.originals.delete(key);
 		}
 		this._onDidChange.fire();
-		await this.syncToChatEditing();
+		await this.syncToChatEditing(sessionId);
 	}
 
 	/** Drop a pending entry after the built-in Chat editing overlay Keep/Undo settles it. */
@@ -349,13 +482,16 @@ export class FileEditSession {
 	/**
 	 * Push pending edits into the workbench Chat editing review session so the
 	 * editor gets the same decorations / hunk Keep·Undo as Copilot Chat.
+	 * When `sessionId` is set, only that chat's pending files are shown.
 	 */
-	async syncToChatEditing(): Promise<void> {
-		const files = [...this.entries.values()].map(e => ({
-			uri: e.uri,
-			original: e.original,
-			kind: e.kind,
-		}));
+	async syncToChatEditing(sessionId?: string): Promise<void> {
+		const files = [...this.entries.values()]
+			.filter(e => !e.kept && (!sessionId || e.ownerSessionId === sessionId))
+			.map(e => ({
+				uri: e.uri,
+				original: e.original,
+				kind: e.kind,
+			}));
 		try {
 			await vscode.commands.executeCommand('_zcode.editing.sync', files);
 		} catch {
@@ -380,8 +516,9 @@ export class FileEditSession {
 		await vscode.window.showTextDocument(entry.uri, { preview: false });
 	}
 
-	async openAllChanges(): Promise<void> {
-		const pending = [...this.entries.values()].filter(e => !e.kept);
+	async openAllChanges(sessionId?: string): Promise<void> {
+		const pending = [...this.entries.values()].filter(e =>
+			!e.kept && (!sessionId || e.ownerSessionId === sessionId));
 		if (!pending.length) {
 			return;
 		}
@@ -395,6 +532,170 @@ export class FileEditSession {
 			e.uri,
 		]);
 		await vscode.commands.executeCommand('vscode.changes', 'ZCode Changes', resources);
+	}
+
+	/** Start a user turn. Later writes in this session record their pre-image here. */
+	beginCheckpoint(id: string, sessionId: string): void {
+		const sessionCps = this.checkpoints.filter(c => c.sessionId === sessionId);
+		const index = sessionCps.findIndex(c => c.id === id);
+		if (index >= 0) {
+			this.checkpoints = this.checkpoints.filter(c => {
+				if (c.sessionId !== sessionId) {
+					return true;
+				}
+				return sessionCps.findIndex(row => row.id === c.id) < index;
+			});
+		}
+		this.checkpoints.push({ id, sessionId, files: new Map() });
+		this.activeBySession.set(sessionId, id);
+	}
+
+	filesFromCheckpoint(id: string, sessionId: string): number {
+		const sessionCps = this.checkpoints.filter(c => c.sessionId === sessionId);
+		const index = sessionCps.findIndex(c => c.id === id);
+		if (index < 0) {
+			return 0;
+		}
+		const keys = new Set<string>();
+		for (const cp of sessionCps.slice(index)) {
+			for (const key of cp.files.keys()) {
+				keys.add(key);
+			}
+		}
+		return keys.size;
+	}
+
+	/**
+	 * Restore files to the state at the start of a user turn.
+	 * Later checkpoints for that session are dropped. The target checkpoint stays
+	 * unless `drop` is set (edit-and-resend removes the message).
+	 */
+	async restoreToCheckpoint(id: string, sessionId: string, opts?: { drop?: boolean }): Promise<{ hadCheckpoint: boolean; fileCount: number }> {
+		const sessionCps = this.checkpoints.filter(c => c.sessionId === sessionId);
+		const index = sessionCps.findIndex(c => c.id === id);
+		if (index < 0) {
+			return { hadCheckpoint: false, fileCount: 0 };
+		}
+		const merged = new Map<string, string | null>();
+		for (const cp of sessionCps.slice(index)) {
+			for (const [key, content] of cp.files) {
+				if (!merged.has(key)) {
+					merged.set(key, content);
+				}
+			}
+		}
+		for (const [key, content] of merged) {
+			await this.applyRestored(key, content);
+		}
+		this.checkpoints = this.checkpoints.filter(c => {
+			if (c.sessionId !== sessionId) {
+				return true;
+			}
+			return sessionCps.findIndex(row => row.id === c.id) < index;
+		});
+		if (!opts?.drop) {
+			this.checkpoints.push({ id, sessionId, files: new Map() });
+			this.activeBySession.set(sessionId, id);
+		} else if (this.activeBySession.get(sessionId) === id) {
+			this.activeBySession.delete(sessionId);
+		}
+		this._onDidChange.fire();
+		await this.syncToChatEditing(sessionId);
+		return { hadCheckpoint: true, fileCount: merged.size };
+	}
+
+	async deleteFile(
+		fsPath: string,
+		root: string,
+		ownerSessionId?: string,
+	): Promise<{ uri: vscode.Uri; path: string }> {
+		const uri = vscode.Uri.file(fsPath);
+		const key = uri.toString();
+		const existing = this.entries.get(key);
+		let before: string | null = null;
+		try {
+			before = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+		} catch {
+			before = null;
+		}
+		this.rememberBefore(ownerSessionId, key, before);
+		try {
+			await vscode.workspace.fs.delete(uri, { useTrash: true });
+		} catch {
+			// already gone
+		}
+		const relativePath = root ? (path.relative(root, fsPath) || path.basename(fsPath)) : fsPath;
+		if (before === null) {
+			this.entries.delete(key);
+			this.originals.delete(key);
+		} else if (existing?.kind === 'create') {
+			this.entries.delete(key);
+			this.originals.delete(key);
+		} else {
+			const original = existing?.original ?? before;
+			const stats = lineStats(original, '');
+			this.entries.set(key, {
+				uri,
+				fsPath,
+				relativePath: relativePath.split(path.sep).join('/'),
+				kind: 'delete',
+				added: 0,
+				removed: stats.removed,
+				original,
+				ownerSessionId: ownerSessionId ?? existing?.ownerSessionId,
+			});
+			this.originals.set(key, original);
+		}
+		this._onDidChange.fire();
+		await this.syncToChatEditing(ownerSessionId);
+		return { uri, path: relativePath.split(path.sep).join('/') };
+	}
+
+	private rememberBefore(sessionId: string | undefined, key: string, content: string | null): void {
+		if (!sessionId) {
+			return;
+		}
+		const id = this.activeBySession.get(sessionId);
+		if (!id) {
+			return;
+		}
+		const cp = this.checkpoints.find(row => row.id === id && row.sessionId === sessionId);
+		if (!cp || cp.files.has(key)) {
+			return;
+		}
+		cp.files.set(key, content);
+	}
+
+	private async applyRestored(key: string, content: string | null): Promise<void> {
+		const uri = vscode.Uri.parse(key);
+		const entry = this.entries.get(key);
+		if (content === null) {
+			try {
+				await vscode.workspace.fs.delete(uri, { useTrash: true });
+			} catch {
+				// already gone
+			}
+			this.entries.delete(key);
+			this.originals.delete(key);
+			return;
+		}
+		await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(uri.fsPath)));
+		await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+		if (!entry) {
+			return;
+		}
+		if (entry.original === content) {
+			this.entries.delete(key);
+			this.originals.delete(key);
+			return;
+		}
+		const stats = lineStats(entry.original, content);
+		entry.added = stats.added;
+		entry.removed = stats.removed;
+		if (entry.kind === 'delete') {
+			entry.kind = 'edit';
+		}
+		await this.applyViaChatEditing(uri, content, entry.original, entry.kind);
 	}
 
 	registerContentProvider(context: vscode.ExtensionContext): void {

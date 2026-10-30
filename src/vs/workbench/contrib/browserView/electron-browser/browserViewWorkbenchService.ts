@@ -564,6 +564,10 @@ export class BrowserViewWorkbenchService extends Disposable implements IBrowserV
 		return this._browserViewService.clearGlobalStorage();
 	}
 
+	async importChromeBrowserData(options?: { allowElevatedChromeDecryption?: boolean }) {
+		return this._browserViewService.importChromeBrowserData(options);
+	}
+
 	async clearWorkspaceStorage(): Promise<void> {
 		const workspaceId = this.workspaceContextService.getWorkspace().id;
 		return this._browserViewService.clearWorkspaceStorage(workspaceId);

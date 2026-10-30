@@ -6,7 +6,8 @@
 import { Emitter, Event } from '../../../base/common/event.js';
 import { Disposable, DisposableMap, DisposableStore } from '../../../base/common/lifecycle.js';
 import { VSBuffer } from '../../../base/common/buffer.js';
-import { BrowserViewPresentation, BrowserViewSessionSelector, BrowserViewStorageScope, isBrowserViewStorageScopeShareableWithAgent, IBrowserElementCommentsUpdate, IBrowserElementSelectionOptions, IBrowserViewAudience, IBrowserViewBounds, IBrowserViewState, IBrowserViewService, IBrowserViewCaptureScreenshotOptions, IBrowserViewFindInPageOptions, BrowserViewCommandId, IBrowserViewOwner, IBrowserViewInfo, IBrowserViewCreatedEvent, IBrowserViewEditorOpenOptions, IBrowserViewCreateOptions, IBrowserViewCreationContext, IBrowserViewWindowConfiguration, IBrowserDeviceProfile, BrowserViewChangeEvent, BrowserViewEvent, BrowserViewEventMap, serializeBrowserViewInfo, IBrowserViewAccessibilitySnapshot, getBrowserViewSessionNetwork } from '../common/browserView.js';
+import { BrowserViewPresentation, BrowserViewSessionSelector, BrowserViewStorageScope, isBrowserViewStorageScopeShareableWithAgent, IBrowserElementCommentsUpdate, IBrowserElementSelectionOptions, IBrowserViewAudience, IBrowserViewBounds, IBrowserViewState, IBrowserViewService, IBrowserViewCaptureScreenshotOptions, IBrowserViewFindInPageOptions, BrowserViewCommandId, IBrowserViewOwner, IBrowserViewInfo, IBrowserViewCreatedEvent, IBrowserViewEditorOpenOptions, IBrowserViewCreateOptions, IBrowserViewCreationContext, IBrowserViewWindowConfiguration, IBrowserDeviceProfile, BrowserViewChangeEvent, BrowserViewEvent, BrowserViewEventMap, serializeBrowserViewInfo, IBrowserViewAccessibilitySnapshot, getBrowserViewSessionNetwork, IChromeBrowserDataImportResult } from '../common/browserView.js';
+import { importChromeBrowserData as importChromeBrowserDataImpl } from './chromeImport/browserDataManager.js';
 import { ITunnelProxyInfo } from '../../tunnel/common/tunnelProxy.js';
 import { clipboard, Menu, MenuItem } from 'electron';
 import { IEnvironmentMainService } from '../../environment/electron-main/environmentMainService.js';
@@ -336,6 +337,21 @@ export class BrowserViewMainService extends Disposable implements IBrowserViewMa
 		const browserSession = BrowserSession.getOrCreateGlobal(this.instantiationService);
 		browserSession.connectStorage(this.applicationStorageMainService);
 		await browserSession.clearData();
+	}
+
+	async importChromeBrowserData(options?: { allowElevatedChromeDecryption?: boolean }): Promise<IChromeBrowserDataImportResult> {
+		const browserSession = BrowserSession.getOrCreateGlobal(this.instantiationService);
+		browserSession.connectStorage(this.applicationStorageMainService);
+		const logger = {
+			info: (...args: unknown[]) => this.logService.info('[browser-chrome-import]', ...args.map(String)),
+			warn: (...args: unknown[]) => this.logService.warn('[browser-chrome-import]', ...args.map(String)),
+		};
+		const result = await importChromeBrowserDataImpl({
+			allowElevatedChromeDecryption: options?.allowElevatedChromeDecryption,
+			logger,
+			targetSession: browserSession.electronSession,
+		});
+		return result;
 	}
 
 	async clearWorkspaceStorage(workspaceId: string): Promise<void> {

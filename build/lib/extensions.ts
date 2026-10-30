@@ -180,8 +180,13 @@ function fromLocalEsbuild(extensionPath: string, esbuildConfigFileName: string):
 			fancyLog(`${ansiColors.green('esbuilding')}: ${data.toString('utf8')}`);
 		});
 	}).then(() => {
-		// After esbuild completes, collect all files using vsce
-		return vsce.listFiles({ cwd: extensionPath, packageManager: vsce.PackageManager.None });
+		// After esbuild completes, collect all files using vsce.
+		// Copilot externalizes `@github/copilot` (CLI SDK); PackageManager.None
+		// ignores those node_modules even when .vscodeignore re-includes them.
+		const packageManager = extensionName === 'copilot'
+			? vsce.PackageManager.Npm
+			: vsce.PackageManager.None;
+		return vsce.listFiles({ cwd: extensionPath, packageManager });
 	}).then(fileNames => {
 		if (packagedDependencies.length > 0) {
 			const packagedDependencyFileNames = packagedDependencies.flatMap(dependency =>
@@ -204,6 +209,17 @@ function fromLocalEsbuild(extensionPath: string, esbuildConfigFileName: string):
 
 		const files = fileNames
 			.map(fileName => path.join(extensionPath, fileName))
+			.filter(filePath => {
+				try {
+					fs.lstatSync(filePath);
+					return true;
+				} catch {
+					// vsce/npm file lists can briefly reference paths postinstall removed
+					// (e.g. @github/copilot/shims.txt). Skip instead of failing the build.
+					fancyLog.warn(`Skipping missing file while packaging ${extensionName}: ${path.relative(extensionPath, filePath)}`);
+					return false;
+				}
+			})
 			.map(filePath => new File({
 				path: filePath,
 				stat: fs.statSync(filePath),
@@ -464,6 +480,11 @@ function doPackageLocalExtensionsStream(forWeb: boolean, native: boolean): Strea
  * Package the built-in copilot extension specifically.
  * This is used by non-CI local builds where copilot is not downloaded as a VSIX
  * but must be compiled from source and included in the build.
+ *
+ * Important: `fromLocal` runs esbuild → postinstall, which rewrites
+ * `node_modules/@github/copilot` (and deletes `shims.txt`). Dependency gulps must
+ * wait until that finishes; merging them in parallel races postinstall and
+ * yields `ENOENT: lstat .../shims.txt`.
  */
 export function packageCopilotExtensionStream(): Stream {
 	const extensionPath = path.join(root, 'extensions', 'copilot');
@@ -471,20 +492,56 @@ export function packageCopilotExtensionStream(): Stream {
 		return es.readArray([]);
 	}
 
+	const result = es.through();
 	const localExtensionsStream = minifyExtensionResources(
 		fromLocal(extensionPath, false)
 			.pipe(rename(p => p.dirname = `extensions/copilot/${p.dirname}`))
 	);
 
-	const productionDependencies = getProductionDependencies('extensions/copilot');
-	const dependenciesSrc = productionDependencies.map(d => path.relative(root, d)).map(d => [`${d}/**`, `!${d}/**/{test,tests}/**`]).flat();
+	const localFiles: File[] = [];
+	localExtensionsStream.on('data', (f: File) => localFiles.push(f));
+	localExtensionsStream.on('error', (err: unknown) => result.emit('error', err));
+	localExtensionsStream.on('end', () => {
+		// `@github/copilot` (+ platform packages) are stripped by `.moduleignore`
+		// and re-added via the keep-set below — skip them in the production-deps
+		// glob so we never pick up a transient `shims.txt` marker.
+		const productionDependencies = getProductionDependencies('extensions/copilot')
+			.filter(d => !isGithubCopilotNodeModule(d));
+		const dependenciesSrc = productionDependencies
+			.map(d => path.relative(root, d))
+			.map(d => [`${d}/**`, `!${d}/**/{test,tests}/**`])
+			.flat();
 
-	return es.merge(
-		localExtensionsStream,
-		gulp.src(dependenciesSrc, { base: '.' })
-			.pipe(util2.cleanNodeModules(path.join(root, 'build', '.moduleignore')))
-			.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`)))
-	).pipe(util2.setExecutableBit(['**/*.sh']));
+		const copilotCliSdkSrc = [
+			'extensions/copilot/node_modules/@github/copilot/package.json',
+			'extensions/copilot/node_modules/@github/copilot/sdk/**',
+			'!extensions/copilot/node_modules/@github/copilot/sdk/**/{test,tests}/**',
+			'!extensions/copilot/node_modules/@github/copilot/sdk/**/*.map',
+		];
+
+		es.merge(
+			es.readArray(localFiles),
+			gulp.src(dependenciesSrc, { base: '.', allowEmpty: true, dot: true })
+				.pipe(util2.cleanNodeModules(path.join(root, 'build', '.moduleignore')))
+				.pipe(util2.cleanNodeModules(path.join(root, 'build', `.moduleignore.${process.platform}`))),
+			gulp.src(copilotCliSdkSrc, { base: '.', allowEmpty: true, dot: true }),
+		)
+			.pipe(util2.setExecutableBit(['**/*.sh']))
+			.on('error', (err: unknown) => result.emit('error', err))
+			.pipe(result);
+	});
+
+	return result;
+}
+
+/** True for `@github/copilot` or `@github/copilot-*` package directories. */
+function isGithubCopilotNodeModule(dependencyPath: string): boolean {
+	const parts = dependencyPath.split(/[/\\]/);
+	const scopeIdx = parts.lastIndexOf('@github');
+	if (scopeIdx < 0 || scopeIdx + 1 >= parts.length) {
+		return false;
+	}
+	return parts[scopeIdx + 1] === 'copilot' || parts[scopeIdx + 1].startsWith('copilot-');
 }
 
 export function packageMarketplaceExtensionsStream(forWeb: boolean): Stream {

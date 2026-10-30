@@ -15,11 +15,24 @@ export interface TodoItem {
 	status: TodoStatus;
 }
 
+/** Attachment summary stored on a user bubble for display. */
+export interface UserAttachmentRef {
+	id: string;
+	name: string;
+	/** Rendered as a clickable image thumbnail instead of a file pill. */
+	image?: boolean;
+	/** Webview-loadable URI for image previews. */
+	uri?: string;
+	/** Absolute path, used to open the file on click. */
+	path?: string;
+}
+
 export type ConversationItem =
 	| {
 		id: string;
 		kind: 'user';
 		text: string;
+		attachments?: UserAttachmentRef[];
 	}
 	| {
 		id: string;
@@ -66,6 +79,13 @@ export type ConversationItem =
 	}
 	| {
 		id: string;
+		kind: 'summary';
+		text: string;
+		/** How many earlier user turns were folded into this summary. */
+		turnCount: number;
+	}
+	| {
+		id: string;
 		kind: 'work';
 		label: string;
 		startedAt: number;
@@ -108,6 +128,17 @@ export function toolDisplayName(name: string): string {
 		case 'glob':
 		case 'Glob':
 			return 'Glob';
+		case 'open_browser_page':
+		case 'browser_navigate':
+		case 'browser_reload':
+		case 'browser_go_back':
+		case 'browser_go_forward':
+		case 'browser_new_tab':
+		case 'browser_list_or_open':
+		case 'browser_toggle_devtools':
+			return 'Browser';
+		case 'browser_import_chrome_data':
+			return 'Chrome Sync';
 		case 'TodoWrite':
 			return 'Todos';
 		case 'AskUserQuestion':

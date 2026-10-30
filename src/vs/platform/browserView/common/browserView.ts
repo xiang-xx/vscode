@@ -61,6 +61,8 @@ export enum BrowserViewCommandId {
 	ClearWorkspaceStorage = `${commandPrefix}.clearWorkspaceStorage`,
 	ClearEphemeralStorage = `${commandPrefix}.clearEphemeralStorage`,
 	ClearAgentStorage = `${commandPrefix}.clearAgentStorage`,
+	/** Import cookies/localStorage from the local Chrome profile (ZCode-compatible). */
+	ImportChromeData = `${commandPrefix}.importChromeData`,
 
 	// Find in page
 	ShowFind = `${commandPrefix}.showFind`,
@@ -543,6 +545,21 @@ export function getAgentBrowserViewCreationDefaults(sessionId: string, storageAf
 	};
 }
 
+/** Result of importing Chrome cookies / LocalStorage into the integrated browser. */
+export interface IChromeBrowserDataImportResult {
+	success: boolean;
+	cookies: { imported: number; skipped: number; failed: number };
+	localStorage: {
+		originsImported: number;
+		entriesImported: number;
+		originsSkipped: number;
+		originsFailed: number;
+		error?: string;
+	};
+	issues?: string[];
+	error?: string;
+}
+
 export const ipcBrowserViewChannelName = 'browserView';
 
 /**
@@ -775,6 +792,12 @@ export interface IBrowserViewService {
 	 * Clear all storage data for the global browser session
 	 */
 	clearGlobalStorage(): Promise<void>;
+
+	/**
+	 * Import Chrome cookies and LocalStorage into the global integrated browser session
+	 * (same idea as ZCode "Sync Chrome sign-in state").
+	 */
+	importChromeBrowserData(options?: { allowElevatedChromeDecryption?: boolean }): Promise<IChromeBrowserDataImportResult>;
 
 	/**
 	 * Clear all storage data for a specific workspace browser session,

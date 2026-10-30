@@ -3,11 +3,20 @@
  *  Licensed under the MIT License.
  *--------------------------------------------------------------------------------------------*/
 
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { AgentProgressEvent } from './agentRuntime';
 import type { AskUserAnswer, AskUserPrompt, AskUserResult } from './askUser';
 import { getAuthService } from './authSession';
+import {
+	AGENT_PACE_LABELS,
+	AGENT_PACES,
+	getAgentPace,
+	setAgentPace,
+	type AgentPace,
+} from './agentPace';
 import {
 	BRAIN_LABELS,
 	BRAINS,
@@ -21,6 +30,7 @@ import {
 	type CursorAgentMode,
 } from './brains';
 import { completeChatTurn, getBridgeMode, getCursorBrainStatusLine, workspaceRoot, type ChatMessage } from './bridge';
+import { compactConversation } from './contextCompact';
 import { buildPlusMenuSections, formatSlashInsert } from './composerActions';
 import {
 	formatWorkDuration,
@@ -28,6 +38,7 @@ import {
 	toolDisplayName,
 	type ConversationItem,
 	type TodoItem,
+	type UserAttachmentRef,
 } from './conversation';
 import { listCursorModels } from './cursorAuth';
 import {
@@ -40,6 +51,18 @@ import {
 	setSelectedModelId,
 	setSelectedReasoningLevel,
 } from './models';
+import { filterSkills, listLocalSkills, prepareComposerTurn } from './localSkills';
+import {
+	claimManualPlan,
+	fetchAccountQuota,
+	fetchClaimOffer,
+	QUOTA_NOTICE_SEEN_KEY,
+	readSeenQuotaNotices,
+	selectQuotaNotice,
+	type AccountQuota,
+	type ClaimOffer,
+} from './planBilling';
+import { buildPromptPreamble } from './promptContext';
 import {
 	getProviderMode,
 	pickProviderMode,
@@ -61,13 +84,18 @@ import {
 	type IdeChatSessionMeta,
 } from './ideChatStore';
 import { computeContextUsage, type ContextUsageSnapshot } from './contextUsage';
+import type { SessionAwareness } from './sessionAwareness';
 import { getZcodeScheduleTip } from './zcodeScheduleTip';
 
 const VIEW_ID = 'zcode.chatView';
 
-const CHAT_FONT_SIZE_DEFAULT = 15;
+const CHAT_FONT_SIZE_DEFAULT = 14;
 const CHAT_FONT_SIZE_MIN = 11;
 const CHAT_FONT_SIZE_MAX = 24;
+
+const CHAT_LINE_HEIGHT_DEFAULT = 1.8;
+const CHAT_LINE_HEIGHT_MIN = 1.3;
+const CHAT_LINE_HEIGHT_MAX = 2.4;
 
 /** Chat stream font size from `zcode.chatFontSize`, clamped to a sane range. */
 function getChatFontSize(): number {
@@ -76,6 +104,15 @@ function getChatFontSize(): number {
 		return CHAT_FONT_SIZE_DEFAULT;
 	}
 	return Math.min(CHAT_FONT_SIZE_MAX, Math.max(CHAT_FONT_SIZE_MIN, size));
+}
+
+/** Chat stream line height from `zcode.chatLineHeight`, clamped to a sane range. */
+function getChatLineHeight(): number {
+	const value = vscode.workspace.getConfiguration('zcode').get<number>('chatLineHeight');
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		return CHAT_LINE_HEIGHT_DEFAULT;
+	}
+	return Math.min(CHAT_LINE_HEIGHT_MAX, Math.max(CHAT_LINE_HEIGHT_MIN, value));
 }
 
 interface AttachmentChip {
@@ -121,6 +158,7 @@ function selectionLineSpan(range: vscode.Range): { start: number; end: number } 
 interface QueuedMessage {
 	id: string;
 	text: string;
+	attachments: AttachmentChip[];
 }
 
 /** Mutable chat fields shared by the active view and parked background sessions. */
@@ -140,6 +178,21 @@ interface MutableChat {
 	turnStartedAt?: number;
 }
 
+/** In-flight agent turn for one IDE chat session (ZCode-style per-session abort). */
+interface SessionRun {
+	cancel: vscode.CancellationTokenSource;
+	pendingAsk?: {
+		id: string;
+		resolve: (result: AskUserResult) => void;
+	};
+	/** Prefer this text on the next idle tick (send-now / interrupt). */
+	pendingForceSend?: { content: string; text: string; attachments: AttachmentChip[] };
+}
+
+function getAttachmentDir(): string {
+	return path.join(os.tmpdir(), 'zcode-chat-attachments');
+}
+
 export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	public static readonly viewType = VIEW_ID;
 
@@ -155,12 +208,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private queue: QueuedMessage[] = [];
 	/** After stop/error, do not auto-drain until the user resumes. */
 	private queuePaused = false;
-	/** Prefer this text on the next idle tick (send-now / interrupt). */
-	private pendingForceSend?: string;
-	private pendingAsk?: {
-		id: string;
-		resolve: (result: AskUserResult) => void;
-	};
 	private sessionId?: string;
 	private sessionList: IdeChatSessionMeta[] = [];
 	/** Open session tabs (persisted via IdeChatStore + optional draft). */
@@ -171,9 +218,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private historyOpen = false;
 	/** Sessions that finished a turn and still need a done badge. */
 	private unreadDoneIds = new Set<string>();
-	/** Session currently running an AI turn (for pulse marker). */
-	private runningSessionId?: string;
-	private runCancel?: vscode.CancellationTokenSource;
+	/**
+	 * Concurrent agent turns keyed by IDE chat session id.
+	 * Matches ZCode: many sessions may run; only one foreground turn per session.
+	 */
+	private readonly runs = new Map<string, SessionRun>();
 	/** Parked sessions (including a mid-run chat while viewing another tab). */
 	private readonly parked = new Map<string, MutableChat>();
 	private activeStatusId?: string;
@@ -189,10 +238,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private cursorAccountLabel = 'Cursor · checking…';
 	/** Last provider-reported total tokens for the active session (if any). */
 	private reportedUsageTokens?: number;
+	private claimOffer: ClaimOffer | null = null;
+	private claimError: string | undefined;
+	private claimBusy = false;
+	private accountQuota: AccountQuota | null = null;
+	private seenNotices = new Set<string>();
+	private billingSeq = 0;
 
-	/** True when the visible tab is the one with an in-flight AI turn. */
+	private isRunning(sessionId: string | undefined): boolean {
+		return !!sessionId && this.runs.has(sessionId);
+	}
+
+	/** True when the visible tab has an in-flight AI turn. */
 	private get busy(): boolean {
-		return !!this.runningSessionId && this.runningSessionId === this.sessionId;
+		return this.isRunning(this.sessionId);
 	}
 
 	private scheduleTipTimer?: ReturnType<typeof setInterval>;
@@ -201,11 +260,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		private readonly extensionUri: vscode.Uri,
 		private readonly ideChat: IdeChatStore,
 		private readonly fileEdits: FileEditSession,
+		private readonly globalState: vscode.Memento,
 	) {
+		this.seenNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(QUOTA_NOTICE_SEEN_KEY)));
 		this.fileEdits.onDidChange(() => {
-			this.fileChanges = this.fileEdits.list();
+			this.refreshFileChanges();
 			this.pushState();
 		});
+		try {
+			getAuthService().onDidChangeSession(() => {
+				void this.refreshBilling();
+			});
+		} catch {
+			// Auth service is registered before the panel in activate.
+		}
 		void this.refreshCursorMeta();
 	}
 
@@ -225,7 +293,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.view = webviewView;
 		webviewView.webview.options = {
 			enableScripts: true,
-			localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'media')],
+			localResourceRoots: [
+				vscode.Uri.joinPath(this.extensionUri, 'media'),
+				vscode.Uri.file(getAttachmentDir()),
+			],
 		};
 		webviewView.webview.html = this.renderHtml(webviewView.webview);
 		webviewView.webview.onDidReceiveMessage(async (message) => {
@@ -241,8 +312,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			clearInterval(this.scheduleTipTimer);
 		}
 		// Refresh tip when crossing the 14:00 / 18:00 boundary without user action.
-		this.scheduleTipTimer = setInterval(() => this.pushState(), 60_000);
+		this.scheduleTipTimer = setInterval(() => {
+			this.pushState();
+			void this.refreshBilling();
+		}, 60_000);
 		void this.bootstrapSession();
+		void this.refreshBilling();
 	}
 
 	async newChat(): Promise<void> {
@@ -265,8 +340,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	clearTabDoneFromTitle(sessionId: string): void {
-		this.unreadDoneIds.delete(sessionId);
-		this.pushState();
+		// Only re-render when a badge was actually dismissed.
+		if (this.unreadDoneIds.delete(sessionId)) {
+			this.pushState();
+		}
 	}
 
 	toggleHistory(): void {
@@ -361,13 +438,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			provider?: string;
 			model?: string;
 			reasoningLevel?: string;
+			pace?: string;
 			actionId?: string;
 			slash?: string;
 			draft?: string;
 			attachmentId?: string;
+			path?: string;
 			open?: boolean;
 			answers?: AskUserAnswer[];
 			reason?: string;
+			planId?: string;
+			query?: string;
 		};
 
 		if (msg.type === 'ready') {
@@ -437,6 +518,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			return;
 		}
+		if (msg.type === 'setAgentPace' && typeof msg.pace === 'string'
+			&& (AGENT_PACES as readonly string[]).includes(msg.pace)) {
+			await setAgentPace(msg.pace as AgentPace);
+			this.pushState();
+			return;
+		}
 		if (msg.type === 'clear' || msg.type === 'newChat') {
 			await this.startNewSession();
 			return;
@@ -458,6 +545,36 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'enqueue' && typeof msg.text === 'string') {
 			await this.enqueueMessage(msg.text);
+			return;
+		}
+		if (msg.type === 'rewind' && typeof msg.id === 'string') {
+			await this.rewindToUser(msg.id, 'keep');
+			return;
+		}
+		if (msg.type === 'editUser' && typeof msg.id === 'string') {
+			await this.rewindToUser(msg.id, 'edit');
+			return;
+		}
+		if (msg.type === 'retry' && typeof msg.id === 'string') {
+			await this.retryFromAssistant(msg.id);
+			return;
+		}
+		if (msg.type === 'claimPlan') {
+			await this.claimCurrentPlan(typeof msg.planId === 'string' ? msg.planId : undefined);
+			return;
+		}
+		if (msg.type === 'dismissQuotaNotice' && typeof msg.id === 'string') {
+			await this.dismissQuotaNotice(msg.id);
+			return;
+		}
+		if (msg.type === 'querySkills') {
+			const query = typeof msg.query === 'string' ? msg.query : '';
+			const skills = filterSkills(this.cachedSkills(), query).map(skill => ({
+				name: skill.name,
+				description: skill.description,
+				scope: skill.scope,
+			}));
+			void this.view?.webview.postMessage({ type: 'skillMatches', query, skills });
 			return;
 		}
 		if (msg.type === 'removeQueueItem' && typeof msg.id === 'string') {
@@ -508,8 +625,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (msg.type === 'clearTabDone' && typeof msg.sessionId === 'string') {
-			this.unreadDoneIds.delete(msg.sessionId);
-			this.pushState();
+			// Fired on any press in the page; skip the re-render when the active
+			// tab had no badge to dismiss.
+			if (this.unreadDoneIds.delete(msg.sessionId)) {
+				this.pushState();
+			}
 			return;
 		}
 		if (msg.type === 'deleteSession' && typeof msg.sessionId === 'string') {
@@ -521,15 +641,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (msg.type === 'keepFileChanges') {
-			await this.fileEdits.keep(typeof msg.uri === 'string' ? [msg.uri] : undefined);
+			await this.fileEdits.keep(
+				typeof msg.uri === 'string' ? [msg.uri] : undefined,
+				this.sessionId,
+			);
 			return;
 		}
 		if (msg.type === 'undoFileChanges') {
-			await this.fileEdits.undo(typeof msg.uri === 'string' ? [msg.uri] : undefined);
+			await this.fileEdits.undo(
+				typeof msg.uri === 'string' ? [msg.uri] : undefined,
+				this.sessionId,
+			);
 			return;
 		}
 		if (msg.type === 'viewAllFileChanges') {
-			await this.fileEdits.openAllChanges();
+			await this.fileEdits.openAllChanges(this.sessionId);
 			return;
 		}
 		if (msg.type === 'toggleReasoning' && typeof msg.id === 'string') {
@@ -542,7 +668,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'toggleTool' && typeof msg.id === 'string') {
 			const row = this.items.find(i => i.id === msg.id);
-			if (row && row.kind === 'tool' && (row.detail || row.uri)) {
+			if (row && row.kind === 'tool') {
 				row.expanded = !row.expanded;
 				this.pushState();
 			}
@@ -552,9 +678,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			await vscode.commands.executeCommand('zcode.manageAccount');
 			return;
 		}
+		if (msg.type === 'openAttachment' && typeof msg.path === 'string') {
+			try {
+				void vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path));
+			} catch {
+				// ignore invalid paths
+			}
+			return;
+		}
 		if (msg.type === 'removeAttachment' && typeof msg.attachmentId === 'string') {
 			this.attachments = this.attachments.filter(a => a.id !== msg.attachmentId);
 			this.pushState();
+			return;
+		}
+		if (msg.type === 'attachTransfer') {
+			this.handleAttachTransfer(msg);
 			return;
 		}
 		if (msg.type === 'plusAction' && typeof msg.actionId === 'string') {
@@ -625,6 +763,50 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState();
 	}
 
+	/**
+	 * Attach a file pasted/dropped into the webview. Images are written to a
+	 * temp file so the agent can read them from disk; text files are inlined
+	 * as an excerpt chip like editor selections.
+	 */
+	private handleAttachTransfer(msg: {
+		name?: string;
+		mime?: string;
+		base64?: string;
+		text?: string;
+	}): void {
+		const name = (msg.name ?? 'pasted-file').split(/[\\/]/).pop() || 'pasted-file';
+		const stamp = `${Date.now()}:${Math.random().toString(36).slice(2, 7)}`;
+		if (typeof msg.base64 === 'string' && msg.base64) {
+			const extFromName = path.extname(name).replace(/^\./, '');
+			const mimeExt = (msg.mime ?? '').split('/')[1]?.split(';')[0] ?? '';
+			const ext = extFromName || mimeExt.replace('jpeg', 'jpg') || 'png';
+			try {
+				const dir = getAttachmentDir();
+				fs.mkdirSync(dir, { recursive: true });
+				const base = name.replace(/\.[^.]+$/, '').replace(/[^\w.-]+/g, '_') || 'image';
+				const file = path.join(dir, `${base}-${stamp.replace(/[:]/g, '-')}.${ext}`);
+				fs.writeFileSync(file, Buffer.from(msg.base64, 'base64'));
+				this.attachments.push({ id: `paste:${file}:${stamp}`, name, fsPath: file, detail: name });
+			} catch {
+				void vscode.window.showErrorMessage('Failed to save pasted image.');
+			}
+			this.pushState();
+			return;
+		}
+		if (typeof msg.text === 'string' && msg.text.trim()) {
+			const ext = path.extname(name).replace(/^\./, '');
+			this.attachments.push({
+				id: `paste:${name}:${stamp}`,
+				name,
+				fsPath: name,
+				detail: name,
+				excerpt: msg.text,
+				languageId: ext,
+			});
+			this.pushState();
+		}
+	}
+
 	private buildSelectionChips(editor: vscode.TextEditor): AttachmentChip[] {
 		const document = editor.document;
 		const ranges = editor.selections.some(selection => !selection.isEmpty)
@@ -680,46 +862,51 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState({ insertText: `${mention} ` });
 	}
 
-	private stopRunning(): void {
-		if (!this.runningSessionId || !this.runCancel) {
+	/** Stop the visible session's turn, or a specific session when closing/deleting. */
+	private stopRunning(sessionId?: string): void {
+		const id = sessionId ?? this.sessionId;
+		if (!id) {
+			return;
+		}
+		const run = this.runs.get(id);
+		if (!run) {
 			return;
 		}
 		// Stopping pauses auto-drain so queued follow-ups are not lost silently.
-		if (this.runningSessionId === this.sessionId) {
-			this.queuePaused = true;
-		} else {
-			const parked = this.parked.get(this.runningSessionId);
-			if (parked) {
-				parked.queuePaused = true;
-				this.parked.set(this.runningSessionId, parked);
-			}
+		this.mutateChat(id, chat => {
+			chat.queuePaused = true;
+		});
+		if (run.pendingAsk) {
+			this.resolveAsk(run.pendingAsk.id, { outcome: 'cancelled' });
 		}
-		if (this.pendingAsk) {
-			this.resolveAsk(this.pendingAsk.id, { outcome: 'cancelled' });
-		}
-		this.runCancel.cancel();
+		run.cancel.cancel();
 		this.pushState();
 	}
 
 	private waitForAsk(
+		sessionId: string,
 		prompt: AskUserPrompt,
 		token: vscode.CancellationToken,
 	): Promise<AskUserResult> {
-		if (this.pendingAsk) {
-			this.resolveAsk(this.pendingAsk.id, { outcome: 'cancelled' });
+		const run = this.runs.get(sessionId);
+		if (!run) {
+			return Promise.resolve({ outcome: 'cancelled' });
+		}
+		if (run.pendingAsk) {
+			this.resolveAsk(run.pendingAsk.id, { outcome: 'cancelled' });
 		}
 		return new Promise(resolve => {
 			const cancel = token.onCancellationRequested(() => {
 				this.resolveAsk(prompt.id, { outcome: 'cancelled' });
 			});
-			this.pendingAsk = {
+			run.pendingAsk = {
 				id: prompt.id,
 				resolve: result => {
 					cancel.dispose();
 					resolve(result);
 				},
 			};
-			this.mutateRunChat(chat => {
+			this.mutateChat(sessionId, chat => {
 				this.clearStatusOn(chat);
 				this.finishReasoningOn(chat);
 				const existing = chat.items.find(i => i.id === prompt.id && i.kind === 'question');
@@ -744,30 +931,40 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private resolveAsk(id: string, result: AskUserResult): void {
-		if (!this.pendingAsk || this.pendingAsk.id !== id) {
+		for (const [sessionId, run] of this.runs) {
+			if (!run.pendingAsk || run.pendingAsk.id !== id) {
+				continue;
+			}
+			const pending = run.pendingAsk;
+			run.pendingAsk = undefined;
+			this.mutateChat(sessionId, chat => {
+				const row = chat.items.find(i => i.id === id && i.kind === 'question');
+				if (row && row.kind === 'question') {
+					row.status = result.outcome === 'answered' ? 'answered' : 'skipped';
+					row.answers = result.outcome === 'answered' ? result.answers : undefined;
+				}
+			});
+			this.pushState();
+			pending.resolve(result);
 			return;
 		}
-		const pending = this.pendingAsk;
-		this.pendingAsk = undefined;
-		this.mutateRunChat(chat => {
-			const row = chat.items.find(i => i.id === id && i.kind === 'question');
-			if (row && row.kind === 'question') {
-				row.status = result.outcome === 'answered' ? 'answered' : 'skipped';
-				row.answers = result.outcome === 'answered' ? result.answers : undefined;
-			}
-		});
-		this.pushState();
-		pending.resolve(result);
 	}
 
-	private async enqueueMessage(raw: string): Promise<void> {
-		const attachmentBlock = formatAttachmentBlock(this.attachments);
+	private async enqueueMessage(raw: string, pendingAttachments?: AttachmentChip[]): Promise<void> {
+		const chips = pendingAttachments ?? this.attachments;
+		const attachmentBlock = formatAttachmentBlock(chips);
 		const text = `${attachmentBlock}${raw}`.trim();
 		if (!text) {
 			return;
 		}
-		this.queue.push({ id: newItemId('queue'), text });
-		this.attachments = [];
+		this.queue.push({
+			id: newItemId('queue'),
+			text: raw.trim() || text,
+			attachments: [...chips],
+		});
+		if (!pendingAttachments) {
+			this.attachments = [];
+		}
 		this.draftText = '';
 		this.pushState({ clearDraft: true });
 	}
@@ -780,24 +977,41 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const [item] = this.queue.splice(index, 1);
 		this.queuePaused = false;
 		this.pushState();
-		if (this.busy) {
-			this.pendingForceSend = item.text;
-			this.runCancel?.cancel();
+		if (this.busy && this.sessionId) {
+			const run = this.runs.get(this.sessionId);
+			if (run) {
+				run.pendingForceSend = {
+					content: `${formatAttachmentBlock(item.attachments)}${item.text}`.trim(),
+					text: item.text,
+					attachments: item.attachments,
+				};
+				run.cancel.cancel();
+			}
 			return;
 		}
-		await this.handleSend(item.text);
+		await this.handleSend(item.text, item.attachments);
 	}
 
 	private async flushQueue(sessionId: string | undefined): Promise<void> {
-		if (!sessionId || sessionId !== this.sessionId || this.runningSessionId) {
+		if (!sessionId || this.runs.has(sessionId)) {
 			return;
 		}
-		if (this.queuePaused || !this.queue.length) {
-			return;
+		let next: QueuedMessage | undefined;
+		if (sessionId === this.sessionId) {
+			if (this.queuePaused || !this.queue.length) {
+				return;
+			}
+			next = this.queue.shift()!;
+			this.pushState();
+		} else {
+			const parked = this.parked.get(sessionId);
+			if (!parked || parked.queuePaused || !parked.queue.length) {
+				return;
+			}
+			next = parked.queue.shift()!;
+			this.parked.set(sessionId, parked);
 		}
-		const next = this.queue.shift()!;
-		this.pushState();
-		await this.handleSend(next.text);
+		await this.startTurn(sessionId, `${formatAttachmentBlock(next.attachments)}${next.text}`.trim(), { text: next.text, attachments: next.attachments });
 	}
 
 	private captureView(): MutableChat {
@@ -842,91 +1056,440 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.stopElapsedTimer();
 	}
 
+	/** Working-set rows for the visible chat only. */
+	private refreshFileChanges(): void {
+		this.fileChanges = this.sessionId
+			? this.fileEdits.listOwnedBy(this.sessionId)
+			: [];
+	}
+
 	/**
-	 * Apply a mutation to the running chat. When the run is parked, write back
-	 * into `parked`; when it's the visible tab, write back onto `this`.
+	 * After switching sessions: restore composer draft (parked in draftText) and
+	 * scope editor review markers to this chat's pending files.
 	 */
-	private mutateRunChat(mutator: (chat: MutableChat) => void): void {
-		const id = this.runningSessionId;
-		if (!id) {
-			return;
-		}
-		if (id === this.sessionId) {
+	private pushAfterSessionSwitch(extra?: { focusInput?: boolean }): void {
+		this.refreshFileChanges();
+		void this.fileEdits.syncToChatEditing(this.sessionId);
+		const draft = this.draftText;
+		this.pushState({
+			clearDraft: true,
+			...(draft ? { insertText: draft } : {}),
+			focusInput: extra?.focusInput,
+		});
+	}
+
+	/**
+	 * Apply a mutation to a session's chat. Visible tab writes through
+	 * capture/adopt; background tabs write into `parked`.
+	 */
+	private mutateChat(sessionId: string, mutator: (chat: MutableChat) => void): void {
+		if (sessionId === this.sessionId) {
 			const chat = this.captureView();
 			mutator(chat);
 			this.adoptView(chat);
 			return;
 		}
-		const parked = this.parked.get(id);
+		const parked = this.parked.get(sessionId);
 		if (!parked) {
 			return;
 		}
 		mutator(parked);
-		this.parked.set(id, parked);
+		this.parked.set(sessionId, parked);
 	}
 
-	private async handleSend(text: string): Promise<void> {
-		if (this.busy) {
-			await this.enqueueMessage(text);
+	private async refreshBilling(): Promise<void> {
+		const seq = ++this.billingSeq;
+		const [offer, quota] = await Promise.all([fetchClaimOffer(), fetchAccountQuota()]);
+		if (seq !== this.billingSeq) {
 			return;
 		}
-		if (this.runningSessionId && this.runningSessionId !== this.sessionId) {
-			this.items.push({
-				id: newItemId('status'),
-				kind: 'status',
-				text: '另一个对话仍在运行，请先停止或等待完成。',
-				tone: 'error',
-			});
-			this.pushState();
+		this.claimOffer = offer;
+		this.accountQuota = quota;
+		this.pushState();
+	}
+
+	private skillCache?: { at: number; root: string; skills: ReturnType<typeof listLocalSkills> };
+
+	private cachedSkills() {
+		const root = workspaceRoot() ?? '';
+		const now = Date.now();
+		if (this.skillCache && this.skillCache.root === root && now - this.skillCache.at < 3000) {
+			return this.skillCache.skills;
+		}
+		const skills = listLocalSkills(root || undefined);
+		this.skillCache = { at: now, root, skills };
+		return skills;
+	}
+
+	private async dismissQuotaNotice(id: string): Promise<void> {
+		const noticeId = id.trim();
+		if (!noticeId) {
 			return;
 		}
+		this.seenNotices.add(noticeId);
+		await this.globalState.update(QUOTA_NOTICE_SEEN_KEY, [...this.seenNotices].slice(-200));
+		this.pushState();
+	}
+
+	private async claimCurrentPlan(planId?: string): Promise<void> {
+		const id = planId || this.claimOffer?.planId;
+		if (!id || this.claimBusy) {
+			return;
+		}
+		this.claimBusy = true;
+		this.claimError = undefined;
+		this.pushState();
+		const result = await claimManualPlan(id);
+		this.claimBusy = false;
+		if (result.ok) {
+			this.claimError = undefined;
+			this.claimOffer = null;
+			void vscode.window.showInformationMessage('已领取免费额度');
+			await this.refreshBilling();
+			return;
+		}
+		this.claimError = result.message;
+		this.pushState();
+	}
+
+	private async retryFromAssistant(assistantId: string): Promise<void> {
 		if (!this.sessionId) {
 			return;
 		}
-		const attachmentBlock = formatAttachmentBlock(this.attachments);
-		const content = `${attachmentBlock}${text}`.trim();
+		const assistantIndex = this.items.findIndex(item => item.id === assistantId && item.kind === 'assistant');
+		if (assistantIndex < 0) {
+			return;
+		}
+		let userId: string | undefined;
+		for (let i = assistantIndex; i >= 0; i--) {
+			const item = this.items[i];
+			if (item.kind === 'user') {
+				userId = item.id;
+				break;
+			}
+		}
+		if (!userId) {
+			return;
+		}
+		await this.rewindToUser(userId, 'retry');
+	}
 
-		this.items.push({ id: newItemId('user'), kind: 'user', text: content });
-		this.attachments = [];
-		this.draftText = '';
-		this.runningSessionId = this.sessionId;
-		this.unreadDoneIds.delete(this.sessionId);
+	private async rewindToUser(userId: string, mode: 'keep' | 'edit' | 'retry'): Promise<void> {
+		if (!this.sessionId || this.busy) {
+			return;
+		}
+		const index = this.items.findIndex(item => item.id === userId && item.kind === 'user');
+		const user = this.items[index];
+		if (!user || user.kind !== 'user') {
+			return;
+		}
+		const hasTail = index < this.items.length - 1;
+		const fileCount = this.fileEdits.filesFromCheckpoint(userId, this.sessionId);
+		if (mode !== 'edit' && !hasTail && fileCount === 0) {
+			return;
+		}
+		if (mode !== 'edit' || hasTail || fileCount > 0) {
+			const label = mode === 'edit' ? '修改' : mode === 'retry' ? '重试' : '回到这里';
+			const detail = mode === 'edit'
+				? '修改这条消息会去掉它和之后的回复，并撤销这之后记录到的文件改动。'
+				: mode === 'retry'
+					? '重试会去掉这条回复和之后的内容，撤销这轮记录到的文件改动，然后原样再发一次。'
+					: '回到这一轮会去掉之后的回复，并撤销这之后记录到的文件改动。';
+			const confirmed = await vscode.window.showWarningMessage(detail, { modal: true }, label);
+			if (confirmed !== label) {
+				return;
+			}
+		}
+		const restored = await this.fileEdits.restoreToCheckpoint(userId, this.sessionId, {
+			drop: mode === 'edit',
+		});
+		this.items = mode === 'edit' ? this.items.slice(0, index) : this.items.slice(0, index + 1);
+		this.todos = [];
 		this.activeStatusId = undefined;
 		this.activeAssistantId = undefined;
 		this.activeReasoningId = undefined;
 		this.activeReasoningStartedAt = undefined;
-		this.turnStartedAt = Date.now();
-		this.activeWorkId = newItemId('work');
-		this.items.push({
-			id: this.activeWorkId,
-			kind: 'work',
-			label: 'Working',
-			startedAt: this.turnStartedAt,
-			elapsedMs: 0,
-			running: true,
-		});
-		this.startElapsedTimer();
-		this.pushState({ clearDraft: true });
+		this.activeWorkId = undefined;
+		this.turnStartedAt = undefined;
+		this.reportedUsageTokens = undefined;
+		const chips = (user.attachments ?? []).flatMap(ref => ref.path ? [{
+			id: ref.id,
+			name: ref.name,
+			fsPath: ref.path,
+		}] : []);
+		if (mode === 'edit') {
+			this.attachments = chips;
+			this.draftText = user.text;
+			this.pushState({ clearDraft: true, insertText: user.text, focusInput: true });
+			await this.persistSession();
+			return;
+		}
+		if (!restored.hadCheckpoint && fileCount === 0 && this.fileEdits.listOwnedBy(this.sessionId).length > 0) {
+			void vscode.window.showInformationMessage('对话已回到这一轮。更早启动里的文件改动没有按轮记录，需要的话请用 Undo 撤销。');
+		}
+		if (mode === 'retry') {
+			this.pushState();
+			const content = `${formatAttachmentBlock(chips)}${user.text}`.trim();
+			await this.startTurn(this.sessionId, content, { text: user.text, attachments: chips }, userId);
+			return;
+		}
+		this.pushState();
+		await this.persistSession();
+	}
 
-		const runSessionId = this.sessionId;
+	private maybeCompact(runSessionId: string): boolean {
+		const chat = runSessionId === this.sessionId
+			? this.captureView()
+			: this.parked.get(runSessionId);
+		if (!chat) {
+			return false;
+		}
+		const brain = getActiveBrain();
+		const model = brain === 'cursor'
+			? (getCursorModel() || undefined)
+			: getSelectedModelId(getProviderMode());
+		const next = compactConversation(chat.items, model);
+		if (!next.compacted) {
+			return false;
+		}
+		this.mutateChat(runSessionId, current => {
+			current.items = next.items;
+		});
+		if (runSessionId === this.sessionId) {
+			this.reportedUsageTokens = undefined;
+		}
+		return true;
+	}
+
+	private async handleSend(text: string, pendingAttachments?: AttachmentChip[]): Promise<void> {
+		if (!this.sessionId) {
+			return;
+		}
+		if (this.busy) {
+			await this.enqueueMessage(text, pendingAttachments);
+			return;
+		}
+		const attachments = pendingAttachments ?? this.attachments;
+		const prepared = prepareComposerTurn(text, workspaceRoot());
+		if (!prepared.modelText) {
+			this.noteComposer(prepared.notice || '没有可发送的内容');
+			return;
+		}
+		const content = `${formatAttachmentBlock(attachments)}${prepared.modelText}`.trim();
+		if (!content) {
+			return;
+		}
+		this.attachments = [];
+		this.draftText = '';
+		this.pushState({ clearDraft: true });
+		await this.startTurn(this.sessionId, content, { text: prepared.displayText, attachments });
+	}
+
+	/** Local slash replies (/skill list, unknown skill) stay in the timeline. */
+	private noteComposer(text: string): void {
+		if (!this.sessionId) {
+			return;
+		}
+		const sessionId = this.sessionId;
+		this.mutateChat(sessionId, chat => {
+			chat.items.push({
+				id: newItemId('status'),
+				kind: 'status',
+				text,
+				tone: 'info',
+			});
+		});
+		this.draftText = '';
+		this.pushState({ clearDraft: true });
+		void this.persistSessionById(sessionId);
+	}
+
+	/**
+	 * Snapshot of other open/running chats + foreign pending files for prompt injection.
+	 */
+	private buildSessionAwareness(runSessionId: string): SessionAwareness {
+		const titleById = new Map<string, string>();
+		for (const tab of this.buildTitleTabs()) {
+			titleById.set(tab.id, tab.title);
+		}
+		for (const s of this.sessionList) {
+			if (!titleById.has(s.id)) {
+				titleById.set(s.id, s.title);
+			}
+		}
+
+		const peerIds = new Set<string>();
+		for (const id of this.runs.keys()) {
+			if (id !== runSessionId) {
+				peerIds.add(id);
+			}
+		}
+		for (const id of this.openTabIds) {
+			if (id !== runSessionId) {
+				peerIds.add(id);
+			}
+		}
+		for (const id of this.parked.keys()) {
+			if (id !== runSessionId) {
+				peerIds.add(id);
+			}
+		}
+
+		const peers = [...peerIds].map(id => {
+			const chat = id === this.sessionId
+				? this.captureView()
+				: this.parked.get(id);
+			const todos = (chat?.todos ?? [])
+				.filter(t => t.status !== 'completed')
+				.map(t => t.content.trim())
+				.filter(Boolean)
+				.slice(0, 5);
+			const recentTools = (chat?.items ?? [])
+				.filter((item): item is Extract<ConversationItem, { kind: 'tool' }> => item.kind === 'tool')
+				.slice(-5)
+				.map(item => `${item.toolName}: ${item.summary}`);
+			return {
+				id,
+				title: titleById.get(id) || '对话',
+				running: this.runs.has(id),
+				todos,
+				recentTools,
+			};
+		}).filter(peer => peer.running || peer.todos.length > 0 || peer.recentTools.length > 0);
+
+		const foreignFiles = this.fileEdits.listOwnedByOthers(runSessionId).map(f => ({
+			path: f.relativePath,
+			kind: f.kind,
+			ownerSessionId: f.ownerSessionId!,
+			ownerTitle: f.ownerSessionId ? titleById.get(f.ownerSessionId) : undefined,
+		}));
+
+		// Always surface file owners even when the peer tab was filtered as idle/empty.
+		for (const file of foreignFiles) {
+			if (peers.some(p => p.id === file.ownerSessionId)) {
+				continue;
+			}
+			peers.push({
+				id: file.ownerSessionId,
+				title: file.ownerTitle || '对话',
+				running: this.runs.has(file.ownerSessionId),
+				todos: [],
+				recentTools: [],
+			});
+		}
+
+		return {
+			sessionId: runSessionId,
+			peers,
+			foreignFiles,
+		};
+	}
+
+	/**
+	 * Start an agent turn for any open session (visible or parked).
+	 * Concurrent across sessions; serialized within one session via `runs`.
+	 */
+	private toAttachmentRefs(attachments?: AttachmentChip[]): UserAttachmentRef[] | undefined {
+		if (!attachments?.length) {
+			return undefined;
+		}
+		return attachments.map(a => {
+			const isImage = !a.excerpt && !!a.fsPath && /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(a.fsPath);
+			let uri: string | undefined;
+			if (isImage && a.fsPath) {
+				try {
+					uri = this.view?.webview.asWebviewUri(vscode.Uri.file(a.fsPath)).toString();
+				} catch {
+					uri = undefined;
+				}
+			}
+			return { id: a.id, name: a.name, image: isImage, uri, path: a.fsPath };
+		});
+	}
+
+	private async startTurn(runSessionId: string, content: string, display?: { text?: string; attachments?: AttachmentChip[] }, reuseUserId?: string): Promise<void> {
+		if (!content.trim() || this.runs.has(runSessionId)) {
+			return;
+		}
+		const displayText = display?.text ?? content;
+		const attachmentRefs = this.toAttachmentRefs(display?.attachments);
+		let sentUserId = reuseUserId ?? '';
+
+		this.mutateChat(runSessionId, chat => {
+			const reused = reuseUserId
+				? chat.items.find(item => item.id === reuseUserId && item.kind === 'user')
+				: undefined;
+			const userId = reused ? reused.id : newItemId('user');
+			sentUserId = userId;
+			if (!reused) {
+				chat.items.push({ id: userId, kind: 'user', text: displayText, attachments: attachmentRefs });
+			}
+			this.fileEdits.beginCheckpoint(userId, runSessionId);
+			chat.activeStatusId = undefined;
+			chat.activeAssistantId = undefined;
+			chat.activeReasoningId = undefined;
+			chat.activeReasoningStartedAt = undefined;
+			chat.turnStartedAt = Date.now();
+			chat.activeWorkId = newItemId('work');
+			chat.items.push({
+				id: chat.activeWorkId,
+				kind: 'work',
+				label: 'Working',
+				startedAt: chat.turnStartedAt,
+				elapsedMs: 0,
+				running: true,
+			});
+		});
+		this.unreadDoneIds.delete(runSessionId);
+		if (runSessionId === this.sessionId) {
+			this.startElapsedTimer();
+		}
+		this.pushState();
+		if (this.maybeCompact(runSessionId)) {
+			this.pushState();
+		}
+
+		const snapshot = runSessionId === this.sessionId
+			? this.captureView()
+			: this.parked.get(runSessionId);
+		if (!snapshot) {
+			return;
+		}
+
 		const brain = getActiveBrain();
 		const provider = getProviderMode();
 		const model = brain === 'cursor'
 			? (getCursorModel() || undefined)
 			: getSelectedModelId(provider);
 		const reasoningLevel = getSelectedReasoningLevel(provider, getSelectedModelId(provider));
-		const history: ChatMessage[] = this.items
-			.filter((item): item is Extract<ConversationItem, { kind: 'user' | 'assistant' }> =>
-				item.kind === 'user' || (item.kind === 'assistant' && !item.streaming && !!item.text))
-			.map(item => ({
-				role: item.kind === 'user' ? 'user' : 'assistant',
-				content: item.text,
-			}));
-		const initialTodos = [...this.todos];
+		const history: ChatMessage[] = snapshot.items
+			.filter((item): item is Extract<ConversationItem, { kind: 'user' | 'assistant' | 'summary' }> =>
+				item.kind === 'user'
+				|| item.kind === 'summary'
+				|| (item.kind === 'assistant' && !item.streaming && !!item.text))
+			.map(item => {
+				if (item.kind === 'summary') {
+					return { role: 'user' as const, content: `此前对话已压缩为摘要，请据此继续：\n${item.text}` };
+				}
+				if (item.kind === 'assistant') {
+					return { role: 'assistant' as const, content: item.text };
+				}
+				if (item.id === sentUserId) {
+					return { role: 'user' as const, content };
+				}
+				const chips = (item.attachments ?? []).flatMap(ref => ref.path ? [{
+					id: ref.id,
+					name: ref.name,
+					fsPath: ref.path,
+				}] : []);
+				return { role: 'user' as const, content: `${formatAttachmentBlock(chips)}${item.text}`.trim() };
+			});
+		const initialTodos = [...snapshot.todos];
+		const sessionAwareness = this.buildSessionAwareness(runSessionId);
 
-		this.runCancel?.dispose();
 		const cancel = new vscode.CancellationTokenSource();
-		this.runCancel = cancel;
+		const run: SessionRun = { cancel };
+		this.runs.set(runSessionId, run);
 		let cancelled = false;
 		let turnFailed = false;
 		try {
@@ -938,11 +1501,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				reasoningLevel,
 				workspaceRoot: workspaceRoot(),
 				initialTodos,
-				onProgress: event => this.applyProgress(event),
-				askUser: (prompt, token) => this.waitForAsk(prompt, token),
+				sessionAwareness,
+				agentPace: getAgentPace(),
+				promptPreamble: buildPromptPreamble(workspaceRoot()),
+				onProgress: event => this.applyProgress(runSessionId, event),
+				askUser: (prompt, token) => this.waitForAsk(runSessionId, prompt, token),
 			}, cancel.token);
 
-			this.mutateRunChat(chat => {
+			this.mutateChat(runSessionId, chat => {
 				this.clearStatusOn(chat);
 				this.finishReasoningOn(chat);
 				if (result.todos?.length) {
@@ -951,7 +1517,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				if (chat.activeAssistantId) {
 					const existing = chat.items.find(i => i.id === chat.activeAssistantId);
 					if (existing && existing.kind === 'assistant') {
-						existing.text = result.content;
+						if (result.content.trim() && result.content.length >= existing.text.length) {
+							existing.text = result.content;
+						}
 						existing.streaming = false;
 					}
 				} else if (result.content.trim()) {
@@ -969,7 +1537,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			cancelled = error instanceof vscode.CancellationError
 				|| (error instanceof Error && /cancel|abort/i.test(error.message));
 			turnFailed = !cancelled;
-			this.mutateRunChat(chat => {
+			this.mutateChat(runSessionId, chat => {
 				this.clearStatusOn(chat);
 				this.finishReasoningOn(chat);
 				this.finishWorkOn(chat, false);
@@ -981,31 +1549,24 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				});
 			});
 		} finally {
-			const finished = runSessionId === this.sessionId
-				? this.captureView()
-				: this.parked.get(runSessionId);
-			if (finished) {
-				finished.activeStatusId = undefined;
-				finished.activeAssistantId = undefined;
-				finished.activeReasoningId = undefined;
-				finished.activeReasoningStartedAt = undefined;
-				finished.activeWorkId = undefined;
-				finished.turnStartedAt = undefined;
-				if ((cancelled || turnFailed) && !this.pendingForceSend) {
-					finished.queuePaused = true;
+			const force = run.pendingForceSend;
+			this.mutateChat(runSessionId, chat => {
+				chat.activeStatusId = undefined;
+				chat.activeAssistantId = undefined;
+				chat.activeReasoningId = undefined;
+				chat.activeReasoningStartedAt = undefined;
+				chat.activeWorkId = undefined;
+				chat.turnStartedAt = undefined;
+				if ((cancelled || turnFailed) && !force) {
+					chat.queuePaused = true;
 				}
-				if (runSessionId === this.sessionId) {
-					this.adoptView(finished);
-				} else {
-					this.parked.set(runSessionId, finished);
-				}
+			});
+			if (runSessionId === this.sessionId) {
+				this.stopElapsedTimer();
 			}
-			this.stopElapsedTimer();
-			if (this.runningSessionId === runSessionId) {
-				this.runningSessionId = undefined;
-			}
-			if (this.runCancel === cancel) {
-				this.runCancel = undefined;
+			// Identity-compare like ZCode: only clear if this turn still owns the slot.
+			if (this.runs.get(runSessionId)?.cancel === cancel) {
+				this.runs.delete(runSessionId);
 			}
 			cancel.dispose();
 			if (!cancelled) {
@@ -1016,15 +1577,35 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			await this.persistSessionById(runSessionId);
 			this.pushState();
 
-			const force = this.pendingForceSend;
-			if (force && runSessionId === this.sessionId) {
-				this.pendingForceSend = undefined;
-				this.queuePaused = false;
-				void this.handleSend(force);
-			} else if (!cancelled && !turnFailed) {
+			if (force) {
+				this.mutateChat(runSessionId, chat => {
+					chat.queuePaused = false;
+				});
+				void this.startTurn(runSessionId, force.content, { text: force.text, attachments: force.attachments });
+			} else if (!cancelled && !turnFailed && this.sessionHasPendingQueue(runSessionId)) {
 				void this.flushQueue(runSessionId);
+			} else if (!cancelled) {
+				// Notify when this session is idle again (not on Stop, not mid-queue).
+				this.playCompletionSound(turnFailed ? 'error' : 'success');
 			}
 		}
+	}
+
+	private sessionHasPendingQueue(sessionId: string): boolean {
+		if (sessionId === this.sessionId) {
+			return !this.queuePaused && this.queue.length > 0;
+		}
+		const parked = this.parked.get(sessionId);
+		return !!parked && !parked.queuePaused && parked.queue.length > 0;
+	}
+
+	/** Soft chime in the chat webview when a turn settles. */
+	private playCompletionSound(outcome: 'success' | 'error'): void {
+		const enabled = vscode.workspace.getConfiguration('zcode').get<boolean>('completionSound');
+		if (enabled === false) {
+			return;
+		}
+		void this.view?.webview.postMessage({ type: 'playCompletionSound', outcome });
 	}
 
 	private async bootstrapSession(): Promise<void> {
@@ -1072,7 +1653,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.sessionId = id;
 		this.sessionPersisted = persisted;
 		this.reportedUsageTokens = undefined;
-		const freezeRunning = this.runningSessionId === id;
+		const freezeRunning = this.runs.has(id);
 		this.items = items.map(item => {
 			if (freezeRunning) {
 				return item;
@@ -1086,8 +1667,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			if (item.kind === 'work') {
 				return { ...item, running: false };
 			}
-			if (item.kind === 'tool' && item.status === 'running') {
-				return { ...item, status: 'done' as const };
+			if (item.kind === 'tool') {
+				const next = item.status === 'running' && !freezeRunning
+					? { ...item, status: 'done' as const }
+					: { ...item };
+				// Historical tool diffs stay one click away — never dump cards into the stream.
+				next.expanded = false;
+				return next;
 			}
 			return item;
 		});
@@ -1097,7 +1683,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.draftText = '';
 		this.queue = [];
 		this.queuePaused = false;
-		this.pendingForceSend = undefined;
 		if (!freezeRunning) {
 			this.activeStatusId = undefined;
 			this.activeAssistantId = undefined;
@@ -1110,13 +1695,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private async startNewSession(opts?: { force?: boolean }): Promise<void> {
 		this.historyOpen = false;
 		// Already on an empty draft — keep a single blank chat, don't spam history.
-		if (!opts?.force && this.isSessionEmpty() && !this.sessionPersisted && this.runningSessionId !== this.sessionId) {
+		if (!opts?.force && this.isSessionEmpty() && !this.sessionPersisted && !this.isRunning(this.sessionId)) {
 			this.pushState({ clearDraft: true });
 			return;
 		}
-		if (this.sessionId && (this.runningSessionId === this.sessionId || !this.isSessionEmpty() || this.sessionPersisted)) {
+		if (this.sessionId && (this.isRunning(this.sessionId) || !this.isSessionEmpty() || this.sessionPersisted)) {
 			this.parkCurrent();
-			if (this.isSessionEmpty() && this.sessionPersisted && this.runningSessionId !== this.sessionId) {
+			if (this.isSessionEmpty() && this.sessionPersisted && !this.isRunning(this.sessionId)) {
 				await this.ideChat.deleteSession(this.sessionId);
 				this.parked.delete(this.sessionId);
 			} else if (!this.isSessionEmpty()) {
@@ -1128,9 +1713,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (this.sessionId && !this.openTabIds.includes(this.sessionId)) {
 			this.openTabIds = [...this.openTabIds, this.sessionId];
 		}
-		this.fileChanges = this.fileEdits.list();
 		await this.refreshSessionList();
-		this.pushState({ clearDraft: true });
+		this.pushAfterSessionSwitch();
 	}
 
 	private async openSession(sessionId: string): Promise<void> {
@@ -1152,13 +1736,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.sessionId = sessionId;
 			this.adoptView(parked);
 			this.parked.delete(sessionId);
-			if (this.runningSessionId === sessionId) {
+			if (this.runs.has(sessionId)) {
 				this.startElapsedTimer();
 			}
 			await this.ideChat.setActiveSession(sessionId).catch(() => undefined);
 			await this.refreshSessionList();
-			this.pushState({ clearDraft: true });
-			if (this.runningSessionId !== sessionId) {
+			this.pushAfterSessionSwitch();
+			if (!this.runs.has(sessionId)) {
 				void this.flushQueue(sessionId);
 			}
 			return;
@@ -1170,19 +1754,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		this.applySession(session.id, session.timeline ?? [], session.todos ?? [], true);
 		await this.refreshSessionList();
-		this.pushState({ clearDraft: true });
+		this.pushAfterSessionSwitch();
 	}
 
 	private async closeTab(sessionId: string): Promise<void> {
-		if (this.runningSessionId === sessionId) {
-			this.stopRunning();
-			this.stopElapsedTimer();
+		if (this.runs.has(sessionId)) {
+			this.stopRunning(sessionId);
+			if (sessionId === this.sessionId) {
+				this.stopElapsedTimer();
+			}
 			// Detach the run marker now — the async run loop's tail must not keep
 			// the closed tab alive via refreshSessionList()/persistSessionById().
-			this.runningSessionId = undefined;
+			this.runs.delete(sessionId);
 		}
 		const closingActive = this.sessionId === sessionId;
-		const closingDraft = closingActive && !this.sessionPersisted && this.runningSessionId !== sessionId;
+		const closingDraft = closingActive && !this.sessionPersisted && !this.runs.has(sessionId);
 
 		// Snapshot and drop the closing chat FIRST. openSession()/startNewSession()
 		// both park the current view, which used to resurrect the closed tab at the
@@ -1224,8 +1810,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async deleteSession(sessionId: string): Promise<void> {
-		if (this.runningSessionId === sessionId) {
-			this.stopRunning();
+		if (this.runs.has(sessionId)) {
+			this.stopRunning(sessionId);
+			this.runs.delete(sessionId);
 		}
 		this.parked.delete(sessionId);
 		await this.ideChat.deleteSession(sessionId);
@@ -1258,12 +1845,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 		const stored = await this.ideChat.getOpenTabIds();
 		const known = new Set(this.sessionList.map(s => s.id));
-		const allowed = new Set<string>([...stored, ...this.parked.keys()]);
+		const allowed = new Set<string>([...stored, ...this.parked.keys(), ...this.runs.keys()]);
 		if (this.sessionId) {
 			allowed.add(this.sessionId);
-		}
-		if (this.runningSessionId) {
-			allowed.add(this.runningSessionId);
 		}
 
 		// Keep existing tab order stable across switches; only append newcomers.
@@ -1277,7 +1861,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				known.has(id)
 				|| this.parked.has(id)
 				|| id === this.sessionId
-				|| id === this.runningSessionId
+				|| this.runs.has(id)
 			) {
 				next.push(id);
 				seen.add(id);
@@ -1292,8 +1876,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		for (const id of this.parked.keys()) {
 			append(id);
 		}
+		for (const id of this.runs.keys()) {
+			append(id);
+		}
 		append(this.sessionId);
-		append(this.runningSessionId);
 		this.openTabIds = next;
 	}
 
@@ -1355,14 +1941,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		await this.refreshSessionList();
 	}
 
-	private applyProgress(event: AgentProgressEvent): void {
+	private applyProgress(sessionId: string, event: AgentProgressEvent): void {
 		if (event.type === 'file_change') {
-			this.fileChanges = this.fileEdits.list();
-			this.pushState();
+			// Only refresh the visible working set when the active tab owns the edit.
+			if (sessionId === this.sessionId) {
+				this.refreshFileChanges();
+				this.pushState();
+			}
 			return;
 		}
 
-		this.mutateRunChat(chat => {
+		this.mutateChat(sessionId, chat => {
 			if (event.type === 'status') {
 				if (chat.activeStatusId) {
 					const row = chat.items.find(i => i.id === chat.activeStatusId);
@@ -1378,7 +1967,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 			if (event.type === 'reasoning') {
 				this.clearStatusOn(chat);
-				this.dropInterimAssistantOn(chat);
+				this.settleAssistantOn(chat);
 				if (!chat.activeReasoningId) {
 					chat.activeReasoningId = newItemId('reasoning');
 					chat.activeReasoningStartedAt = Date.now();
@@ -1387,7 +1976,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 						kind: 'reasoning',
 						text: event.text,
 						streaming: !event.done,
-						expanded: true,
+						// Match Cursor: stay collapsed; header shows a one-line preview while streaming.
+						expanded: false,
 						startedAt: chat.activeReasoningStartedAt,
 					});
 				} else {
@@ -1417,40 +2007,80 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			if (event.type === 'tool_start') {
 				this.clearStatusOn(chat);
 				this.finishReasoningOn(chat);
-				this.dropInterimAssistantOn(chat);
+				this.settleAssistantOn(chat);
+				const startSummary = event.summary && !isUselessToolSummary(event.summary, event.toolName)
+					? event.summary
+					: undefined;
 				chat.items.push({
 					id: event.id,
 					kind: 'tool',
 					toolName: event.toolName,
-					summary: event.summary || toolDisplayName(event.toolName),
+					summary: startSummary || toolDisplayName(event.toolName),
+					detail: event.detail,
 					status: 'running',
+					expanded: false,
 				});
 				this.pinWorkToEndOn(chat);
 				return;
 			}
 
+			if (event.type === 'tool_update') {
+				const row = chat.items.find(i => i.id === event.id);
+				if (row && row.kind === 'tool' && row.status === 'running') {
+					if (event.summary && !isUselessToolSummary(event.summary, row.toolName)) {
+						row.summary = event.summary;
+					}
+					if (typeof event.detail === 'string') {
+						row.detail = event.detail;
+					}
+				}
+				return;
+			}
+
 			if (event.type === 'tool_end') {
-				const patch = {
-					summary: event.summary,
-					status: (event.ok ? 'done' : 'error') as 'done' | 'error',
-					detail: event.detail,
-					path: event.path,
-					uri: event.uri,
-					added: event.added,
-					removed: event.removed,
-				};
 				const row = chat.items.find(i => i.id === event.id);
 				if (row && row.kind === 'tool') {
-					Object.assign(row, patch);
-					if (row.detail || row.uri) {
-						row.expanded = row.expanded ?? false;
+					if (event.summary && !isUselessToolSummary(event.summary, row.toolName)) {
+						row.summary = event.summary;
+					} else if (event.path) {
+						row.summary = event.path;
 					}
+					row.status = event.ok ? 'done' : 'error';
+					if (typeof event.detail === 'string') {
+						row.detail = event.detail;
+					}
+					if (event.path) {
+						row.path = event.path;
+					}
+					if (event.uri) {
+						row.uri = event.uri;
+					}
+					if (typeof event.added === 'number') {
+						row.added = event.added;
+					}
+					if (typeof event.removed === 'number') {
+						row.removed = event.removed;
+					}
+					row.expanded = row.expanded ?? false;
 				} else {
+					let endSummary = toolDisplayName(event.toolName);
+					if (event.path) {
+						endSummary = event.path;
+					}
+					if (event.summary && !isUselessToolSummary(event.summary, event.toolName)) {
+						endSummary = event.summary;
+					}
 					chat.items.push({
 						id: event.id,
 						kind: 'tool',
 						toolName: event.toolName,
-						...patch,
+						summary: endSummary,
+						status: event.ok ? 'done' : 'error',
+						detail: event.detail,
+						path: event.path,
+						uri: event.uri,
+						added: event.added,
+						removed: event.removed,
 						expanded: false,
 					});
 				}
@@ -1460,20 +2090,36 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			if (event.type === 'assistant') {
 				this.clearStatusOn(chat);
 				this.finishReasoningOn(chat);
-				if (!chat.activeAssistantId) {
+				const next = event.text;
+				let row = chat.activeAssistantId
+					? chat.items.find(i => i.id === chat.activeAssistantId)
+					: undefined;
+				if (row && row.kind === 'assistant' && row.text && next && !next.startsWith(row.text)) {
+					// A new segment, not a longer version of the text already on screen.
+					row.streaming = false;
+					chat.activeAssistantId = undefined;
+					row = undefined;
+				}
+				if (!row || row.kind !== 'assistant') {
+					const carried = this.assistantContinuing(chat, next);
+					if (carried) {
+						row = carried;
+						chat.activeAssistantId = carried.id;
+					}
+				}
+				if (!row || row.kind !== 'assistant') {
 					chat.activeAssistantId = newItemId('assistant');
 					chat.items.push({
 						id: chat.activeAssistantId,
 						kind: 'assistant',
-						text: event.text,
+						text: next,
 						streaming: !event.done,
 					});
+				} else if (next.length >= row.text.length) {
+					row.text = next;
+					row.streaming = !event.done;
 				} else {
-					const row = chat.items.find(i => i.id === chat.activeAssistantId);
-					if (row && row.kind === 'assistant') {
-						row.text = event.text;
-						row.streaming = !event.done;
-					}
+					row.streaming = !event.done;
 				}
 				this.pinAssistantBeforeWorkOn(chat);
 			}
@@ -1481,15 +2127,37 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState();
 	}
 
-	private dropInterimAssistantOn(chat: MutableChat): void {
+	/** Keep text already shown. The next answer segment starts a new row. */
+	private settleAssistantOn(chat: MutableChat): void {
 		if (!chat.activeAssistantId) {
 			return;
 		}
 		const row = chat.items.find(i => i.id === chat.activeAssistantId);
 		if (row && row.kind === 'assistant') {
-			chat.items = chat.items.filter(i => i.id !== chat.activeAssistantId);
-			chat.activeAssistantId = undefined;
+			if (!row.text.trim()) {
+				chat.items = chat.items.filter(i => i.id !== chat.activeAssistantId);
+			} else {
+				row.streaming = false;
+			}
 		}
+		chat.activeAssistantId = undefined;
+	}
+
+	/** Cursor sends the full answer so far; reuse that row instead of duplicating it. */
+	private assistantContinuing(chat: MutableChat, next: string): Extract<ConversationItem, { kind: 'assistant' }> | undefined {
+		if (!next) {
+			return undefined;
+		}
+		for (let i = chat.items.length - 1; i >= 0; i--) {
+			const item = chat.items[i];
+			if (item.kind === 'user') {
+				return undefined;
+			}
+			if (item.kind === 'assistant') {
+				return item.text && next.startsWith(item.text) ? item : undefined;
+			}
+		}
+		return undefined;
 	}
 
 	private pinAssistantBeforeWorkOn(chat: MutableChat): void {
@@ -1589,6 +2257,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const provider = getProviderMode();
 		const modelId = getSelectedModelId(provider);
 		const reasoningLevel = getSelectedReasoningLevel(provider, modelId);
+		const agentPace = getAgentPace();
 		const models = modelsForProvider(provider).map(m => ({
 			id: m.id,
 			label: m.label,
@@ -1658,6 +2327,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			reasoningLevels: models.find(m => m.id === modelId)?.reasoningLevels
 				?? models[0]?.reasoningLevels
 				?? [],
+			agentPace,
+			agentPaceLabel: AGENT_PACE_LABELS[agentPace],
+			agentPaces: AGENT_PACES.map(id => ({ id, label: AGENT_PACE_LABELS[id] })),
 			bridgeMode: brain === 'cursor' ? 'cursor-acp' : getBridgeMode(),
 			workspaceRoot: workspaceRoot(),
 			items,
@@ -1671,7 +2343,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				source: s.source,
 				active: s.id === this.sessionId,
 				open: this.openTabIds.includes(s.id),
-				running: this.runningSessionId === s.id,
+				running: this.runs.has(s.id),
 				done: this.unreadDoneIds.has(s.id),
 			})),
 			tabs: this.buildTitleTabs(),
@@ -1684,7 +2356,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			busy: this.busy,
 			historyOpen: this.historyOpen,
 			fontSize: getChatFontSize(),
+			lineHeight: getChatLineHeight(),
 			contextUsage: this.buildContextUsage(),
+			claimOffer: this.claimOffer,
+			claimError: this.claimError,
+			claimBusy: this.claimBusy,
+			accountQuota: this.accountQuota ? { lines: this.accountQuota.lines } : null,
+			quotaNotice: selectQuotaNotice(this.accountQuota, getSelectedModelId(provider), this.seenNotices),
 			scheduleTip: getZcodeScheduleTip(brain),
 			clearDraft: extra?.clearDraft ?? false,
 			insertText: extra?.insertText,
@@ -1717,24 +2395,37 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				title,
 				source: s?.source ?? (isDraft ? this.sessionSource() : undefined),
 				active: id === this.sessionId,
-				running: this.runningSessionId === id,
+				running: this.runs.has(id),
 				done: this.unreadDoneIds.has(id),
 				draft: isDraft,
 			};
 		});
 	}
 
+	/** Bust webview HTTP cache so CSS/JS edits show after Reload Window. */
+	private mediaUri(webview: vscode.Webview, ...pathSegments: string[]): vscode.Uri {
+		const file = vscode.Uri.joinPath(this.extensionUri, ...pathSegments);
+		let ver = '1';
+		try {
+			ver = String(fs.statSync(file.fsPath).mtimeMs | 0);
+		} catch {
+			ver = String(Date.now());
+		}
+		return webview.asWebviewUri(file).with({ query: `v=${ver}` });
+	}
+
 	private renderHtml(webview: vscode.Webview): string {
-		const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'chatView.css'));
-		const highlightStyleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'highlight-vscode.css'));
-		const markdownItUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'markdown-it.min.js'));
-		const highlightUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'highlight.min.js'));
-		const markdownUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'markdown.js'));
-		const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'chatView.js'));
+		const styleUri = this.mediaUri(webview, 'media', 'chatView.css');
+		const highlightStyleUri = this.mediaUri(webview, 'media', 'highlight-vscode.css');
+		const markdownItUri = this.mediaUri(webview, 'media', 'markdown-it.min.js');
+		const highlightUri = this.mediaUri(webview, 'media', 'highlight.min.js');
+		const markdownUri = this.mediaUri(webview, 'media', 'markdown.js');
+		const scriptUri = this.mediaUri(webview, 'media', 'chatView.js');
 		const csp = [
 			`default-src 'none'`,
 			`style-src ${webview.cspSource}`,
 			`script-src ${webview.cspSource}`,
+			`img-src ${webview.cspSource} data:`,
 		].join('; ');
 
 		return `<!DOCTYPE html>
@@ -1743,17 +2434,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	<meta charset="UTF-8" />
 	<meta http-equiv="Content-Security-Policy" content="${csp}" />
 	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<meta name="zcode-chat-ui" content="compact-v2" />
 	<title>ZCode</title>
 	<link rel="stylesheet" href="${styleUri}" />
 	<link rel="stylesheet" href="${highlightStyleUri}" />
 </head>
-<body>
-	<div class="brain-bar">
-		<div class="brain-switch" id="brainSwitch" role="tablist" aria-label="AI brain">
-			<button type="button" class="brain-tab" data-brain="zcode" id="brainZcode">ZCode</button>
-			<button type="button" class="brain-tab" data-brain="cursor" id="brainCursor">Cursor</button>
-		</div>
-	</div>
+<body class="zcode-compact">
 	<div class="history-drawer" id="historyDrawer" hidden>
 		<div class="history-header">
 			<div class="history-header-text">
@@ -1797,17 +2483,30 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		</div>
 		<ul class="queue-list" id="queueList"></ul>
 	</div>
+	<div class="quota-notice" id="quotaNotice" hidden>
+		<span id="quotaNoticeText"></span>
+		<button type="button" id="quotaNoticeClose" aria-label="关闭">×</button>
+	</div>
+	<div class="claim-banner" id="claimBanner" hidden>
+		<div class="claim-copy">
+			<div class="claim-title" id="claimTitle"></div>
+			<div class="claim-meta" id="claimMeta"></div>
+			<div class="claim-error" id="claimError" hidden></div>
+		</div>
+		<button type="button" class="monaco-text-button" id="claimBtn">领取</button>
+	</div>
 	<div class="chat-input-container" id="composer">
 		<div class="menu" id="plusMenu" role="menu"></div>
 		<div class="menu" id="pickerMenu" role="listbox"></div>
-		<textarea id="input" rows="2" placeholder="Plan, @ for context, / for commands"></textarea>
+		<textarea id="input" rows="2" placeholder="Plan, @ for context, / for commands, $ for skills"></textarea>
 		<div class="chat-input-toolbars" id="composerToolbar">
 			<div class="toolbar-left">
 				<button class="icon-btn" id="plus" type="button" title="Add" aria-label="Add">+</button>
 				<span id="zcodePills" data-brain-chrome="zcode">
 					<button class="pill" id="providerBtn" type="button" title="Provider"><span class="label" id="providerLabel">Start Plan</span><span class="chev">▾</span></button>
 					<button class="pill" id="modelBtn" type="button" title="Model"><span class="label" id="modelLabel">Model</span><span class="chev">▾</span></button>
-					<button class="pill thought" id="thoughtBtn" type="button" title="Thinking intensity"><span class="brain">◎</span><span class="label" id="thoughtLabel">High</span><span class="chev">▾</span></button>
+					<button class="pill" id="paceBtn" type="button" title="Agent pace"><span class="label" id="paceLabel">快速</span><span class="chev">▾</span></button>
+					<button class="pill thought" id="thoughtBtn" type="button" title="Thinking intensity"><span class="brain">◎</span><span class="label" id="thoughtLabel">Low</span><span class="chev">▾</span></button>
 				</span>
 				<span id="cursorPills" data-brain-chrome="cursor" hidden>
 					<button class="pill" id="cursorModeBtn" type="button" title="Cursor mode"><span class="label" id="cursorModeLabel">Agent</span><span class="chev">▾</span></button>
@@ -1815,6 +2514,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				</span>
 			</div>
 			<div class="toolbar-right">
+				<span class="quota-chip" id="quotaChip" hidden title="Start Plan 剩余额度"></span>
 				<button class="context-usage" id="contextUsageBtn" type="button" title="上下文容量" aria-label="上下文容量" aria-expanded="false" hidden>
 					<svg class="context-ring" viewBox="0 0 24 24" aria-hidden="true">
 						<circle class="ring-bg" cx="12" cy="12" r="10"></circle>
@@ -1836,6 +2536,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			</div>
 		</div>
 	</div>
+	<div class="brain-bar">
+		<div class="brain-switch" id="brainSwitch" role="tablist" aria-label="AI brain">
+			<button type="button" class="brain-tab" data-brain="zcode" id="brainZcode">ZCode</button>
+			<button type="button" class="brain-tab" data-brain="cursor" id="brainCursor">Cursor</button>
+		</div>
+	</div>
 	<div class="schedule-tip" id="scheduleTip" hidden role="status"></div>
 	<div class="hint" id="hint"></div>
 	<script src="${markdownItUri}"></script>
@@ -1852,7 +2558,7 @@ export function registerChatPanel(
 	ideChat: IdeChatStore,
 	fileEdits: FileEditSession = getFileEditSession(),
 ): ZCodeChatViewProvider {
-	const provider = new ZCodeChatViewProvider(context.extensionUri, ideChat, fileEdits);
+	const provider = new ZCodeChatViewProvider(context.extensionUri, ideChat, fileEdits, context.globalState);
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider(ZCodeChatViewProvider.viewType, provider, {
 			webviewOptions: { retainContextWhenHidden: true },
@@ -1866,4 +2572,32 @@ export function registerChatPanel(
 		}),
 	);
 	return provider;
+}
+
+/** ACP placeholders that must not replace a better tool summary. */
+function isUselessToolSummary(summary: string, toolName?: string): boolean {
+	const t = summary.trim().toLowerCase();
+	if (!t) {
+		return true;
+	}
+	if (
+		t === 'tool'
+		|| t === 'other'
+		|| t === 'mcp: tool'
+		|| t === 'mcp tool'
+		|| t === 'called mcp tool'
+		|| t === 'pending'
+		|| t === 'in_progress'
+		|| t === 'completed'
+		|| t === 'failed'
+		|| t === 'error'
+		|| t === 'done'
+		|| t === 'running'
+	) {
+		return true;
+	}
+	if (toolName && t === toolName.trim().toLowerCase()) {
+		return true;
+	}
+	return false;
 }

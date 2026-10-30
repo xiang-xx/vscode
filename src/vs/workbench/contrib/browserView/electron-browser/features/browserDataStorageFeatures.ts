@@ -16,6 +16,9 @@ import { IEditorService } from '../../../../services/editor/common/editorService
 import { Codicon } from '../../../../../base/common/codicons.js';
 import type { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { INotificationService, Severity } from '../../../../../platform/notification/common/notification.js';
+import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+import { isWindows } from '../../../../../base/common/platform.js';
 
 export const CONTEXT_BROWSER_STORAGE_SCOPE = new RawContextKey<string>('browserStorageScope', '', localize('browser.storageScope', "The storage scope of the current browser view"));
 
@@ -153,6 +156,74 @@ registerAction2(ClearGlobalBrowserStorageAction);
 registerAction2(ClearWorkspaceBrowserStorageAction);
 registerAction2(ClearEphemeralBrowserStorageAction);
 registerAction2(ClearAgentBrowserStorageAction);
+
+class ImportChromeBrowserDataAction extends Action2 {
+	static readonly ID = BrowserViewCommandId.ImportChromeData;
+
+	constructor() {
+		super({
+			id: ImportChromeBrowserDataAction.ID,
+			title: localize2('browser.importChromeData', 'Sync Chrome Sign-in State'),
+			category: BrowserActionCategory,
+			icon: Codicon.globe,
+			f1: true,
+			menu: {
+				id: MenuId.BrowserActionsToolbar,
+				group: BrowserActionGroup.Data,
+				order: 10,
+				isHiddenByDefault: false,
+			}
+		});
+	}
+
+	async run(accessor: ServicesAccessor): Promise<void> {
+		const browserViewWorkbenchService = accessor.get(IBrowserViewWorkbenchService);
+		const notificationService = accessor.get(INotificationService);
+		const dialogService = accessor.get(IDialogService);
+
+		let allowElevated = false;
+		if (isWindows) {
+			const confirm = await dialogService.confirm({
+				type: 'warning',
+				message: localize('browser.importChrome.windowsTitle', "Allow administrator access to import Chrome cookies?"),
+				detail: localize('browser.importChrome.windowsDetail', "Chrome may protect cookies with App-Bound encryption on Windows. This import requests elevation only for this run. Passwords are never imported."),
+				primaryButton: localize('browser.importChrome.windowsContinue', "Continue"),
+			});
+			if (!confirm.confirmed) {
+				return;
+			}
+			allowElevated = true;
+		}
+
+		notificationService.info(localize('browser.importChrome.pending', "Syncing Chrome sign-in state…"));
+		const result = await browserViewWorkbenchService.importChromeBrowserData({ allowElevatedChromeDecryption: allowElevated });
+		if (result.success) {
+			notificationService.notify({
+				severity: Severity.Info,
+				message: localize(
+					'browser.importChrome.success',
+					"Imported {0} cookies and {1} LocalStorage entries from {2} sites.",
+					result.cookies.imported,
+					result.localStorage.entriesImported,
+					result.localStorage.originsImported,
+				),
+			});
+			return;
+		}
+
+		const error = result.error ?? result.issues?.[0] ?? 'chrome_data_import_failed';
+		const message = error === 'chrome_cookie_access_denied'
+			? localize('browser.importChrome.accessDenied', "Chrome cookie access was denied (Keychain / OS permission). No data was imported.")
+			: error === 'chrome_profile_not_found' || error === 'chrome_executable_not_found'
+				? localize('browser.importChrome.notFound', "Could not find a local Chrome profile to import from.")
+				: error === 'chrome_cookie_protection_unsupported'
+					? localize('browser.importChrome.protected', "Some Chrome cookies are App-Bound protected and could not be imported. LocalStorage may still have been imported.")
+					: localize('browser.importChrome.failed', "Chrome data import failed ({0}).", error);
+		notificationService.notify({ severity: Severity.Warning, message });
+	}
+}
+
+registerAction2(ImportChromeBrowserDataAction);
 
 Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Configuration).registerConfiguration({
 	...workbenchConfigurationNodeBase,

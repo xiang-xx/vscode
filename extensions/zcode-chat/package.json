@@ -95,15 +95,42 @@
         },
         "zcode.reasoningLevel": {
           "type": "string",
-          "default": "high",
+          "default": "low",
           "description": "%config.reasoningLevel%"
+        },
+        "zcode.agentPace": {
+          "type": "string",
+          "default": "fast",
+          "enum": [
+            "fast",
+            "balanced",
+            "thorough"
+          ],
+          "enumDescriptions": [
+            "%config.agentPace.fast%",
+            "%config.agentPace.balanced%",
+            "%config.agentPace.thorough%"
+          ],
+          "description": "%config.agentPace%"
         },
         "zcode.chatFontSize": {
           "type": "number",
-          "default": 15,
+          "default": 14,
           "minimum": 11,
           "maximum": 24,
           "description": "%config.chatFontSize%"
+        },
+        "zcode.chatLineHeight": {
+          "type": "number",
+          "default": 1.8,
+          "minimum": 1.3,
+          "maximum": 2.4,
+          "description": "%config.chatLineHeight%"
+        },
+        "zcode.completionSound": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.completionSound%"
         },
         "zcode.bridge.mode": {
           "type": "string",

@@ -12,6 +12,8 @@ import { runCursorAgent } from './cursorAgentRuntime';
 import { getCursorAuthStatus } from './cursorAuth';
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, PROVIDER_HINTS, PROVIDER_LABELS, type ProviderMode } from './providers';
+import { getAgentPace, type AgentPace } from './agentPace';
+import type { SessionAwareness } from './sessionAwareness';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
 
 export type BridgeMode = 'agent' | 'stub' | 'http' | 'cursor-acp';
@@ -31,6 +33,12 @@ export interface ChatTurnRequest {
 	onProgress?: (event: AgentProgressEvent) => void;
 	initialTodos?: import('./conversation').TodoItem[];
 	askUser?: AskUserHandler;
+	/** Concurrent-session occupancy so agents avoid conflicting edits. */
+	sessionAwareness?: SessionAwareness;
+	/** ZCode explore-vs-edit bias (ignored for Cursor brain). */
+	agentPace?: AgentPace;
+	/** Personal instructions, project AGENTS.md, and the skill catalog. */
+	promptPreamble?: string;
 }
 
 export interface ChatTurnResult {
@@ -120,6 +128,8 @@ async function completeViaCursorAcp(
 		mode: getCursorAgentMode(),
 		model: request.model || getCursorModel() || undefined,
 		askUser: request.askUser,
+		sessionAwareness: request.sessionAwareness,
+		promptPreamble: request.promptPreamble,
 	});
 	return {
 		content: result.text,
@@ -147,6 +157,9 @@ async function completeViaAgent(
 		onProgress: request.onProgress,
 		initialTodos: request.initialTodos,
 		askUser: request.askUser,
+		sessionAwareness: request.sessionAwareness,
+		agentPace: request.agentPace ?? getAgentPace(),
+		promptPreamble: request.promptPreamble,
 	});
 	return {
 		content: result.text,
@@ -210,7 +223,7 @@ async function completeViaHttp(
 			},
 			body: JSON.stringify({
 				model,
-				messages: request.messages,
+				messages: withPreamble(request.messages, request.promptPreamble),
 				stream: false,
 				metadata: {
 					workspaceRoot: request.workspaceRoot,
@@ -277,6 +290,14 @@ function safeSession() {
 function emptyToUndefined(value: string | undefined): string | undefined {
 	const trimmed = value?.trim();
 	return trimmed ? trimmed : undefined;
+}
+
+function withPreamble(messages: ChatMessage[], preamble?: string): ChatMessage[] {
+	const text = preamble?.trim();
+	if (!text) {
+		return messages;
+	}
+	return [{ role: 'system', content: text }, ...messages];
 }
 
 function truncate(text: string, max: number): string {

@@ -45,6 +45,18 @@ function createSessionFileDiff(beforeSessionUri: string, afterSessionUri: string
 }
 
 /**
+ * Reads the before-snapshot text for an identity. Rename records are stored
+ * under their post-rename path while `firstFilePath` may hold the pre-rename
+ * path, so fall back to the terminal path. Returns `undefined` when no
+ * snapshot exists (callers skip the file rather than treating it as empty).
+ */
+async function readBeforeText(db: ISessionDatabase, identity: IFileIdentity): Promise<string | undefined> {
+	const content = await db.readFileEditContent(identity.firstToolCallId, identity.firstFilePath)
+		?? await db.readFileEditContent(identity.firstToolCallId, identity.terminalPath);
+	return content?.beforeContent ? new TextDecoder().decode(content.beforeContent) : undefined;
+}
+
+/**
  * Represents a file's identity across renames, tracking its first and last
  * snapshots in the session for diff computation.
  */
@@ -260,25 +272,26 @@ export async function computeSessionDiffs(
 
 		diffPromises.push((async () => {
 			// Determine "before" text
-			let beforeText: string;
+			let beforeText: string | undefined;
 			if (identity.firstKind === FileEditKind.Create) {
 				beforeText = '';
 			} else {
-				const content = await db.readFileEditContent(identity.firstToolCallId, identity.firstFilePath);
-				beforeText = content?.beforeContent ? new TextDecoder().decode(content.beforeContent) : '';
+				// A missing snapshot must not be treated as an empty file (that would
+				// report the whole file as added); skip the file instead.
+				beforeText = await readBeforeText(db, identity);
 			}
 
 			// Determine "after" text
-			let afterText: string;
+			let afterText: string | undefined;
 			if (identity.lastKind === FileEditKind.Delete) {
 				afterText = '';
 			} else {
 				const content = await db.readFileEditContent(identity.lastToolCallId, identity.lastFilePath);
-				afterText = content?.afterContent ? new TextDecoder().decode(content.afterContent) : '';
+				afterText = content?.afterContent ? new TextDecoder().decode(content.afterContent) : undefined;
 			}
 
-			// Skip files with no net change
-			if (beforeText === afterText) {
+			// Skip files with no net change or with unavailable snapshots
+			if (beforeText === undefined || afterText === undefined || beforeText === afterText) {
 				return;
 			}
 
@@ -501,23 +514,23 @@ async function computeUnionedFileDiffs(
 			const firstSource = sources[identity.firstSourceIdx];
 			const lastSource = sources[identity.lastSourceIdx];
 
-			let beforeText: string;
+			let beforeText: string | undefined;
 			if (identity.firstKind === FileEditKind.Create) {
 				beforeText = '';
 			} else {
-				const content = await firstSource.db.readFileEditContent(identity.firstToolCallId, identity.firstFilePath);
-				beforeText = content?.beforeContent ? new TextDecoder().decode(content.beforeContent) : '';
+				// A missing snapshot must not be treated as an empty file; skip instead.
+				beforeText = await readBeforeText(firstSource.db, identity);
 			}
 
-			let afterText: string;
+			let afterText: string | undefined;
 			if (identity.lastKind === FileEditKind.Delete) {
 				afterText = '';
 			} else {
 				const content = await lastSource.db.readFileEditContent(identity.lastToolCallId, identity.lastFilePath);
-				afterText = content?.afterContent ? new TextDecoder().decode(content.afterContent) : '';
+				afterText = content?.afterContent ? new TextDecoder().decode(content.afterContent) : undefined;
 			}
 
-			if (beforeText === afterText) {
+			if (beforeText === undefined || afterText === undefined || beforeText === afterText) {
 				return;
 			}
 
@@ -677,21 +690,21 @@ export async function computeTurnDiffs(
 			continue;
 		}
 		diffPromises.push((async () => {
-			let beforeText: string;
+			let beforeText: string | undefined;
 			if (identity.firstKind === FileEditKind.Create) {
 				beforeText = '';
 			} else {
-				const content = await db.readFileEditContent(identity.firstToolCallId, identity.firstFilePath);
-				beforeText = content?.beforeContent ? new TextDecoder().decode(content.beforeContent) : '';
+				// A missing snapshot must not be treated as an empty file; skip instead.
+				beforeText = await readBeforeText(db, identity);
 			}
-			let afterText: string;
+			let afterText: string | undefined;
 			if (identity.lastKind === FileEditKind.Delete) {
 				afterText = '';
 			} else {
 				const content = await db.readFileEditContent(identity.lastToolCallId, identity.lastFilePath);
-				afterText = content?.afterContent ? new TextDecoder().decode(content.afterContent) : '';
+				afterText = content?.afterContent ? new TextDecoder().decode(content.afterContent) : undefined;
 			}
-			if (beforeText === afterText) {
+			if (beforeText === undefined || afterText === undefined || beforeText === afterText) {
 				return;
 			}
 			const counts = await diffService.computeDiffCounts(beforeText, afterText);

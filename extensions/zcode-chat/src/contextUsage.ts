@@ -113,7 +113,7 @@ export function computeContextUsage(opts: {
 			buckets.tools += estimateTokens(
 				[item.toolName, item.summary, item.detail, item.path].filter(Boolean).join('\n'),
 			);
-		} else if (item.kind === 'status') {
+		} else if (item.kind === 'status' || item.kind === 'summary') {
 			buckets.messages += estimateTokens(item.text || '');
 		}
 	}

@@ -297,7 +297,10 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
 				'node_modules/@vscode/sandbox-runtime/**', // includes its nested `commander`
 				'node_modules/@pondwader/socks5-server/**',
 				'node_modules/shell-quote/**',
-				'node_modules/zod/**'
+				'node_modules/zod/**',
+				// Main process may statically import `ws` before bootstrap-esm registers the
+				// ASAR resolve hook; keep a real copy so default ESM resolution succeeds.
+				'node_modules/ws/**',
 			], 'node_modules.asar'));
 
 		const mergeStreams = [

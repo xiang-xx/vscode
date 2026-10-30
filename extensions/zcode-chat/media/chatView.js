@@ -29,9 +29,11 @@
 	const providerBtn = document.getElementById('providerBtn');
 	const modelBtn = document.getElementById('modelBtn');
 	const thoughtBtn = document.getElementById('thoughtBtn');
+	const paceBtn = document.getElementById('paceBtn');
 	const providerLabel = document.getElementById('providerLabel');
 	const modelLabel = document.getElementById('modelLabel');
 	const thoughtLabel = document.getElementById('thoughtLabel');
+	const paceLabel = document.getElementById('paceLabel');
 	const zcodePills = document.getElementById('zcodePills');
 	const cursorPills = document.getElementById('cursorPills');
 	const cursorModeBtn = document.getElementById('cursorModeBtn');
@@ -47,6 +49,15 @@
 	const composer = document.getElementById('composer');
 	const timelineRoot = document.getElementById('timeline');
 	const contextUsageBtn = document.getElementById('contextUsageBtn');
+	const claimBanner = document.getElementById('claimBanner');
+	const claimTitle = document.getElementById('claimTitle');
+	const claimMeta = document.getElementById('claimMeta');
+	const claimError = document.getElementById('claimError');
+	const claimBtn = document.getElementById('claimBtn');
+	const quotaChip = document.getElementById('quotaChip');
+	const quotaNotice = document.getElementById('quotaNotice');
+	const quotaNoticeText = document.getElementById('quotaNoticeText');
+	const quotaNoticeClose = document.getElementById('quotaNoticeClose');
 	const contextUsagePct = document.getElementById('contextUsagePct');
 	const contextPanel = document.getElementById('contextPanel');
 	const contextPanelSummary = document.getElementById('contextPanelSummary');
@@ -57,6 +68,9 @@
 	let busy = false;
 	let state = null;
 	let openMenu = null;
+	let skillItems = [];
+	let skillIndex = 0;
+	let skillRange = null;
 	let historyOpen = false;
 	let contextPanelOpen = false;
 	const CONTEXT_RING_R = 10;
@@ -102,37 +116,181 @@
 		return `<p>${escapeHtml(text).replace(/\n/g, '<br/>')}</p>`;
 	}
 
-	function toolGlyph(status) {
-		if (status === 'running') return '◐';
-		if (status === 'error') return '!';
-		return '✓';
+	function iconSvg(body) {
+		return `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`;
 	}
 
-	function toolTitle(name) {
-		switch (name) {
+	const TOOL_ICON = {
+		check: iconSvg('<path d="M20 6 9 17l-5-5"/>'),
+		spin: iconSvg('<path d="M21 12a9 9 0 1 1-6.219-8.56"/>'),
+		read: iconSvg('<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>'),
+		edit: iconSvg('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
+		shell: iconSvg('<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>'),
+		search: iconSvg('<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'),
+		list: iconSvg('<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>'),
+		globe: iconSvg('<circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>'),
+		trash: iconSvg('<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>'),
+		todo: iconSvg('<path d="M11 18H3"/><path d="m15 18 2 2 4-4"/><path d="M16 6H3"/><path d="M16 12H3"/>'),
+		ask: iconSvg('<path d="M7 7h10"/><path d="M7 12h6"/><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'),
+		default: iconSvg('<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>'),
+	};
+
+	function normalizeToolKey(name) {
+		const raw = String(name || '').trim();
+		const lower = raw.toLowerCase();
+		if (/^called\s+mcp/.test(lower) || lower.includes('mcp tool')) return 'mcp';
+		if (/^ran\s+shell|^shell$|^bash$|^terminal/.test(lower)) return 'shell';
+		if (/^edited?\b|^edit\b|^wrote\b|^write\b/.test(lower)) return 'edit';
+		if (/^read\b|^reading\b/.test(lower)) return 'read';
+		if (/^explor|^search|^grep|^glob/.test(lower)) return 'search';
+		if (/^listed?\b|^list\b/.test(lower)) return 'list';
+		if (/browser|navigate|fetch|web/.test(lower)) return 'browser';
+		return raw;
+	}
+
+	function toolIcon(name, status) {
+		if (status === 'done') {
+			return TOOL_ICON.check;
+		}
+		if (status === 'running') {
+			return TOOL_ICON.spin;
+		}
+		switch (normalizeToolKey(name)) {
 			case 'read_file':
-			case 'Read': return 'Read';
+			case 'Read':
+			case 'read':
+				return TOOL_ICON.read;
 			case 'write_file':
-			case 'Write': return 'Write';
+			case 'Write':
 			case 'str_replace':
-			case 'Edit': return 'Edit';
+			case 'Edit':
+			case 'edit':
+				return TOOL_ICON.edit;
+			case 'mcp':
+				return TOOL_ICON.default;
 			case 'delete_file':
-			case 'Delete': return 'Delete';
-			case 'list_dir': return 'List';
+			case 'Delete':
+				return TOOL_ICON.trash;
 			case 'run_terminal_cmd':
 			case 'Bash':
-			case 'bash': return 'Bash';
-			case 'get_diagnostics': return 'Diagnostics';
-			case 'web_fetch':
-			case 'WebFetch': return 'Fetch';
+			case 'bash':
+			case 'shell':
+				return TOOL_ICON.shell;
 			case 'grep':
-			case 'Grep': return 'Grep';
+			case 'Grep':
 			case 'glob':
-			case 'Glob': return 'Glob';
-			case 'TodoWrite': return 'Todos';
-			case 'AskUserQuestion': return 'Question';
-			default: return name;
+			case 'Glob':
+			case 'search':
+				return TOOL_ICON.search;
+			case 'list_dir':
+			case 'list':
+				return TOOL_ICON.list;
+			case 'web_fetch':
+			case 'WebFetch':
+			case 'open_browser_page':
+			case 'browser_navigate':
+			case 'browser_reload':
+			case 'browser_go_back':
+			case 'browser_go_forward':
+			case 'browser_new_tab':
+			case 'browser_list_or_open':
+			case 'browser':
+				return TOOL_ICON.globe;
+			case 'TodoWrite':
+				return TOOL_ICON.todo;
+			case 'AskUserQuestion':
+				return TOOL_ICON.ask;
+			default:
+				return TOOL_ICON.default;
 		}
+	}
+
+	const REASONING_MARK = iconSvg('<path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/>');
+
+	function toolTitle(name) {
+		const key = normalizeToolKey(name);
+		switch (key) {
+			case 'read_file':
+			case 'Read':
+			case 'read': return 'Read';
+			case 'write_file':
+			case 'Write': return 'Wrote';
+			case 'str_replace':
+			case 'Edit':
+			case 'edit': return 'Edited';
+			case 'delete_file':
+			case 'Delete': return 'Deleted';
+			case 'list_dir':
+			case 'list': return 'Listed';
+			case 'run_terminal_cmd':
+			case 'Bash':
+			case 'bash':
+			case 'shell': return 'Ran';
+			case 'get_diagnostics': return 'Checked';
+			case 'web_fetch':
+			case 'WebFetch': return 'Fetched';
+			case 'grep':
+			case 'Grep':
+			case 'glob':
+			case 'Glob':
+			case 'search': return 'Explored';
+			case 'mcp': return 'Used';
+			case 'open_browser_page':
+			case 'browser_navigate':
+			case 'browser_reload':
+			case 'browser_go_back':
+			case 'browser_go_forward':
+			case 'browser_new_tab':
+			case 'browser_list_or_open':
+			case 'browser_toggle_devtools':
+			case 'browser': return 'Browsed';
+			case 'browser_import_chrome_data': return 'Synced';
+			case 'TodoWrite': return 'Todos';
+			case 'AskUserQuestion': return 'Asked';
+			default: {
+				const raw = String(name || '').trim();
+				// Cursor ACP titles are already sentence-case verbs — keep short.
+				if (/^(called|ran|edited|read|explored|searched|listed|wrote)\b/i.test(raw)) {
+					return raw.replace(/\s+mcp\s+tool/i, ' MCP').split(/\s+/).slice(0, 2).join(' ');
+				}
+				return raw.length > 28 ? raw.slice(0, 26) + '…' : raw;
+			}
+		}
+	}
+
+	function isGenericToolSummary(text) {
+		const t = String(text || '').trim().toLowerCase();
+		return !t
+			|| t === 'tool'
+			|| t === 'other'
+			|| t === 'mcp: tool'
+			|| t === 'mcp tool'
+			|| t === 'called mcp tool'
+			|| t === 'pending'
+			|| t === 'in_progress'
+			|| t === 'completed'
+			|| t === 'failed'
+			|| t === 'error'
+			|| t === 'done'
+			|| t === 'running';
+	}
+
+	function toolSummaryText(item) {
+		const path = typeof item.path === 'string' ? item.path.trim() : '';
+		const summary = typeof item.summary === 'string' ? item.summary.trim() : '';
+		const title = toolTitle(item.toolName);
+		if (path) {
+			return path;
+		}
+		if (!summary || isGenericToolSummary(summary) || summary === item.toolName || summary === title) {
+			return '';
+		}
+		// Drop redundant leading verb if summary already repeats the title.
+		if (summary.toLowerCase().startsWith(String(item.toolName || '').toLowerCase())) {
+			const rest = summary.slice(String(item.toolName || '').length).replace(/^[:\s\-—]+/, '');
+			return isGenericToolSummary(rest) ? '' : (rest || '');
+		}
+		return summary;
 	}
 
 	function ensureQuestionDraft(item) {
@@ -319,18 +477,27 @@
 
 	function todoGlyph(status) {
 		if (status === 'completed') return '✓';
-		if (status === 'in_progress') return '◐';
+		if (status === 'in_progress') return '→';
 		return '○';
 	}
 
 	function closeMenus() {
 		openMenu = null;
-		plusMenu.classList.remove('open');
-		pickerMenu.classList.remove('open');
+		if (plusMenu) plusMenu.classList.remove('open');
+		pickerMenu.classList.remove('open', 'skill-picker');
+		pickerMenu.style.left = '';
+		pickerMenu.style.bottom = '';
+		pickerMenu.style.width = '';
+		skillRange = null;
+		skillItems = [];
+		skillIndex = 0;
 		plusBtn.setAttribute('aria-expanded', 'false');
 		providerBtn.setAttribute('aria-expanded', 'false');
 		modelBtn.setAttribute('aria-expanded', 'false');
 		thoughtBtn.setAttribute('aria-expanded', 'false');
+		if (paceBtn) {
+			paceBtn.setAttribute('aria-expanded', 'false');
+		}
 		setContextPanelOpen(false);
 	}
 
@@ -428,7 +595,7 @@
 			sendBtn.setAttribute('aria-label', 'Send');
 			sendBtn.classList.remove('stopping', 'queueing');
 		}
-		[plusBtn, providerBtn, modelBtn, thoughtBtn, inputEl].forEach((el) => {
+		[plusBtn, providerBtn, modelBtn, paceBtn, thoughtBtn, inputEl].forEach((el) => {
 			if (el) el.disabled = false;
 		});
 	}
@@ -550,6 +717,54 @@
 		scrollTimelineToBottom();
 	}
 
+	function bindToggle(el, message) {
+		el.addEventListener('pointerdown', (event) => {
+			if (event.button !== 0) {
+				return;
+			}
+			event.preventDefault();
+			event.stopPropagation();
+			vscode.postMessage(message);
+		});
+		el.addEventListener('keydown', (event) => {
+			if (event.key !== 'Enter' && event.key !== ' ') {
+				return;
+			}
+			event.preventDefault();
+			vscode.postMessage(message);
+		});
+	}
+
+	function lastReasoningLine(text) {
+		const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+		for (let index = lines.length - 1; index >= 0; index -= 1) {
+			const line = (lines[index] || '').trim();
+			if (line) return line;
+		}
+		return '';
+	}
+
+	function fillReasoningChrome(row, item) {
+		const label = row.querySelector('.reasoning-header .label');
+		const dur = row.querySelector('.reasoning-header .dur');
+		const sep = row.querySelector('.reasoning-header .sep');
+		const stream = row.querySelector('.reasoning-header .stream-line');
+		if (label) label.textContent = item.streaming ? 'Thinking' : 'Thought';
+		// While streaming and collapsed: one-line peek. When done: label + duration only.
+		const summary = item.streaming && !item.expanded ? lastReasoningLine(item.text) : '';
+		const durText = !item.streaming && item.durationLabel ? item.durationLabel : '';
+		if (stream) {
+			stream.textContent = summary;
+			stream.hidden = !summary;
+			if (summary) stream.scrollLeft = stream.scrollWidth;
+		}
+		if (dur) {
+			dur.textContent = durText;
+			dur.hidden = !durText;
+		}
+		if (sep) sep.hidden = !(summary || durText);
+	}
+
 	function renderReasoning(item, host) {
 		const row = document.createElement('div');
 		row.className = 'reasoning-row' + (item.streaming ? ' streaming' : '') + (item.expanded ? ' expanded' : ' collapsed');
@@ -557,18 +772,11 @@
 		const header = document.createElement('button');
 		header.type = 'button';
 		header.className = 'reasoning-header';
-		const chev = item.expanded ? '▾' : '▸';
-		const title = item.streaming ? '正在思考' : '思考';
-		let dur = '';
-		if (item.durationLabel) {
-			dur = item.streaming ? '' : ` · 持续了 ${item.durationLabel}`;
-		}
-		header.innerHTML = `<span class="chev">${chev}</span><span class="label"></span><span class="dur"></span>`;
-		header.querySelector('.label').textContent = title;
-		header.querySelector('.dur').textContent = dur;
-		header.onclick = () => vscode.postMessage({ type: 'toggleReasoning', id: item.id });
+		header.innerHTML = `<span class="mark" aria-hidden="true">${REASONING_MARK}</span><span class="label"></span><span class="sep" aria-hidden="true">·</span><span class="dur"></span><span class="stream-line"></span><span class="chev" aria-hidden="true"></span>`;
+		bindToggle(header, { type: 'toggleReasoning', id: item.id });
 		row.appendChild(header);
-		if (item.expanded || item.streaming) {
+		fillReasoningChrome(row, item);
+		if (item.expanded) {
 			const body = document.createElement('div');
 			body.className = 'reasoning-body';
 			body.dataset.id = item.id;
@@ -629,55 +837,58 @@
 			span.textContent = line;
 			pre.appendChild(span);
 		});
+		pre.dataset.raw = String(detail || '');
 		container.appendChild(pre);
 	}
 
 	function renderTool(item, host) {
-		const expandable = !!(item.detail || item.uri);
 		const row = document.createElement('div');
 		row.className = 'tool-row ' + (item.status || '')
 			+ (item.expanded ? ' expanded' : ' collapsed')
-			+ (expandable ? ' expandable' : '');
+			+ ' expandable';
 
-		const header = document.createElement(expandable ? 'button' : 'div');
-		if (expandable) header.type = 'button';
+		const header = document.createElement('button');
+		header.type = 'button';
 		header.className = 'tool-header';
-		const chev = expandable ? (item.expanded ? '▾' : '▸') : '';
 		header.innerHTML =
-			(expandable ? `<span class="chev">${chev}</span>` : '') +
 			'<span class="glyph"></span>' +
-			'<div class="meta"><div class="name"></div><div class="summary"></div></div>' +
+			'<span class="name"></span>' +
+			'<span class="summary"></span>' +
 			((item.added || item.removed)
 				? '<span class="tool-stats"><span class="add"></span><span class="del"></span></span>'
-				: '');
-		header.querySelector('.glyph').textContent = toolGlyph(item.status);
-		header.querySelector('.name').textContent = toolTitle(item.toolName);
-		let summaryText = item.summary || '';
-		if (item.path) {
-			summaryText = (item.status === 'done' ? 'completed · ' : '') + item.path;
-		} else if (item.status === 'done' && summaryText) {
-			summaryText = summaryText;
+				: '') +
+			'<span class="chev" aria-hidden="true"></span>';
+		header.querySelector('.glyph').innerHTML = toolIcon(item.toolName, item.status);
+		const title = toolTitle(item.toolName);
+		const summaryText = toolSummaryText(item);
+		// Cursor-style: one quiet line — "Edited path" / "Ran cmd", not stacked cards.
+		if (summaryText) {
+			header.querySelector('.name').textContent = title;
+			header.querySelector('.summary').textContent = summaryText;
+			header.querySelector('.summary').hidden = false;
+		} else {
+			header.querySelector('.name').textContent = title;
+			header.querySelector('.summary').textContent = '';
+			header.querySelector('.summary').hidden = true;
 		}
-		header.querySelector('.summary').textContent = summaryText;
 		const stats = header.querySelector('.tool-stats');
 		if (stats) {
 			stats.querySelector('.add').textContent = item.added ? `+${item.added}` : '';
 			stats.querySelector('.del').textContent = item.removed ? `-${item.removed}` : '';
 		}
-		if (expandable) {
-			header.onclick = () => vscode.postMessage({ type: 'toggleTool', id: item.id });
-		}
+		bindToggle(header, { type: 'toggleTool', id: item.id });
 		row.appendChild(header);
 
-		if (item.expanded && (item.detail || item.uri)) {
+		if (item.expanded) {
 			const body = document.createElement('div');
 			body.className = 'tool-detail';
-			if (item.detail) {
-				renderDiffDetail(body, item.detail);
+			const text = item.detail || item.summary || '';
+			if (text) {
+				renderDiffDetail(body, text);
 			} else {
 				const empty = document.createElement('div');
 				empty.className = 'tool-detail-empty';
-				empty.textContent = '暂无预览内容';
+				empty.textContent = item.status === 'running' ? '正在执行…' : '暂无预览内容';
 				body.appendChild(empty);
 			}
 			if (item.uri) {
@@ -706,33 +917,37 @@
 		host.appendChild(row);
 	}
 
-	function tryPatchStreamingReasoning(items) {
-		if (!items || !items.length) {
-			return false;
+	function expansionMatches(items) {
+		for (const item of items) {
+			if (item.kind !== 'reasoning' && item.kind !== 'tool') {
+				continue;
+			}
+			const el = timelineEl.querySelector(`[data-item-id="${CSS.escape(item.id)}"]`);
+			if (!el || el.classList.contains('expanded') !== !!item.expanded) {
+				return false;
+			}
 		}
-		const streaming = items.filter((i) => i.kind === 'reasoning' && i.streaming);
-		if (streaming.length !== 1) {
-			return false;
-		}
-		const item = streaming[0];
-		const row = timelineEl.querySelector(`.reasoning-row[data-id="${CSS.escape(item.id)}"]`);
+		return true;
+	}
+
+	function patchReasoningRow(item) {
+		const row = timelineEl.querySelector(`.reasoning-row[data-item-id="${CSS.escape(item.id)}"], .reasoning-row[data-id="${CSS.escape(item.id)}"]`);
 		if (!row) {
 			return false;
 		}
-		// Only patch when the timeline structure is otherwise unchanged (same item ids in order).
-		const existingIds = [...timelineEl.querySelectorAll('[data-item-id]')].map((el) => el.getAttribute('data-item-id'));
-		const nextIds = items.map((i) => i.id);
-		if (existingIds.length !== nextIds.length || existingIds.some((id, idx) => id !== nextIds[idx])) {
-			return false;
-		}
-
-		row.className = 'reasoning-row streaming' + (item.expanded ? ' expanded' : ' collapsed');
-		const label = row.querySelector('.reasoning-header .label');
-		if (label) label.textContent = '正在思考';
-		const dur = row.querySelector('.reasoning-header .dur');
-		if (dur) dur.textContent = '';
+		row.className = 'reasoning-row'
+			+ (item.streaming ? ' streaming' : '')
+			+ (item.expanded ? ' expanded' : ' collapsed');
+		row.dataset.id = item.id;
+		fillReasoningChrome(row, item);
 		let body = row.querySelector('.reasoning-body');
-		if (!body && (item.expanded || item.streaming)) {
+		if (!item.expanded) {
+			if (body) {
+				body.remove();
+			}
+			return true;
+		}
+		if (!body) {
 			body = document.createElement('div');
 			body.className = 'reasoning-body';
 			body.dataset.id = item.id;
@@ -743,10 +958,6 @@
 				};
 			}, { passive: true });
 			row.appendChild(body);
-		}
-		if (!body) {
-			scrollTimelineToBottom();
-			return true;
 		}
 		const saved = reasoningScroll[item.id] || {
 			top: body.scrollTop,
@@ -764,21 +975,457 @@
 			top: body.scrollTop,
 			stickBottom: saved.stickBottom && isNearBottom(body, 32),
 		};
-
-		const work = items.find((i) => i.kind === 'work' && i.running);
-		if (work) {
-			const workEl = timelineEl.querySelector(`.work-row[data-item-id="${CSS.escape(work.id)}"] .text`);
-			if (workEl) {
-				const d = work.durationLabel || '';
-				workEl.textContent = d ? `已运行 ${d}` : '工作中…';
-			}
-		}
-		scrollTimelineToBottom();
 		return true;
 	}
 
+	function patchToolRow(item) {
+		const row = timelineEl.querySelector(`.tool-row[data-item-id="${CSS.escape(item.id)}"]`);
+		if (!row) {
+			return false;
+		}
+		const nextClass = 'tool-row ' + (item.status || '')
+			+ (item.expanded ? ' expanded' : ' collapsed')
+			+ ' expandable';
+		if (row.className !== nextClass) {
+			row.className = nextClass;
+		}
+		const glyph = row.querySelector('.tool-header .glyph');
+		if (glyph) {
+			glyph.innerHTML = toolIcon(item.toolName, item.status);
+		}
+		const name = row.querySelector('.tool-header .name');
+		if (name) {
+			name.textContent = toolTitle(item.toolName);
+		}
+		const summary = row.querySelector('.tool-header .summary');
+		if (summary) {
+			const summaryText = toolSummaryText(item);
+			if (summary.textContent !== summaryText) {
+				summary.textContent = summaryText;
+			}
+			summary.hidden = !summaryText;
+		}
+		let stats = row.querySelector('.tool-header .tool-stats');
+		if (item.added || item.removed) {
+			if (!stats) {
+				stats = document.createElement('span');
+				stats.className = 'tool-stats';
+				stats.innerHTML = '<span class="add"></span><span class="del"></span>';
+				const header = row.querySelector('.tool-header');
+				const chevron = header?.querySelector('.chev');
+				if (header && chevron) {
+					header.insertBefore(stats, chevron);
+				} else {
+					header?.appendChild(stats);
+				}
+			}
+			const add = stats.querySelector('.add');
+			const del = stats.querySelector('.del');
+			if (add) {
+				add.textContent = item.added ? `+${item.added}` : '';
+			}
+			if (del) {
+				del.textContent = item.removed ? `-${item.removed}` : '';
+			}
+		} else if (stats) {
+			stats.remove();
+		}
+
+		let body = row.querySelector('.tool-detail');
+		if (!item.expanded) {
+			if (body) {
+				body.remove();
+			}
+			return true;
+		}
+		const text = item.detail || item.summary || '';
+		const pre = body?.querySelector('.tool-diff');
+		if (body && pre && pre.dataset.raw === text) {
+			return true;
+		}
+		if (!body) {
+			body = document.createElement('div');
+			body.className = 'tool-detail';
+			row.appendChild(body);
+		} else {
+			body.innerHTML = '';
+		}
+		if (text) {
+			renderDiffDetail(body, text);
+		} else {
+			const empty = document.createElement('div');
+			empty.className = 'tool-detail-empty';
+			empty.textContent = item.status === 'running' ? '正在执行…' : '暂无预览内容';
+			body.appendChild(empty);
+		}
+		if (item.uri) {
+			const actions = document.createElement('div');
+			actions.className = 'tool-detail-actions';
+			const openDiff = document.createElement('button');
+			openDiff.type = 'button';
+			openDiff.textContent = '打开 Diff';
+			openDiff.onclick = (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: 'openFileChange', uri: item.uri, mode: 'diff' });
+			};
+			const openFile = document.createElement('button');
+			openFile.type = 'button';
+			openFile.textContent = '打开文件';
+			openFile.onclick = (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: 'openFileChange', uri: item.uri, mode: 'file' });
+			};
+			actions.appendChild(openDiff);
+			actions.appendChild(openFile);
+			body.appendChild(actions);
+		}
+		return true;
+	}
+
+	/**
+	 * In-place timeline update when item ids/order are unchanged.
+	 * Avoids innerHTML rebuild so running spinners (tools / work) keep animating
+	 * while reasoning / assistant / status text streams in.
+	 */
+	function tryPatchTimeline(items) {
+		if (!items || !items.length) {
+			return false;
+		}
+		const existingIds = [...timelineEl.querySelectorAll('[data-item-id]')].map((el) => el.getAttribute('data-item-id'));
+		const nextIds = items.map((i) => i.id);
+		if (existingIds.length !== nextIds.length || existingIds.some((id, idx) => id !== nextIds[idx])) {
+			return false;
+		}
+		if (!expansionMatches(items)) {
+			return false;
+		}
+
+		for (const item of items) {
+			const el = timelineEl.querySelector(`[data-item-id="${CSS.escape(item.id)}"]`);
+			if (!el) {
+				return false;
+			}
+			if (item.kind === 'reasoning') {
+				if (!patchReasoningRow(item)) {
+					return false;
+				}
+				continue;
+			}
+			if (item.kind === 'work') {
+				const nextClass = 'work-row' + (item.running ? ' running' : '');
+				if (el.className !== nextClass) {
+					el.className = nextClass;
+				}
+				const textEl = el.querySelector('.text');
+				if (textEl) {
+					const dur = item.durationLabel || '';
+					let text;
+					if (item.running) {
+						text = dur ? `已运行 ${dur}` : '工作中…';
+					} else if (item.label === 'Failed') {
+						text = dur ? `失败 · ${dur}` : '失败';
+					} else {
+						text = dur ? `完成 · ${dur}` : '完成';
+					}
+					if (textEl.textContent !== text) {
+						textEl.textContent = text;
+					}
+				}
+				continue;
+			}
+			if (item.kind === 'tool') {
+				if (!patchToolRow(item)) {
+					return false;
+				}
+				continue;
+			}
+			if (item.kind === 'assistant') {
+				const body = el.querySelector('.assistant-body');
+				if (!body) {
+					return false;
+				}
+				const nextClass = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
+				if (body.className !== nextClass) {
+					body.className = nextClass;
+				}
+				const html = renderMarkdown(item.text || '');
+				if (body.innerHTML !== html) {
+					body.innerHTML = html;
+				}
+				continue;
+			}
+			if (item.kind === 'status') {
+				const nextClass = 'status-row' + (item.tone === 'error' ? ' error' : '');
+				if (el.className !== nextClass) {
+					return false;
+				}
+				if (item.tone === 'error') {
+					if (el.textContent !== item.text) {
+						el.textContent = item.text;
+					}
+				} else {
+					const textEl = el.querySelector('.text');
+					if (textEl && textEl.textContent !== item.text) {
+						textEl.textContent = item.text;
+					}
+				}
+				continue;
+			}
+			if (item.kind === 'user') {
+				const bubble = el.querySelector('.user-bubble');
+				const key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
+				if (!bubble || bubble.dataset.key !== key) {
+					return false;
+				}
+				continue;
+			}
+			if (item.kind === 'question') {
+				// Questions need full rebuild for interactive controls.
+				return false;
+			}
+			if (item.kind === 'summary') {
+				continue;
+			}
+			return false;
+		}
+
+		scrollTimelineToBottom();
+		timelineContentKey = timelineKey(items);
+		return true;
+	}
+
+	let timelineContentKey = '';
+
+	function timelineKey(items) {
+		return (items || []).map((item) => {
+			if (item.kind === 'work') {
+				return `${item.id}|w|${item.running ? 1 : 0}|${item.label || ''}`;
+			}
+			if (item.kind === 'reasoning') {
+				return `${item.id}|r|${item.expanded ? 1 : 0}|${item.streaming ? 1 : 0}|${item.text || ''}|${item.durationLabel || ''}`;
+			}
+			if (item.kind === 'tool') {
+				return `${item.id}|t|${item.expanded ? 1 : 0}|${item.status || ''}|${item.summary || ''}|${item.detail || ''}|${item.path || ''}|${item.uri || ''}|${item.added || ''}|${item.removed || ''}`;
+			}
+			if (item.kind === 'assistant') {
+				return `${item.id}|a|${item.streaming ? 1 : 0}|${item.text || ''}`;
+			}
+			if (item.kind === 'user') {
+				return `${item.id}|u|${item.text || ''}|${JSON.stringify(item.attachments || [])}`;
+			}
+			if (item.kind === 'question') {
+				return `${item.id}|q|${item.status || ''}|${JSON.stringify(item.answers || '')}`;
+			}
+			if (item.kind === 'status') {
+				return `${item.id}|s|${item.tone || ''}|${item.text || ''}`;
+			}
+			return `${item.id}|${item.kind}|${item.text || ''}|${item.status || ''}`;
+		}).join('\u0001');
+	}
+
+	function patchWorkLabel(items) {
+		const work = items.find((i) => i.kind === 'work' && i.running);
+		if (!work) {
+			return;
+		}
+		const workEl = timelineEl.querySelector(`.work-row[data-item-id="${CSS.escape(work.id)}"] .text`);
+		if (!workEl) {
+			return;
+		}
+		const d = work.durationLabel || '';
+		workEl.textContent = d ? `已运行 ${d}` : '工作中…';
+	}
+
+	function tryPatchElapsed(items) {
+		if (!items || !items.length || timelineKey(items) !== timelineContentKey) {
+			return false;
+		}
+		const existingIds = [...timelineEl.querySelectorAll('[data-item-id]')].map((el) => el.getAttribute('data-item-id'));
+		const nextIds = items.map((i) => i.id);
+		if (existingIds.length !== nextIds.length || existingIds.some((id, idx) => id !== nextIds[idx])) {
+			return false;
+		}
+		patchWorkLabel(items);
+		return true;
+	}
+
+	function turnActionButton(label, action, id) {
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = 'turn-action';
+		btn.dataset.turnAction = action;
+		btn.dataset.itemId = id;
+		btn.textContent = label;
+		return btn;
+	}
+
+	function turnActionIds(items) {
+		const rewind = new Set();
+		const retry = new Set();
+		let userId = null;
+		let lastAssistant = null;
+		let sawAfter = false;
+		const flush = () => {
+			if (userId && sawAfter) {
+				rewind.add(userId);
+			}
+			if (userId && lastAssistant) {
+				retry.add(lastAssistant);
+			}
+		};
+		for (const item of items || []) {
+			if (item.kind === 'user') {
+				flush();
+				userId = item.id;
+				lastAssistant = null;
+				sawAfter = false;
+				continue;
+			}
+			if (!userId) {
+				continue;
+			}
+			sawAfter = true;
+			if (item.kind === 'assistant' && item.text && !item.streaming) {
+				lastAssistant = item.id;
+			}
+		}
+		flush();
+		return { rewind, retry };
+	}
+
+	function syncTurnActions() {
+		const locked = !!(state && state.busy);
+		timelineEl.querySelectorAll('.turn-actions').forEach((el) => {
+			el.hidden = locked;
+		});
+	}
+
+	function renderClaim(next) {
+		if (!claimBanner) {
+			return;
+		}
+		const offer = next && next.claimOffer;
+		if (!offer) {
+			claimBanner.hidden = true;
+			return;
+		}
+		claimBanner.hidden = false;
+		if (claimTitle) claimTitle.textContent = offer.name || '免费额度';
+		if (claimMeta) claimMeta.textContent = offer.detail || '';
+		if (claimError) {
+			claimError.hidden = !next.claimError;
+			claimError.textContent = next.claimError || '';
+		}
+		if (claimBtn) {
+			claimBtn.disabled = !!next.claimBusy;
+			claimBtn.textContent = next.claimBusy ? '领取中…' : '领取';
+			claimBtn.dataset.planId = offer.planId || '';
+		}
+	}
+
+	function renderQuotaNotice(notice) {
+		if (!quotaNotice) {
+			return;
+		}
+		if (!notice || !notice.text) {
+			quotaNotice.hidden = true;
+			return;
+		}
+		quotaNotice.hidden = false;
+		if (quotaNoticeText) quotaNoticeText.textContent = notice.text;
+		if (quotaNoticeClose) quotaNoticeClose.dataset.noticeId = notice.id || '';
+	}
+
+	function currentSkillQuery() {
+		const caret = inputEl.selectionStart ?? inputEl.value.length;
+		const before = inputEl.value.slice(0, caret);
+		const match = /(?:^|[\s\n])\$([A-Za-z0-9._-]*)$/.exec(before);
+		if (!match) {
+			return null;
+		}
+		return { query: match[1], start: caret - match[1].length - 1, end: caret };
+	}
+
+	function syncSkillQuery() {
+		const next = currentSkillQuery();
+		if (!next) {
+			if (openMenu === 'skill') closeMenus();
+			return;
+		}
+		skillRange = { start: next.start, end: next.end };
+		vscode.postMessage({ type: 'querySkills', query: next.query });
+	}
+
+	function renderSkillMenu(skills) {
+		const query = currentSkillQuery();
+		if (!query || !skills.length) {
+			if (openMenu === 'skill') closeMenus();
+			return;
+		}
+		skillRange = { start: query.start, end: query.end };
+		skillItems = skills;
+		skillIndex = Math.max(0, Math.min(skillIndex, skills.length - 1));
+		openMenu = 'skill';
+		pickerMenu.innerHTML = '';
+		pickerMenu.classList.add('open', 'picker', 'skill-picker');
+		skills.forEach((skill, index) => {
+			const btn = document.createElement('button');
+			btn.type = 'button';
+			btn.className = 'picker-item' + (index === skillIndex ? ' active' : '');
+			btn.innerHTML = '<span class="skill-copy"><span class="title"></span><span class="desc"></span></span>';
+			btn.querySelector('.title').textContent = '$' + skill.name;
+			btn.querySelector('.desc').textContent = skill.description || (skill.scope === 'workspace' ? '项目技能' : '个人技能');
+			btn.addEventListener('mousedown', (event) => {
+				event.preventDefault();
+				insertSkill(skill.name);
+			});
+			pickerMenu.appendChild(btn);
+		});
+		const rect = inputEl.getBoundingClientRect();
+		pickerMenu.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 240)) + 'px';
+		pickerMenu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+		pickerMenu.style.width = Math.min(380, Math.max(220, rect.width)) + 'px';
+	}
+
+	function insertSkill(name) {
+		if (!skillRange) return;
+		const value = inputEl.value;
+		const insert = '$' + name + ' ';
+		inputEl.value = value.slice(0, skillRange.start) + insert + value.slice(skillRange.end);
+		const pos = skillRange.start + insert.length;
+		closeMenus();
+		inputEl.focus();
+		inputEl.setSelectionRange(pos, pos);
+		autosize();
+		vscode.postMessage({ type: 'draft', draft: inputEl.value });
+	}
+
+	function renderQuota(quota) {
+		if (!quotaChip) {
+			return;
+		}
+		const line = quota && quota.lines && quota.lines[0];
+		if (!line) {
+			quotaChip.hidden = true;
+			quotaChip.textContent = '';
+			return;
+		}
+		quotaChip.hidden = false;
+		quotaChip.textContent = `剩余 ${line.remainingLabel}`;
+		const parts = [line.name, `剩余 ${line.remainingLabel}`];
+		if (line.totalLabel) parts.push(`共 ${line.totalLabel}`);
+		if (line.resetLabel) parts.push(line.resetLabel);
+		for (const extra of quota.lines.slice(1)) {
+			parts.push(`${extra.name} 剩余 ${extra.remainingLabel}${extra.resetLabel ? `，${extra.resetLabel}` : ''}`);
+		}
+		quotaChip.title = parts.filter(Boolean).join(' · ');
+	}
+
 	function renderTimeline(items) {
-		if (tryPatchStreamingReasoning(items)) {
+		if (tryPatchTimeline(items)) {
+			return;
+		}
+		if (tryPatchElapsed(items)) {
 			return;
 		}
 
@@ -790,6 +1437,7 @@
 			empty.className = 'empty';
 			empty.textContent = 'Ask ZCode to edit, explain, or run something in this workspace.';
 			timelineEl.appendChild(empty);
+			timelineContentKey = '';
 			return;
 		}
 
@@ -810,6 +1458,7 @@
 			return el;
 		}
 
+		const turnActions = turnActionIds(items);
 		items.forEach((item) => {
 			if (item.kind === 'user') {
 				turn = document.createElement('div');
@@ -819,8 +1468,68 @@
 				row.className = 'user-row';
 				const bubble = document.createElement('div');
 				bubble.className = 'user-bubble';
-				bubble.textContent = item.text;
+				bubble.dataset.key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
+				if (item.text) {
+					const textEl = document.createElement('div');
+					textEl.className = 'user-text';
+					textEl.textContent = item.text;
+					bubble.appendChild(textEl);
+				}
+				const atts = Array.isArray(item.attachments) ? item.attachments : [];
+				if (atts.length) {
+					const list = document.createElement('div');
+					list.className = 'user-attachments';
+					atts.forEach((a) => {
+						if (a.image && a.uri) {
+							const thumb = document.createElement('img');
+							thumb.className = 'attach-thumb';
+							thumb.src = a.uri;
+							thumb.title = a.name || '图片附件';
+							thumb.alt = a.name || '图片附件';
+							thumb.addEventListener('click', () => {
+								vscode.postMessage({ type: 'openAttachment', path: a.path });
+							});
+							list.appendChild(thumb);
+						} else {
+							const pill = document.createElement('span');
+							pill.className = 'attach-pill';
+							pill.textContent = (a.image ? '🖼 ' : '📄 ') + (a.name || '附件');
+							if (a.path) {
+								pill.title = a.path;
+								pill.addEventListener('click', () => {
+									vscode.postMessage({ type: 'openAttachment', path: a.path });
+								});
+							}
+							list.appendChild(pill);
+						}
+					});
+					bubble.appendChild(list);
+				}
 				row.appendChild(bubble);
+				const actions = document.createElement('div');
+				actions.className = 'turn-actions';
+				if (turnActions.rewind.has(item.id)) {
+					actions.appendChild(turnActionButton('回到这里', 'rewind', item.id));
+				}
+				actions.appendChild(turnActionButton('修改', 'editUser', item.id));
+				row.appendChild(actions);
+				turn.appendChild(row);
+				return;
+			}
+			if (item.kind === 'summary') {
+				turn = document.createElement('div');
+				turn.className = 'turn';
+				frag.appendChild(turn);
+				const row = mark(document.createElement('div'), item.id);
+				row.className = 'summary-row';
+				const label = document.createElement('div');
+				label.className = 'summary-label';
+				label.textContent = `已压缩更早的 ${item.turnCount || 1} 轮对话`;
+				const body = document.createElement('div');
+				body.className = 'summary-body';
+				body.textContent = item.text || '';
+				row.appendChild(label);
+				row.appendChild(body);
 				turn.appendChild(row);
 				return;
 			}
@@ -845,6 +1554,12 @@
 				body.className = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
 				body.innerHTML = renderMarkdown(item.text || '');
 				row.appendChild(body);
+				if (turnActions.retry.has(item.id)) {
+					const actions = document.createElement('div');
+					actions.className = 'turn-actions';
+					actions.appendChild(turnActionButton('重试', 'retry', item.id));
+					row.appendChild(actions);
+				}
 				host.appendChild(row);
 				return;
 			}
@@ -874,6 +1589,7 @@
 		});
 
 		timelineEl.appendChild(frag);
+		timelineContentKey = timelineKey(items);
 		requestAnimationFrame(() => {
 			if (timelineStickBottom) {
 				scrollTimelineToBottom();
@@ -901,15 +1617,46 @@
 		const done = todos.filter((t) => t.status === 'completed').length;
 		todoCount.textContent = `${done}/${todos.length}`;
 		const titleEl = todoPanel.querySelector('.todo-title');
-		if (titleEl) titleEl.textContent = '任务';
-		todoList.innerHTML = '';
-		todos.forEach((todo) => {
-			const li = document.createElement('li');
-			li.className = 'todo-item ' + (todo.status || 'pending');
-			li.innerHTML = '<span class="glyph"></span><span class="content"></span>';
-			li.querySelector('.glyph').textContent = todoGlyph(todo.status);
-			li.querySelector('.content').textContent = todo.content || todo.id;
-			todoList.appendChild(li);
+		if (titleEl) {
+			titleEl.textContent = '任务';
+		}
+
+		// Reuse existing <li> nodes so in_progress spin animation is not reset
+		// on every reasoning/status pushState.
+		const seen = new Set();
+		todos.forEach((todo, index) => {
+			const id = String(todo.id || index);
+			seen.add(id);
+			const status = todo.status || 'pending';
+			const text = todo.content || todo.id || '';
+			let li = todoList.querySelector(`:scope > [data-todo-id="${CSS.escape(id)}"]`);
+			if (!li) {
+				li = document.createElement('li');
+				li.dataset.todoId = id;
+				li.innerHTML = '<span class="glyph"></span><span class="content"></span>';
+			}
+			const nextClass = 'todo-item ' + status;
+			if (li.className !== nextClass) {
+				li.className = nextClass;
+				const glyph = li.querySelector('.glyph');
+				if (glyph) {
+					glyph.textContent = todoGlyph(status);
+				}
+			}
+			const content = li.querySelector('.content');
+			if (content && content.textContent !== text) {
+				content.textContent = text;
+			}
+			const ref = todoList.children[index];
+			if (ref !== li) {
+				todoList.insertBefore(li, ref || null);
+			}
+		});
+		[...todoList.children].forEach((li) => {
+			const id = li.getAttribute('data-todo-id');
+			if (!id || !seen.has(id)) {
+				li.remove();
+			}
 		});
 	}
 
@@ -1113,15 +1860,25 @@
 			};
 			pickerMenu.appendChild(btn);
 		});
-		pickerMenu.classList.add('open');
+		pickerMenu.classList.add('open', 'picker');
 		const map = {
 			provider: providerBtn,
 			model: modelBtn,
+			pace: paceBtn,
 			thought: thoughtBtn,
 			cursorMode: cursorModeBtn,
 			cursorModel: cursorModelBtn,
 		};
 		if (map[kind]) map[kind].setAttribute('aria-expanded', 'true');
+		// Anchor the picker above its trigger pill (viewport-fixed, since the
+		// composer sits at the bottom of the page).
+		const anchor = map[kind];
+		if (anchor) {
+			const r = anchor.getBoundingClientRect();
+			pickerMenu.style.left =
+				Math.max(8, Math.min(r.left, window.innerWidth - 160)) + 'px';
+			pickerMenu.style.bottom = window.innerHeight - r.top + 6 + 'px';
+		}
 	}
 
 	function autosize() {
@@ -1137,10 +1894,21 @@
 		document.documentElement.style.setProperty('--zcode-chat-font-size', `${fontSize}px`);
 	}
 
+	/** Chat stream line height, pushed from the `zcode.chatLineHeight` setting. */
+	function applyLineHeight(lineHeight) {
+		if (typeof lineHeight !== 'number' || !Number.isFinite(lineHeight) || lineHeight <= 0) {
+			return;
+		}
+		document.documentElement.style.setProperty('--zcode-chat-line-height', String(lineHeight));
+		const tight = Math.max(1.3, Math.round((lineHeight - 0.25) * 100) / 100);
+		document.documentElement.style.setProperty('--zcode-chat-line-height-tight', String(tight));
+	}
+
 	function render(next) {
 		const wasBusy = busy;
 		state = next;
 		applyFontSize(next.fontSize);
+		applyLineHeight(next.lineHeight);
 		setBusy(!!next.busy);
 		if (next.busy && !wasBusy) {
 			pinTimelineToBottom();
@@ -1184,6 +1952,9 @@
 		providerLabel.textContent =
 			(next.providers || []).find((p) => p.id === next.provider)?.label || next.provider;
 		modelLabel.textContent = next.model || 'Model';
+		if (paceLabel) {
+			paceLabel.textContent = next.agentPaceLabel || next.agentPace || '快速';
+		}
 		thoughtLabel.textContent = next.reasoningLabel || next.reasoningLevel || 'Thinking';
 		if (cursorModeLabel) {
 			cursorModeLabel.textContent =
@@ -1202,7 +1973,9 @@
 			brain === 'cursor' ? 'Cursor' : 'ZCode',
 			rootLabel,
 			next.model || (brain === 'cursor' ? 'default model' : ''),
-			brain === 'zcode' ? (next.reasoningLabel || next.reasoningLevel || '') : (next.cursorMode || 'agent'),
+			brain === 'zcode'
+				? [next.agentPaceLabel || next.agentPace, next.reasoningLabel || next.reasoningLevel].filter(Boolean).join(' · ')
+				: (next.cursorMode || 'agent'),
 		].filter(Boolean).join(' · ');
 
 		if (scheduleTipEl) {
@@ -1227,6 +2000,10 @@
 		renderQueue(next.queue, !!next.queuePaused);
 		renderPlusMenu(next.plusSections);
 		renderContextUsage(next.contextUsage);
+		renderClaim(next);
+		renderQuota(next.accountQuota);
+		renderQuotaNotice(next.quotaNotice);
+		syncTurnActions();
 		updateSendButton();
 
 		if (next.openPlus) {
@@ -1271,6 +2048,15 @@
 			vscode.postMessage({ type: 'setModel', model: id }),
 		);
 	});
+	if (paceBtn) {
+		paceBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			if (!state) return;
+			openPicker('pace', state.agentPaces || [], state.agentPace, (id) =>
+				vscode.postMessage({ type: 'setAgentPace', pace: id }),
+			);
+		});
+	}
 	thoughtBtn.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!state) return;
@@ -1317,6 +2103,24 @@
 			setHistoryOpen(false);
 		});
 	}
+	if (claimBtn) {
+		claimBtn.addEventListener('click', () => {
+			if (claimBtn.disabled) return;
+			vscode.postMessage({ type: 'claimPlan', planId: claimBtn.dataset.planId || '' });
+		});
+	}
+	if (quotaNoticeClose) {
+		quotaNoticeClose.addEventListener('click', () => {
+			vscode.postMessage({ type: 'dismissQuotaNotice', id: quotaNoticeClose.dataset.noticeId || '' });
+		});
+	}
+	timelineEl.addEventListener('click', (e) => {
+		const btn = e.target && e.target.closest ? e.target.closest('[data-turn-action]') : null;
+		if (!btn || btn.closest('.turn-actions')?.hidden) return;
+		e.preventDefault();
+		e.stopPropagation();
+		vscode.postMessage({ type: btn.dataset.turnAction, id: btn.dataset.itemId });
+	});
 	if (contextUsageBtn) {
 		contextUsageBtn.addEventListener('click', (e) => {
 			e.stopPropagation();
@@ -1345,6 +2149,21 @@
 		});
 	}
 	inputEl.addEventListener('keydown', (e) => {
+		if (openMenu === 'skill' && skillItems.length) {
+			if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+				e.preventDefault();
+				skillIndex = e.key === 'ArrowDown'
+					? (skillIndex + 1) % skillItems.length
+					: (skillIndex + skillItems.length - 1) % skillItems.length;
+				renderSkillMenu(skillItems);
+				return;
+			}
+			if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+				e.preventDefault();
+				insertSkill(skillItems[skillIndex].name);
+				return;
+			}
+		}
 		if (e.key === 'Escape') {
 			closeMenus();
 			if (historyOpen) setHistoryOpen(false);
@@ -1359,6 +2178,90 @@
 		autosize();
 		updateSendButton();
 		vscode.postMessage({ type: 'draft', draft: inputEl.value });
+		syncSkillQuery();
+	});
+	inputEl.addEventListener('click', () => syncSkillQuery());
+	inputEl.addEventListener('keyup', (e) => {
+		if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') {
+			syncSkillQuery();
+		}
+	});
+	// Paste / drop files & images as attachments (send bytes to host, which
+	// writes images to temp files and wraps text content as excerpts).
+	function extOf(name) {
+		const m = /\.([A-Za-z0-9]+)$/.exec(name || '');
+		return m ? m[1].toLowerCase() : '';
+	}
+	const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico', 'avif']);
+	function isImageFile(file) {
+		if ((file.type || '').startsWith('image/')) return true;
+		return IMAGE_EXTS.has(extOf(file.name));
+	}
+	function readAsText(file) {
+		return new Promise((resolve) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result || ''));
+			reader.onerror = () => resolve('');
+			reader.readAsText(file);
+		});
+	}
+	function readAsDataUrl(file) {
+		return new Promise((resolve) => {
+			const reader = new FileReader();
+			reader.onload = () => resolve(String(reader.result || ''));
+			reader.onerror = () => resolve('');
+			reader.readAsDataURL(file);
+		});
+	}
+	async function attachTransferFiles(files) {
+		if (!files || !files.length) return;
+		for (const file of Array.from(files)) {
+			const name = file.name || 'pasted-file';
+			if (isImageFile(file)) {
+				if (file.size > 8 * 1024 * 1024) continue; // skip huge images
+				const dataUrl = await readAsDataUrl(file);
+				const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : '';
+				if (!base64) continue;
+				vscode.postMessage({
+					type: 'attachTransfer',
+					name,
+					mime: file.type || `image/${extOf(name) || 'png'}`,
+					base64,
+				});
+			} else {
+				if (file.size > 512 * 1024) continue; // only small text files inline
+				const text = await readAsText(file);
+				if (!text) continue;
+				// Ignore plain-text paste handled by the textarea itself: only
+				// clipboard items that expose a File come through here.
+				vscode.postMessage({ type: 'attachTransfer', name, text });
+			}
+		}
+	}
+	document.addEventListener('paste', (e) => {
+		const items = e.clipboardData && e.clipboardData.items;
+		if (!items) return;
+		const files = [];
+		for (const item of items) {
+			if (item.kind === 'file') {
+				const f = item.getAsFile();
+				if (f) files.push(f);
+			}
+		}
+		if (!files.length) return; // plain text paste → default behavior
+		e.preventDefault();
+		void attachTransferFiles(files);
+	});
+	document.addEventListener('dragover', (e) => {
+		if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+			e.preventDefault();
+			e.dataTransfer.dropEffect = 'copy';
+		}
+	});
+	document.addEventListener('drop', (e) => {
+		if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+		e.preventDefault();
+		void attachTransferFiles(e.dataTransfer.files);
 	});
 	async function copyCodeBlock(btn) {
 		const block = btn.closest('.codeblock');
@@ -1395,20 +2298,86 @@
 			return;
 		}
 		if (!composer.contains(e.target)) closeMenus();
+		// Clicking anywhere outside an open menu (including elsewhere inside
+		// the composer, e.g. the textarea) dismisses it.
+		else if (
+			openMenu &&
+			!(e.target.closest && e.target.closest('.menu'))
+		) {
+			closeMenus();
+		}
 		if (historyOpen && historyDrawer && !historyDrawer.contains(e.target)) {
 			setHistoryOpen(false);
 		}
 	});
 	document.addEventListener('keydown', (e) => {
+		if (e.key === 'Escape' && openMenu) closeMenus();
+	});
+	// Any press inside the chat page dismisses the blue "done" badge on the
+	// active tab (capture phase so element-level stopPropagation can't skip it).
+	document.addEventListener('pointerdown', () => {
+		if (!state || !state.sessionId) return;
+		const active = (state.sessions || []).find((s) => s.id === state.sessionId);
+		// Post when the active session carries the badge, or when the session
+		// list doesn't cover it — the host no-ops cheaply if there is nothing
+		// to clear.
+		if (!active || active.done) {
+			vscode.postMessage({ type: 'clearTabDone', sessionId: state.sessionId });
+		}
+	}, true);
+	document.addEventListener('keydown', (e) => {
 		if (e.key === 'Escape' && historyOpen) {
 			setHistoryOpen(false);
 		}
 	});
+	let completionAudioCtx;
+	function playCompletionSound(outcome) {
+		try {
+			const AudioCtx = window.AudioContext || window.webkitAudioContext;
+			if (!AudioCtx) {
+				return;
+			}
+			if (!completionAudioCtx) {
+				completionAudioCtx = new AudioCtx();
+			}
+			const ctx = completionAudioCtx;
+			if (ctx.state === 'suspended') {
+				void ctx.resume();
+			}
+			const now = ctx.currentTime;
+			const success = outcome !== 'error';
+			const notes = success
+				? [{ f: 660, t: 0, d: 0.09 }, { f: 880, t: 0.08, d: 0.14 }]
+				: [{ f: 440, t: 0, d: 0.1 }, { f: 330, t: 0.1, d: 0.16 }];
+			for (const note of notes) {
+				const osc = ctx.createOscillator();
+				const gain = ctx.createGain();
+				osc.type = 'sine';
+				osc.frequency.value = note.f;
+				gain.gain.setValueAtTime(0.0001, now + note.t);
+				gain.gain.exponentialRampToValueAtTime(0.045, now + note.t + 0.015);
+				gain.gain.exponentialRampToValueAtTime(0.0001, now + note.t + note.d);
+				osc.connect(gain);
+				gain.connect(ctx.destination);
+				osc.start(now + note.t);
+				osc.stop(now + note.t + note.d + 0.02);
+			}
+		} catch {
+			// Audio may be blocked; ignore.
+		}
+	}
+
 	window.addEventListener('message', (event) => {
 		const data = event.data;
 		if (!data) return;
 		if (data.type === 'state') render(data);
 		if (data.type === 'contextUsage') renderContextUsage(data.contextUsage);
+		if (data.type === 'playCompletionSound') playCompletionSound(data.outcome);
+		if (data.type === 'skillMatches') {
+			const query = currentSkillQuery();
+			if (!query || query.query !== (data.query || '')) return;
+			renderSkillMenu(data.skills || []);
+		}
 	});
 	vscode.postMessage({ type: 'ready' });
 })();

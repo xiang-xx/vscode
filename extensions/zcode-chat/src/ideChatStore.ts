@@ -77,9 +77,9 @@ function newId(): string {
 }
 
 export function titleFromMessages(messages: IdeChatMessage[]): string {
-	const first = messages.find(m => m.role === 'user' && m.content.trim());
+	const first = messages.find(m => m.role === 'user' && m.content.trim() && !m.content.startsWith('此前对话摘要：'));
 	if (!first) {
-		return '新对话';
+		return messages.some(m => m.content.startsWith('此前对话摘要：')) ? '已压缩的对话' : '新对话';
 	}
 	const oneLine = first.content.replace(/\s+/g, ' ').trim();
 	return oneLine.length > 42 ? `${oneLine.slice(0, 42)}…` : oneLine;
@@ -367,6 +367,9 @@ export class IdeChatStore {
 	static messagesFromTimeline(items: ConversationItem[]): IdeChatMessage[] {
 		const out: IdeChatMessage[] = [];
 		for (const item of items) {
+			if (item.kind === 'summary' && item.text.trim()) {
+				out.push({ role: 'user', content: `此前对话摘要：\n${item.text}` });
+			}
 			if (item.kind === 'user' && item.text.trim()) {
 				out.push({ role: 'user', content: item.text });
 			}

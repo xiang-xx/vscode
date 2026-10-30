@@ -52,6 +52,7 @@ import { IChatPetService } from '../../../chat/browser/chatPetService.js';
 
 // Register tools
 import '../tools/browserTools.contribution.js';
+import '../tools/browserAgentBridge.contribution.js';
 
 /**
  * Setting that controls whether a screenshot of the selected element is attached

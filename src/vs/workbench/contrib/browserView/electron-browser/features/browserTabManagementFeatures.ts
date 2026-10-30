@@ -53,6 +53,11 @@ import { IExternalUriOpenContext } from '../../../../../platform/opener/common/o
 
 const CONTEXT_BROWSER_EDITOR_OPEN = new RawContextKey<boolean>('browserEditorOpen', false, localize('browser.editorOpen', "Whether any browser editor is currently open"));
 
+const IS_SUPPORTED_LOCAL_BROWSER_FILE = ContextKeyExpr.and(
+	ResourceContextKey.Scheme.isEqualTo(Schemas.file),
+	ContextKeyExpr.regex(ResourceContextKey.Extension.key, /\.(?:html?|mht(?:ml)?)$/i),
+)!;
+
 interface IBrowserQuickPickItem extends IQuickPickItem {
 	groupId: GroupIdentifier;
 	editor: BrowserEditorInput;
@@ -349,10 +354,6 @@ class OpenIntegratedBrowserAction extends Action2 {
 
 class OpenFileInIntegratedBrowserAction extends Action2 {
 	constructor() {
-		const IS_SUPPORTED_LOCAL_BROWSER_FILE = ContextKeyExpr.and(
-			ResourceContextKey.Scheme.isEqualTo(Schemas.file),
-			ContextKeyExpr.regex(ResourceContextKey.Extension.key, /\.(?:html?|mht(?:ml)?)$/i),
-		);
 		super({
 			id: BrowserViewCommandId.OpenFile,
 			title: localize2('browser.openFileAction', "Open in Integrated Browser"),
@@ -552,6 +553,24 @@ MenuRegistry.appendMenuItem(MenuId.EditorTitle, {
 	group: 'navigation',
 	order: 1,
 	when: ContextKeyExpr.and(BROWSER_EDITOR_ACTIVE, IsSessionsWindowContext)
+});
+
+// Always show a globe button in the editor title bar so the Integrated Browser can be
+// opened with a single click from any regular editor. Hidden while a browser editor is
+// active (it has its own toolbar) and for local HTML files, which get a dedicated
+// "Open in Integrated Browser" button that opens the current file instead.
+MenuRegistry.appendMenuItem(MenuId.EditorTitle, {
+	command: {
+		id: BrowserViewCommandId.OpenOrList,
+		title: localize('browser.openOrListEditorTitle', "Open Integrated Browser"),
+		icon: Codicon.globe
+	},
+	group: 'navigation',
+	order: 100,
+	when: ContextKeyExpr.and(
+		BROWSER_EDITOR_ACTIVE.negate(),
+		IS_SUPPORTED_LOCAL_BROWSER_FILE.negate()
+	)
 });
 
 registerAction2(QuickOpenBrowserAction);

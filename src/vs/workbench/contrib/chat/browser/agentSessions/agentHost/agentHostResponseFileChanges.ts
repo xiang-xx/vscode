@@ -509,8 +509,16 @@ export class AgentHostResponseFileChangesProvider extends Disposable implements 
 			const key = getComparisonKey(diff.modifiedURI);
 			const existing = byUri.get(key);
 			if (existing) {
+				// Each edit's added/removed is relative to the previous edit, so summing
+				// them counts lines that an earlier edit added and a later one removed
+				// on both sides. Track the net line delta instead and present it on a
+				// single side, which matches the final state of the file (the changeset
+				// source, when available, still reports exact per-side counts).
 				existing.added += diff.added;
 				existing.removed += diff.removed;
+				const net = existing.added - existing.removed;
+				existing.added = Math.max(0, net);
+				existing.removed = Math.max(0, -net);
 				existing.modifiedURI = diff.modifiedURI;
 				existing.modifiedSnapshotURI = diff.modifiedSnapshotURI;
 				existing.isDeleted = diff.isDeleted;
