@@ -7,6 +7,7 @@ import { Event, Emitter } from '../../../base/common/event.js';
 import { Disposable, IDisposable } from '../../../base/common/lifecycle.js';
 import { IScrollPosition, ScrollEvent, Scrollable, ScrollbarVisibility, INewScrollPosition } from '../../../base/common/scrollable.js';
 import { ConfigurationChangedEvent, EditorOption } from '../config/editorOptions.js';
+import { getScrollBeyondLastLineExtraHeight } from '../config/scrollBeyondLastLine.js';
 import { ScrollType } from '../editorCommon.js';
 import { IEditorConfiguration } from '../config/editorConfiguration.js';
 import { LinesLayout } from './linesLayout.js';
@@ -265,7 +266,7 @@ export class ViewLayout extends Disposable implements IViewLayout {
 
 		let result = this._linesLayout.getLinesTotalHeight();
 		if (options.get(EditorOption.scrollBeyondLastLine)) {
-			result += Math.max(0, height - options.get(EditorOption.lineHeight) - options.get(EditorOption.padding).bottom);
+			result += getScrollBeyondLastLineExtraHeight(height, options.get(EditorOption.lineHeight), options.get(EditorOption.padding).bottom);
 		} else if (!options.get(EditorOption.scrollbar).ignoreHorizontalScrollbarInContentHeight) {
 			result += this._getHorizontalScrollbarHeight(width, contentWidth);
 		}

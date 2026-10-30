@@ -11,6 +11,7 @@ import * as platform from '../../../base/common/platform.js';
 import { ScrollbarVisibility } from '../../../base/common/scrollable.js';
 import { Constants } from '../../../base/common/uint.js';
 import { EDITOR_FONT_DEFAULTS, FONT_VARIATION_OFF, FONT_VARIATION_TRANSLATE, FontInfo } from './fontInfo.js';
+import { getLinesBeyondLastLine } from './scrollBeyondLastLine.js';
 import { EDITOR_MODEL_DEFAULTS } from '../core/misc/textModelDefaults.js';
 import { USUAL_WORD_SEPARATORS } from '../core/wordHelper.js';
 import * as nls from '../../../nls.js';
@@ -309,7 +310,8 @@ export interface IEditorOptions {
 	 */
 	hideCursorInOverviewRuler?: boolean;
 	/**
-	 * Enable that scrolling can go one screen size after the last line.
+	 * Allow scrolling past the last line, up to the vertical center of the editor.
+	 * The viewport does not scroll into an empty page.
 	 * Defaults to true.
 	 */
 	scrollBeyondLastLine?: boolean;
@@ -2734,10 +2736,7 @@ export class EditorLayoutInfoComputer extends ComputedEditorOption<EditorOption.
 	}): { typicalViewportLineCount: number; extraLinesBeforeFirstLine: number; extraLinesBeyondLastLine: number; desiredRatio: number; minimapLineCount: number } {
 		const typicalViewportLineCount = input.height / input.lineHeight;
 		const extraLinesBeforeFirstLine = Math.floor(input.paddingTop / input.lineHeight);
-		let extraLinesBeyondLastLine = Math.floor(input.paddingBottom / input.lineHeight);
-		if (input.scrollBeyondLastLine) {
-			extraLinesBeyondLastLine = Math.max(extraLinesBeyondLastLine, typicalViewportLineCount - 1);
-		}
+		const extraLinesBeyondLastLine = getLinesBeyondLastLine(input.height, input.lineHeight, input.paddingBottom, input.scrollBeyondLastLine);
 		const desiredRatio = (extraLinesBeforeFirstLine + input.viewLineCount + extraLinesBeyondLastLine) / (input.pixelRatio * input.height);
 		const minimapLineCount = Math.floor(input.viewLineCount / desiredRatio);
 		return { typicalViewportLineCount, extraLinesBeforeFirstLine, extraLinesBeyondLastLine, desiredRatio, minimapLineCount };
@@ -6693,7 +6692,7 @@ export const EditorOptions = {
 	)),
 	scrollBeyondLastLine: register(new EditorBooleanOption(
 		EditorOption.scrollBeyondLastLine, 'scrollBeyondLastLine', true,
-		{ description: nls.localize('scrollBeyondLastLine', "Controls whether the editor will scroll beyond the last line.") }
+		{ description: nls.localize('scrollBeyondLastLine', "Controls whether the editor will scroll beyond the last line. When enabled, the last line can move up to the vertical center of the editor.") }
 	)),
 	scrollOnMiddleClick: register(new EditorBooleanOption(
 		EditorOption.scrollOnMiddleClick, 'scrollOnMiddleClick', false,

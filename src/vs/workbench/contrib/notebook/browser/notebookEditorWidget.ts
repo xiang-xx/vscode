@@ -38,6 +38,7 @@ import { generateUuid } from '../../../../base/common/uuid.js';
 import { FontMeasurements } from '../../../../editor/browser/config/fontMeasurements.js';
 import { ICodeEditor } from '../../../../editor/browser/editorBrowser.js';
 import { IEditorOptions } from '../../../../editor/common/config/editorOptions.js';
+import { getScrollBeyondLastLineExtraHeight } from '../../../../editor/common/config/scrollBeyondLastLine.js';
 import { FontInfo } from '../../../../editor/common/config/fontInfo.js';
 import { createBareFontInfoFromRawSettings } from '../../../../editor/common/config/fontInfoFromSettings.js';
 import { Range } from '../../../../editor/common/core/range.js';
@@ -1916,12 +1917,12 @@ export class NotebookEditorWidget extends Disposable implements INotebookEditorD
 		const newCellListHeight = newBodyHeight;
 		if (this._list.getRenderHeight() < newCellListHeight) {
 			// the new dimension is larger than the list viewport, update its additional height first, otherwise the list view will move down a bit (as the `scrollBottom` will move down)
-			this._list.updateOptions({ paddingBottom: this._allowScrollBeyondLastLine() ? Math.max(0, (newCellListHeight - 50)) : 0, paddingTop: 0 });
+			this._list.updateOptions({ paddingBottom: this._allowScrollBeyondLastLine() ? getScrollBeyondLastLineExtraHeight(newCellListHeight, 50, 0) : 0, paddingTop: 0 });
 			this._list.layout(newCellListHeight, dimension.width);
 		} else {
 			// the new dimension is smaller than the list viewport, if we update the additional height, the `scrollBottom` will move up, which moves the whole list view upwards a bit. So we run a layout first.
 			this._list.layout(newCellListHeight, dimension.width);
-			this._list.updateOptions({ paddingBottom: this._allowScrollBeyondLastLine() ? Math.max(0, (newCellListHeight - 50)) : 0, paddingTop: 0 });
+			this._list.updateOptions({ paddingBottom: this._allowScrollBeyondLastLine() ? getScrollBeyondLastLineExtraHeight(newCellListHeight, 50, 0) : 0, paddingTop: 0 });
 		}
 
 		this._overlayContainer.inert = false;

@@ -1610,7 +1610,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private async bootstrapSession(): Promise<void> {
 		await this.ideChat.pruneEmptySessions();
-		const active = await this.ideChat.getActiveSession();
+		const active = await this.ideChat.getActiveSession(this.sessionListScope());
 		if (active && active.messages.length > 0) {
 			this.applySession(active.id, active.timeline ?? [], active.todos ?? [], true);
 		} else {
@@ -1819,7 +1819,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.unreadDoneIds.delete(sessionId);
 		this.openTabIds = this.openTabIds.filter(id => id !== sessionId);
 		if (this.sessionId === sessionId) {
-			const next = await this.ideChat.getActiveSession();
+			const next = await this.ideChat.getActiveSession(this.sessionListScope());
 			if (next) {
 				const parked = this.parked.get(next.id);
 				if (parked) {
@@ -1838,12 +1838,19 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState();
 	}
 
+	/** Scope history and tabs to the opened folder. No folder keeps the unscoped list. */
+	private sessionListScope(): { workspaceRoot: string } | undefined {
+		const root = workspaceRoot();
+		return root ? { workspaceRoot: root } : undefined;
+	}
+
 	private async refreshSessionList(): Promise<void> {
+		const scope = this.sessionListScope();
 		this.sessionList = await this.ideChat.listSessions({
-			workspaceRoot: workspaceRoot(),
+			...scope,
 			limit: 80,
 		});
-		const stored = await this.ideChat.getOpenTabIds();
+		const stored = await this.ideChat.getOpenTabIds(scope);
 		const known = new Set(this.sessionList.map(s => s.id));
 		const allowed = new Set<string>([...stored, ...this.parked.keys(), ...this.runs.keys()]);
 		if (this.sessionId) {

@@ -4,7 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Global IDE chat history — shared by ZCode, DeepSeek, and future AI modules.
+ * IDE chat history shared by ZCode, DeepSeek, and future AI modules.
+ *
+ * Storage is user-global, but each opened folder only sees its own sessions.
+ * `workspaceRoot` is the workspace folder that was open when the session was
+ * saved. Listing, open tabs, and the restored active session stay inside that
+ * root so `/Users/xiang/apps` and `/Users/xiang/projects` do not mix.
  *
  * On-disk layout (user-global, not per-extension):
  *   ~/.zcode/v2/ide-chat/
@@ -98,6 +103,42 @@ function toMeta(session: IdeChatSession): IdeChatSessionMeta {
 	};
 }
 
+/** Compare workspace folders without trailing slashes or macOS/Windows case differences. */
+export function sameWorkspaceRoot(a: string | undefined, b: string | undefined): boolean {
+	if (!a || !b) {
+		return false;
+	}
+	return normalizeWorkspaceRoot(a) === normalizeWorkspaceRoot(b);
+}
+
+function normalizeWorkspaceRoot(root: string): string {
+	let resolved = path.resolve(root);
+	if (resolved.length > 1) {
+		resolved = resolved.replace(/[/\\]+$/, '');
+	}
+	if (process.platform === 'win32' || process.platform === 'darwin') {
+		resolved = resolved.toLowerCase();
+	}
+	return resolved;
+}
+
+function sessionInWorkspace(meta: IdeChatSessionMeta | undefined, workspaceRoot?: string): boolean {
+	if (!meta) {
+		return false;
+	}
+	return !workspaceRoot || sameWorkspaceRoot(meta.workspaceRoot, workspaceRoot);
+}
+
+/** Next open tab in the same root. Does not fall through to another folder's history. */
+function nextOpenTabId(index: IdeChatIndex, workspaceRoot?: string): string | undefined {
+	for (const id of index.openTabIds ?? []) {
+		if (sessionInWorkspace(index.sessions.find(s => s.id === id), workspaceRoot)) {
+			return id;
+		}
+	}
+	return undefined;
+}
+
 function uniquePreserve(ids: string[]): string[] {
 	const seen = new Set<string>();
 	const out: string[] = [];
@@ -176,10 +217,7 @@ export class IdeChatStore {
 		const index = await this.readIndex();
 		let list = [...index.sessions].sort((a, b) => b.updatedAt - a.updatedAt);
 		if (opts?.workspaceRoot) {
-			const root = opts.workspaceRoot;
-			const matched = list.filter(s => s.workspaceRoot === root);
-			const rest = list.filter(s => s.workspaceRoot !== root);
-			list = [...matched, ...rest];
+			list = list.filter(s => sameWorkspaceRoot(s.workspaceRoot, opts.workspaceRoot));
 		}
 		if (opts?.limit && opts.limit > 0) {
 			list = list.slice(0, opts.limit);
@@ -201,8 +239,22 @@ export class IdeChatStore {
 		}
 	}
 
-	async getActiveSession(): Promise<IdeChatSession | undefined> {
-		const id = await this.getActiveSessionId();
+	/**
+	 * Session to restore for this window. With `workspaceRoot`, a marker that
+	 * points at another folder is ignored; we resume this folder's open tab
+	 * instead of the global last-active chat.
+	 */
+	async getActiveSession(opts?: { workspaceRoot?: string }): Promise<IdeChatSession | undefined> {
+		const index = await this.readIndex();
+		const root = opts?.workspaceRoot;
+		const inScope = (id: string | undefined) =>
+			sessionInWorkspace(index.sessions.find(s => s.id === id), root);
+		let id = inScope(index.activeSessionId) ? index.activeSessionId : undefined;
+		if (!id && root) {
+			const tabs = (index.openTabIds ?? []).filter(tabId => inScope(tabId));
+			const byId = new Map(index.sessions.map(s => [s.id, s]));
+			id = [...tabs].sort((a, b) => (byId.get(b)?.updatedAt ?? 0) - (byId.get(a)?.updatedAt ?? 0))[0];
+		}
 		if (!id) {
 			return undefined;
 		}
@@ -267,7 +319,8 @@ export class IdeChatStore {
 			current.sessions = current.sessions.filter(s => !drop.has(s.id));
 			current.openTabIds = (current.openTabIds ?? []).filter(id => !drop.has(id));
 			if (current.activeSessionId && drop.has(current.activeSessionId)) {
-				current.activeSessionId = current.openTabIds[0] ?? current.sessions[0]?.id;
+				const dropped = index.sessions.find(s => s.id === current.activeSessionId);
+				current.activeSessionId = nextOpenTabId(current, dropped?.workspaceRoot);
 			}
 			await this.writeIndex(current);
 		});
@@ -311,12 +364,14 @@ export class IdeChatStore {
 		});
 	}
 
-	async getOpenTabIds(): Promise<string[]> {
+	async getOpenTabIds(opts?: { workspaceRoot?: string }): Promise<string[]> {
 		const index = await this.readIndex();
-		const known = new Set(index.sessions.map(s => s.id));
-		const tabs = (index.openTabIds ?? []).filter(id => known.has(id));
-		if (index.activeSessionId && known.has(index.activeSessionId) && !tabs.includes(index.activeSessionId)) {
-			tabs.push(index.activeSessionId);
+		const inScope = (id: string) =>
+			sessionInWorkspace(index.sessions.find(s => s.id === id), opts?.workspaceRoot);
+		const tabs = (index.openTabIds ?? []).filter(inScope);
+		const active = index.activeSessionId;
+		if (active && inScope(active) && !tabs.includes(active)) {
+			tabs.push(active);
 		}
 		return tabs;
 	}
@@ -333,11 +388,13 @@ export class IdeChatStore {
 	async closeOpenTab(id: string): Promise<void> {
 		await this.enqueue(async () => {
 			const index = await this.readIndex();
+			const closing = index.sessions.find(s => s.id === id);
 			index.openTabIds = (index.openTabIds ?? []).filter(tabId => tabId !== id);
 			// getOpenTabIds() force-appends activeSessionId; drop it as well so a
-			// closed tab cannot resurrect itself on the next read.
+			// closed tab cannot resurrect itself on the next read. Stay in this
+			// folder — the next tab must not be another workspace's chat.
 			if (index.activeSessionId === id) {
-				index.activeSessionId = index.openTabIds?.[0] ?? index.sessions[0]?.id;
+				index.activeSessionId = nextOpenTabId(index, closing?.workspaceRoot);
 			}
 			await this.writeIndex(index);
 		});
@@ -351,10 +408,11 @@ export class IdeChatStore {
 				// missing ok
 			}
 			const index = await this.readIndex();
+			const removed = index.sessions.find(s => s.id === id);
 			index.sessions = index.sessions.filter(s => s.id !== id);
 			index.openTabIds = (index.openTabIds ?? []).filter(tabId => tabId !== id);
 			if (index.activeSessionId === id) {
-				index.activeSessionId = index.openTabIds?.[0] ?? index.sessions[0]?.id;
+				index.activeSessionId = nextOpenTabId(index, removed?.workspaceRoot);
 			}
 			await this.writeIndex(index);
 		});

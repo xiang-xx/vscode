@@ -14,6 +14,7 @@ import * as strings from '../../../../base/common/strings.js';
 import { ILine, RenderedLinesCollection } from '../../view/viewLayer.js';
 import { PartFingerprint, PartFingerprints, ViewPart } from '../../view/viewPart.js';
 import { RenderMinimap, EditorOption, MINIMAP_GUTTER_WIDTH, EditorLayoutInfoComputer } from '../../../common/config/editorOptions.js';
+import { getLinesBeyondLastLine, getScrollBeyondLastLineExtraHeight } from '../../../common/config/scrollBeyondLastLine.js';
 import { Range } from '../../../common/core/range.js';
 import { RGBA8 } from '../../../common/core/misc/rgba.js';
 import { ScrollType } from '../../../common/editorCommon.js';
@@ -302,7 +303,7 @@ class MinimapLayout {
 				+ options.paddingBottom
 			);
 			if (options.scrollBeyondLastLine) {
-				logicalScrollHeight += Math.max(0, viewportHeight - options.lineHeight - options.paddingBottom);
+				logicalScrollHeight += getScrollBeyondLastLineExtraHeight(viewportHeight, options.lineHeight, options.paddingBottom);
 			}
 			const sliderHeight = Math.max(1, Math.floor(viewportHeight * viewportHeight / logicalScrollHeight));
 			const maxMinimapSliderTop = Math.max(0, options.minimapHeight - sliderHeight);
@@ -323,7 +324,7 @@ class MinimapLayout {
 		//          * scrollTop = 10 => visible lines are [1, 31] (with lines 1 and 31 partially visible)
 		//          * scrollTop = 20 => visible lines are [2, 31]
 		//  b) whitespace gaps might make their way in the viewport (which results in a decrease in the visible line count)
-		//  c) we could be in the scroll beyond last line case (which also results in a decrease in the visible line count, down to possibly only one line being visible)
+		//  c) we could be in the scroll beyond last line case (which also results in a decrease in the visible line count, down to about half the viewport)
 
 		// We must first establish a desirable slider height.
 		let sliderHeight: number;
@@ -339,16 +340,12 @@ class MinimapLayout {
 		}
 
 		const extraLinesAtTheTop = Math.floor(options.paddingTop / lineHeight);
-		let extraLinesAtTheBottom = Math.floor(options.paddingBottom / lineHeight);
-		if (options.scrollBeyondLastLine) {
-			const expectedViewportLineCount = viewportHeight / lineHeight;
-			extraLinesAtTheBottom = Math.max(extraLinesAtTheBottom, expectedViewportLineCount - 1);
-		}
+		const extraLinesAtTheBottom = getLinesBeyondLastLine(viewportHeight, lineHeight, options.paddingBottom, options.scrollBeyondLastLine);
 
 		let maxMinimapSliderTop: number;
 		if (extraLinesAtTheBottom > 0) {
 			const expectedViewportLineCount = viewportHeight / lineHeight;
-			// The minimap slider, when dragged all the way down, will contain the last line at its top
+			// The minimap slider, when dragged all the way down, keeps the end of the document near the vertical center
 			maxMinimapSliderTop = (extraLinesAtTheTop + lineCount + extraLinesAtTheBottom - expectedViewportLineCount - 1) * minimapLineHeight / pixelRatio;
 		} else {
 			// The minimap slider, when dragged all the way down, will contain the last line at its bottom

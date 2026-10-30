@@ -1785,9 +1785,17 @@ textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 	color: var(--vscode-foreground);
 }
 .send-btn.stopping {
-	background: color-mix(in srgb, var(--vscode-errorForeground, #f14c4c) 20%, transparent);
-	color: var(--vscode-errorForeground, #f14c4c);
-	font-size: 13px;
+	background: transparent;
+	color: var(--vscode-foreground);
+	font-size: 0;
+}
+.send-btn.stopping::before {
+	content: '';
+	width: 8px;
+	height: 8px;
+	border-radius: 1.5px;
+	background: currentColor;
+	opacity: 0.72;
 }
 .send-btn:disabled,
 .icon-btn:disabled,

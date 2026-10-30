@@ -3464,7 +3464,8 @@ declare namespace monaco.editor {
 		 */
 		hideCursorInOverviewRuler?: boolean;
 		/**
-		 * Enable that scrolling can go one screen size after the last line.
+		 * Allow scrolling past the last line, up to the vertical center of the editor.
+		 * The viewport does not scroll into an empty page.
 		 * Defaults to true.
 		 */
 		scrollBeyondLastLine?: boolean;
