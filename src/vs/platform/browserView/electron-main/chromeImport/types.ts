@@ -44,3 +44,8 @@ export interface ChromeBrowserDataImportResult {
 	issues?: ChromeBrowserDataImportError[];
 	error?: ChromeBrowserDataImportError;
 }
+
+export interface EmbeddedBrowserDataClearResult {
+	success: boolean;
+	error?: 'embedded_browser_clear_failed';
+}

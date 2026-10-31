@@ -39,7 +39,6 @@ import { debounce } from '../../../../../base/common/decorators.js';
 import { MouseWheelClassifier } from '../../../../../base/browser/ui/scrollbar/scrollableElement.js';
 import { IMouseWheelEvent, StandardWheelEvent } from '../../../../../base/browser/mouseEvent.js';
 import { ILayoutService } from '../../../../../platform/layout/browser/layoutService.js';
-import { AccessibilitySignal, IAccessibilitySignalService } from '../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { scrollbarSliderActiveBackground, scrollbarSliderBackground, scrollbarSliderHoverBackground } from '../../../../../platform/theme/common/colorRegistry.js';
 import { XtermAddonImporter } from './xtermAddonImporter.js';
 import { equals } from '../../../../../base/common/objects.js';
@@ -227,7 +226,6 @@ export class XtermTerminal extends Disposable implements IXtermTerminal, IDetach
 		@ITerminalConfigurationService private readonly _terminalConfigurationService: ITerminalConfigurationService,
 		@IClipboardService private readonly _clipboardService: IClipboardService,
 		@IContextKeyService contextKeyService: IContextKeyService,
-		@IAccessibilitySignalService private readonly _accessibilitySignalService: IAccessibilitySignalService,
 		@ILifecycleService lifecycleService: ILifecycleService,
 		@ILayoutService layoutService: ILayoutService
 	) {
@@ -803,7 +801,6 @@ export class XtermTerminal extends Disposable implements IXtermTerminal, IDetach
 			this._capabilities.get(TerminalCapability.CommandDetection)?.handlePromptStart();
 			this._capabilities.get(TerminalCapability.CommandDetection)?.handleCommandStart();
 		}
-		this._accessibilitySignalService.playSignal(AccessibilitySignal.clear);
 	}
 
 	reset(): void {

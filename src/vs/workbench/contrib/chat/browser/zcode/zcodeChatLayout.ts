@@ -14,22 +14,22 @@ import { IPaneCompositePartService } from '../../../../services/panecomposite/br
 import { ZCODE_VIEW_CONTAINER_ID } from './zcodeAuxiliaryBarChrome.js';
 
 const LAYOUT_APPLIED_KEY = 'zcode.chatFirstLayout.applied.v6';
-/** When editor is open, keep Chat as the dominant center pane. */
+/** Width used only when leaving a maximized Chat so it shares the row with the editor. */
 const CHAT_WIDTH_RATIO = 0.58;
 
 /**
  * Chat-first workbench layout:
  * - Explorer left | Chat (+ terminal below) center | editor right
  *   (via `zcode.layout.chatPosition: center`)
- * - Chat is never auto-maximized; it sits center with editor to its right
+ * - Chat is never auto-maximized, and opening a file does not resize it
  *
- * Chat is never auto-maximized; on restore any persisted maximized state is undone.
+ * A persisted maximized Chat is undone on restore. The current width is kept
+ * when the editor area goes from empty to showing a file.
  */
 export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenchContribution {
 	static readonly ID = 'workbench.contrib.zcodeChatLayout';
 
 	private readonly resizeTimers = this._register(new DisposableStore());
-	private hadEditors = false;
 	private applyingSize = false;
 
 	constructor(
@@ -41,7 +41,6 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 	) {
 		super();
 
-		this.hadEditors = this.editorService.visibleEditors.length > 0;
 		void this.bootstrap();
 		this._register(this.editorService.onDidVisibleEditorsChange(() => this.onEditorsChanged()));
 	}
@@ -68,7 +67,6 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 
 		// Wait for editors/layout restore before unmaximizing/width decisions.
 		await this.layoutService.whenRestored;
-		this.hadEditors = this.editorService.visibleEditors.length > 0;
 
 		// Chat must never auto-maximize: undo any persisted maximized state on restore.
 		if (this.layoutService.isAuxiliaryBarMaximized()) {
@@ -77,10 +75,7 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 			this.scheduleChatDominantWidth(50);
 			this.scheduleChatDominantWidth(250);
 			this.scheduleChatDominantWidth(600);
-			return;
 		}
-
-		this.onEditorsChanged();
 	}
 
 	private async applyChatFirstDefaults(): Promise<void> {
@@ -119,27 +114,22 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 	}
 
 	private onEditorsChanged(): void {
-		const hasVisibleEditors = this.editorService.visibleEditors.length > 0;
-		const openedEditors = hasVisibleEditors && !this.hadEditors;
-		this.hadEditors = hasVisibleEditors;
-
-		if (!hasVisibleEditors) {
-			// Chat must never auto-maximize, not even with an empty editor area.
+		if (this.editorService.visibleEditors.length === 0) {
+			// An empty editor area must not resize Chat.
 			return;
 		}
 
-		// If a previous session left Chat maximized, restore side-by-side.
-		const wasMaximized = this.layoutService.isAuxiliaryBarMaximized();
-		if (wasMaximized) {
-			this.layoutService.setAuxiliaryBarMaximized(false);
+		// Opening a file keeps the current Chat width. Only a persisted
+		// maximized Chat is restored to a side-by-side size.
+		if (!this.layoutService.isAuxiliaryBarMaximized()) {
+			return;
 		}
 
-		if (openedEditors || wasMaximized) {
-			this.resizeTimers.clear();
-			this.scheduleChatDominantWidth(50);
-			this.scheduleChatDominantWidth(250);
-			this.scheduleChatDominantWidth(600);
-		}
+		this.layoutService.setAuxiliaryBarMaximized(false);
+		this.resizeTimers.clear();
+		this.scheduleChatDominantWidth(50);
+		this.scheduleChatDominantWidth(250);
+		this.scheduleChatDominantWidth(600);
 	}
 
 	private scheduleChatDominantWidth(delayMs: number): void {

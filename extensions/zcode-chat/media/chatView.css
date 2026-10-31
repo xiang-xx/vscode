@@ -271,12 +271,22 @@ body[data-brain="cursor"] .chat-input-container {
 	flex: 1;
 	min-height: 0;
 	overflow: auto;
-	display: flex;
-	flex-direction: column;
-	gap: var(--conv-gap);
+	/* Block flow on purpose: Chromium paints drag-selection across children of
+	   a column-flex container starting at the container's top edge, so
+	   selecting text highlighted (and copied) everything from the page top.
+	   Plain block flow keeps the selection exactly between anchor and focus;
+	   item spacing comes from margins below instead of `gap`. */
+	display: block;
 	/* Side gutters keep the column width-capped while the scroller itself
 	   stretches edge to edge (whole page is the scroll hit area). */
 	padding: 6px max(0px, calc((100% - var(--chat-content-max-width)) / 2)) 12px;
+}
+.timeline > * + * { margin-top: var(--conv-gap); }
+/* Vertically center the empty-state placeholder; safe to use flex here
+   because there is no selectable text next to it. */
+.timeline:has(.empty) {
+	display: flex;
+	align-items: center;
 }
 .empty {
 	margin: auto;
@@ -288,24 +298,33 @@ body[data-brain="cursor"] .chat-input-container {
 	max-width: 280px;
 }
 .turn {
-	display: flex;
-	flex-direction: column;
-	gap: 4px;
+	/* Block flow for the same selection reason as .timeline. */
+	display: block;
 	width: 100%;
 }
+.turn > * + * { margin-top: 4px; }
 /* Stream chrome (thought / tools / work) sits in a quiet stack under the answer. */
 .turn > .reasoning-row,
 .turn > .tool-row,
 .turn > .work-row,
 .turn > .status-row {
-	margin: 0;
-}
-.user-row {
-	display: flex;
-	flex-direction: column;
-	align-items: flex-end;
 	margin-bottom: 0;
 }
+/* Action chrome must never become a selection endpoint while dragging. */
+.turn-actions,
+.turn-action,
+.brain-bar,
+button {
+	-webkit-user-select: none;
+	user-select: none;
+}
+.user-row {
+	/* Block flow (see .timeline note); children right-align via margins. */
+	display: block;
+	margin-bottom: 0;
+}
+.user-row > * { margin-left: auto; }
+.user-row > * + * { margin-top: 4px; }
 .turn-actions {
 	display: flex;
 	gap: 10px;
@@ -406,12 +425,11 @@ body[data-brain="cursor"] .chat-input-container {
 	border-color: var(--vscode-focusBorder, rgba(127,127,127,.5));
 }
 .assistant-row {
-	display: flex;
-	flex-direction: column;
-	gap: 4px;
-	align-items: stretch;
+	/* Block flow (see .timeline note); 4px spacing via margins instead of gap. */
+	display: block;
 	margin-top: 2px;
 }
+.assistant-row > * + * { margin-top: 4px; }
 .assistant-body {
 	padding: 0;
 	line-height: var(--zcode-chat-line-height);

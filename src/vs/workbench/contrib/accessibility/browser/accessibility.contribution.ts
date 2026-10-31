@@ -9,7 +9,6 @@ import { IWorkbenchContributionsRegistry, WorkbenchPhase, Extensions as Workbenc
 import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
 import { Registry } from '../../../../platform/registry/common/platform.js';
 import { UnfocusedViewDimmingContribution } from './unfocusedViewDimmingContribution.js';
-import { AccessibilityStatus } from './accessibilityStatus.js';
 import { EditorAccessibilityHelpContribution } from './editorAccessibilityHelp.js';
 import { SaveAccessibilitySignalContribution } from '../../accessibilitySignals/browser/saveAccessibilitySignal.js';
 import { DiffEditorActiveAnnouncementContribution } from '../../accessibilitySignals/browser/openDiffEditorAnnouncement.js';
@@ -31,7 +30,6 @@ workbenchRegistry.registerWorkbenchContribution(UnfocusedViewDimmingContribution
 workbenchRegistry.registerWorkbenchContribution(AccesibleViewHelpContribution, LifecyclePhase.Eventually);
 workbenchRegistry.registerWorkbenchContribution(AccesibleViewContributions, LifecyclePhase.Eventually);
 
-registerWorkbenchContribution2(AccessibilityStatus.ID, AccessibilityStatus, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(ExtensionAccessibilityHelpDialogContribution.ID, ExtensionAccessibilityHelpDialogContribution, WorkbenchPhase.BlockRestore);
 registerWorkbenchContribution2(SaveAccessibilitySignalContribution.ID, SaveAccessibilitySignalContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(SpeechAccessibilitySignalContribution.ID, SpeechAccessibilitySignalContribution, WorkbenchPhase.AfterRestored);

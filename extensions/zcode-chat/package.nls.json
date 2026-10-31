@@ -23,7 +23,6 @@
 	"config.agentPace.thorough": "Thorough — more search/todos before large edits.",
 	"config.chatFontSize": "Font size (px) for the AI Chat view: messages, reasoning, tool rows, code blocks, and the input box.",
 	"config.chatLineHeight": "Line height for AI Chat messages, reasoning, and the input box (unitless multiplier, e.g. 1.8).",
-	"config.completionSound": "Play a short sound when a chat turn finishes (success or error). Skipped when stopped or when a queued follow-up starts immediately.",
 	"config.bridge.mode": "How ZCode chat runs (ignored when brain is Cursor).",
 	"config.bridge.mode.agent": "Call BigModel Coding Plan / Start Plan and run a local file tool loop (default).",
 	"config.bridge.mode.stub": "Local stub responses (no network).",

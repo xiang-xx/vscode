@@ -10,7 +10,6 @@ import { Emitter } from '../../../../../base/common/event.js';
 import { Disposable, DisposableMap, DisposableStore, IDisposable, dispose, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { localize } from '../../../../../nls.js';
-import { AccessibilitySignal, IAccessibilitySignalService } from '../../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { IClipboardService } from '../../../../../platform/clipboard/common/clipboardService.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
@@ -61,7 +60,6 @@ export class DecorationAddon extends Disposable implements ITerminalAddon, IDeco
 		@IOpenerService private readonly _openerService: IOpenerService,
 		@IQuickInputService private readonly _quickInputService: IQuickInputService,
 		@ICommandService private readonly _commandService: ICommandService,
-		@IAccessibilitySignalService private readonly _accessibilitySignalService: IAccessibilitySignalService,
 		@INotificationService private readonly _notificationService: INotificationService,
 		@IHoverService private readonly _hoverService: IHoverService,
 		@IChatContextPickService private readonly _contextPickService: IChatContextPickService,
@@ -243,12 +241,6 @@ export class DecorationAddon extends Disposable implements ITerminalAddon, IDeco
 
 			if (shouldRegisterDecoration) {
 				this.registerCommandDecoration(command);
-			}
-
-			if (command.exitCode) {
-				this._accessibilitySignalService.playSignal(AccessibilitySignal.terminalCommandFailed);
-			} else {
-				this._accessibilitySignalService.playSignal(AccessibilitySignal.terminalCommandSucceeded);
 			}
 		}));
 		// Command invalidated

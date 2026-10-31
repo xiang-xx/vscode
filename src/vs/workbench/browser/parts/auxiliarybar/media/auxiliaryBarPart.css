@@ -111,8 +111,16 @@
 	max-width: 150px;
 }
 
-/* ZCode AI Chat: session tabs copy the flat editor-group file tabs. */
+/* ZCode AI Chat: session tabs copy the editor file tabs (strip, hover, active). */
 .monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title {
+	--zcode-chat-tab-strip: var(--vscode-editorGroupHeader-tabsBackground);
+	/* Active tab must be the exact same color chain as the chat page canvas
+	 * (chatView.css: html, body { background: var(--vscode-sideBar-background) })
+	 * so the tab visually flows into the page under every theme. */
+	--zcode-chat-tab-active: var(--vscode-sideBar-background);
+	/* Theme-driven hover: take the theme's tab hover color, else lighten the
+	 * strip toward the theme foreground (works in light and dark themes). */
+	--zcode-chat-tab-hover: var(--vscode-tab-hoverBackground, color-mix(in srgb, var(--vscode-editorGroupHeader-tabsBackground) 92%, var(--vscode-foreground)));
 	display: flex !important;
 	align-items: stretch;
 	gap: 0;
@@ -120,7 +128,7 @@
 	box-sizing: border-box;
 	overflow: hidden;
 	padding: 0;
-	background-color: var(--vscode-editorGroupHeader-tabsBackground);
+	background-color: var(--zcode-chat-tab-strip);
 }
 .monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .title-label,
 .monaco-workbench .part.auxiliarybar.zcode-chat-active > .composite.title > .composite-bar-container {
@@ -193,28 +201,33 @@
 	opacity: 1;
 	background: var(--vscode-toolbar-hoverBackground);
 }
+/* Classic editor tab geometry (mirrors multieditortabscontrol.css):
+ * content-sized tabs, full strip height, 13px label, 10px left inset.
+ * Inactive tabs are transparent so the (heavier, gray) strip shows through;
+ * the active tab uses the chat page background (--vscode-editor-background)
+ * so it connects to the chat below, marked by the theme's active top border. */
 .monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab {
 	position: relative;
 	appearance: none;
 	display: flex;
 	align-items: center;
-	align-self: center;
+	align-self: stretch;
 	gap: 0;
-	/* Cap width so ~4–5 tabs fit; overflow scrolls horizontally. */
-	min-width: 0;
-	max-width: 22%;
-	flex: 1 1 0;
-	height: 26px;
-	margin: 0 1px;
-	padding: 0 1px 0 6px;
+	min-width: 80px;
+	max-width: 220px;
+	flex: 0 1 auto;
+	height: auto;
+	margin: 0;
+	padding: 0 6px 0 10px;
 	border: none;
-	border-radius: var(--vscode-cornerRadius-small, 4px);
-	background-color: transparent;
+	border-radius: 0;
+	background-color: transparent; /* inactive tabs show the strip color */
 	color: var(--vscode-tab-inactiveForeground);
 	font-family: inherit;
-	font-size: 12px;
+	font-size: 13px;
 	font-weight: 400;
 	line-height: 1;
+	white-space: nowrap;
 	cursor: pointer;
 	box-sizing: border-box;
 	box-shadow: none;
@@ -222,16 +235,51 @@
 	-webkit-app-region: no-drag;
 }
 .monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab:hover:not(.active) {
-	background-color: var(--vscode-tab-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 6%, transparent));
-	color: var(--vscode-tab-hoverForeground, var(--vscode-tab-inactiveForeground));
+	background-color: var(--zcode-chat-tab-hover);
+	color: var(--vscode-tab-hoverForeground, var(--vscode-tab-activeForeground));
 }
 .monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.active {
+	background-color: var(--zcode-chat-tab-active);
+	color: var(--vscode-tab-activeForeground);
+	box-shadow: none;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.active::before {
+	content: '';
+	position: absolute;
+	top: 0;
+	left: 0;
+	right: 0;
+	height: var(--vscode-strokeThickness, 1px);
+	background-color: var(--vscode-tab-activeBorderTop, var(--vscode-tab-activeBorder, transparent));
+}
+
+/* Modern UI: follow the modern editor tab treatment (rounded pills for
+ * inactive/hover, connected rounded-top fill for the active tab), using the
+ * same modernEditorTab tokens and metrics as tabs.css in contrib/modernUI. */
+.modern-ui-tabs.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab {
+	align-self: center;
+	height: var(--editor-group-tab-height, 24px);
+	padding: 0 var(--vscode-spacing-size80, 8px);
+	border-radius: var(--vscode-cornerRadius-small, 4px);
+	background-color: var(--vscode-modernEditorTab-inactiveBackground, var(--vscode-tab-inactiveBackground, transparent));
+	color: color-mix(in srgb, var(--vscode-foreground) 50%, transparent);
+	font-size: var(--vscode-fontSize-body1, 13px);
+}
+.modern-ui-tabs.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab:hover:not(.active) {
+	background-color: var(--vscode-modernEditorTab-hoverBackground, var(--vscode-tab-hoverBackground, transparent));
+	color: var(--vscode-modernEditorTab-hoverForeground, var(--vscode-tab-hoverForeground, var(--vscode-tab-inactiveForeground)));
+}
+.modern-ui-tabs.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.active {
 	align-self: stretch;
 	height: auto;
-	margin: 4px 2px 0;
-	border-radius: var(--vscode-cornerRadius-medium, 6px) var(--vscode-cornerRadius-medium, 6px) 0 0;
-	background-color: var(--vscode-tab-activeBackground);
-	color: var(--vscode-tab-activeForeground);
+	padding-left: var(--vscode-spacing-size80, 8px);
+	border-radius: var(--vscode-cornerRadius-small, 4px) var(--vscode-cornerRadius-small, 4px) 0 0;
+	background-color: var(--vscode-modernEditorTab-activeBackground, var(--vscode-sideBar-background));
+	color: var(--vscode-modernEditorTab-activeForeground, var(--vscode-tab-activeForeground));
+	box-shadow: inset 0 0 0 var(--vscode-strokeThickness, 1px) var(--vscode-tab-border, transparent);
+}
+.modern-ui-tabs.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.active::before {
+	display: none;
 }
 .monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-mark {
 	width: 7px;
@@ -269,12 +317,12 @@
 	opacity: 0;
 	cursor: pointer;
 	padding: 0;
-	width: 12px;
-	height: 12px;
+	width: 16px;
+	height: 16px;
 	margin-right: 2px;
 	border-radius: 4px;
 	font-size: 12px;
-	line-height: 14px;
+	line-height: 16px;
 	flex: 0 0 auto;
 	display: inline-flex;
 	align-items: center;

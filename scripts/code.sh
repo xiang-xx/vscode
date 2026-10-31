@@ -49,6 +49,9 @@ function code() {
 	fi
 
 	# Launch Code
+	# The first non-option argument is the Electron app location (this repo).
+	# Dev mode strips it before parsing workspace folders, so `.` does not open
+	# the repository; with no further paths the app restores the previous session.
 	exec "$CODE" . $DISABLE_TEST_EXTENSION "$@"
 }
 

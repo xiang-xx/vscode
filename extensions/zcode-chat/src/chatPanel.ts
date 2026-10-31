@@ -31,7 +31,7 @@ import {
 } from './brains';
 import { completeChatTurn, getBridgeMode, getCursorBrainStatusLine, workspaceRoot, type ChatMessage } from './bridge';
 import { compactConversation } from './contextCompact';
-import { buildPlusMenuSections, formatSlashInsert } from './composerActions';
+import { buildPlusMenuSections, formatSlashInsert, CAPABILITY_COMMANDS, QUICK_ADD_COMMANDS } from './composerActions';
 import {
 	formatWorkDuration,
 	newItemId,
@@ -57,6 +57,7 @@ import {
 	fetchAccountQuota,
 	fetchClaimOffer,
 	QUOTA_NOTICE_SEEN_KEY,
+	CLAIM_NOTICE_SEEN_KEY,
 	readSeenQuotaNotices,
 	selectQuotaNotice,
 	type AccountQuota,
@@ -241,6 +242,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private claimOffer: ClaimOffer | null = null;
 	private claimError: string | undefined;
 	private claimBusy = false;
+	private seenClaimNotices: Set<string>;
 	private accountQuota: AccountQuota | null = null;
 	private seenNotices = new Set<string>();
 	private billingSeq = 0;
@@ -263,6 +265,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		private readonly globalState: vscode.Memento,
 	) {
 		this.seenNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(QUOTA_NOTICE_SEEN_KEY)));
+		this.seenClaimNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(CLAIM_NOTICE_SEEN_KEY)));
 		this.fileEdits.onDidChange(() => {
 			this.refreshFileChanges();
 			this.pushState();
@@ -575,6 +578,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				scope: skill.scope,
 			}));
 			void this.view?.webview.postMessage({ type: 'skillMatches', query, skills });
+			return;
+		}
+		if (msg.type === 'querySlash') {
+			const raw = typeof msg.query === 'string' ? msg.query : '';
+			const query = raw.toLowerCase();
+			const commands = [...QUICK_ADD_COMMANDS, ...CAPABILITY_COMMANDS]
+				.filter(cmd => cmd.name.toLowerCase().startsWith(query))
+				.map(cmd => ({ name: cmd.name, description: cmd.summary }));
+			void this.view?.webview.postMessage({ type: 'slashMatches', query: raw, commands });
+			return;
+		}
+		if (msg.type === 'queryMentions') {
+			const raw = typeof msg.query === 'string' ? msg.query : '';
+			const files = await this.searchMentionFiles(raw);
+			void this.view?.webview.postMessage({ type: 'mentionMatches', query: raw, files });
 			return;
 		}
 		if (msg.type === 'removeQueueItem' && typeof msg.id === 'string') {
@@ -1105,6 +1123,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		this.claimOffer = offer;
 		this.accountQuota = quota;
+		if (offer) {
+			void this.notifyClaimOffer(offer);
+		}
 		this.pushState();
 	}
 
@@ -1119,6 +1140,58 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const skills = listLocalSkills(root || undefined);
 		this.skillCache = { at: now, root, skills };
 		return skills;
+	}
+
+	private mentionCache?: { at: number; root: string; files: string[] };
+
+	/** Workspace file matches for the `@`-mention picker, cached briefly so typing stays snappy. */
+	private async searchMentionFiles(query: string): Promise<Array<{ path: string; detail: string }>> {
+		const folders = vscode.workspace.workspaceFolders;
+		if (!folders?.length) {
+			return [];
+		}
+		const root = folders[0].uri.toString();
+		const now = Date.now();
+		if (!this.mentionCache || this.mentionCache.root !== root || now - this.mentionCache.at > 3000) {
+			const uris = await vscode.workspace.findFiles('**/*', '{**/node_modules/**,**/.git/**,**/dist/**,**/.hg/**,**/.svn/**}', 1000);
+			this.mentionCache = {
+				at: now,
+				root,
+				files: uris.map(uri => vscode.workspace.asRelativePath(uri, false)),
+			};
+		}
+		const q = query.trim().toLowerCase();
+		const scored: Array<{ path: string; score: number }> = [];
+		for (const file of this.mentionCache.files) {
+			const lower = file.toLowerCase();
+			const base = lower.slice(lower.lastIndexOf('/') + 1);
+			let score = -1;
+			if (!q) {
+				score = 2;
+			} else if (base.startsWith(q)) {
+				score = 0;
+			} else if (lower.startsWith(q)) {
+				score = 1;
+			} else if (base.includes(q)) {
+				score = 2;
+			} else if (lower.includes(q)) {
+				score = 3;
+			} else {
+				let from = 0;
+				let ok = true;
+				for (const ch of q) {
+					const at = lower.indexOf(ch, from);
+					if (at < 0) { ok = false; break; }
+					from = at + 1;
+				}
+				if (ok) { score = 4; }
+			}
+			if (score >= 0) {
+				scored.push({ path: file, score });
+			}
+		}
+		scored.sort((a, b) => a.score - b.score || a.path.localeCompare(b.path));
+		return scored.slice(0, 20).map(entry => ({ path: entry.path, detail: '文件' }));
 	}
 
 	private async dismissQuotaNotice(id: string): Promise<void> {
@@ -1150,6 +1223,30 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		this.claimError = result.message;
 		this.pushState();
+	}
+
+	/**
+	 * Native prompt so a claimable plan is hard to miss: one notification per
+	 * plan id, claiming directly from its button. The in-chat banner remains
+	 * available for later, quieter claims.
+	 */
+	private async notifyClaimOffer(offer: ClaimOffer): Promise<void> {
+		if (this.seenClaimNotices.has(offer.planId)) {
+			return;
+		}
+		this.seenClaimNotices.add(offer.planId);
+		await this.globalState.update(CLAIM_NOTICE_SEEN_KEY, [...this.seenClaimNotices].slice(-200));
+		const pick = await vscode.window.showInformationMessage(
+			`可领取免费额度：${offer.name}`,
+			{ detail: offer.detail },
+			'领取',
+		);
+		if (pick === '领取') {
+			await this.claimCurrentPlan(offer.planId);
+			if (this.claimError) {
+				void vscode.window.showWarningMessage(`领取未成功：${this.claimError}`);
+			}
+		}
 	}
 
 	private async retryFromAssistant(assistantId: string): Promise<void> {
@@ -1569,6 +1666,25 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.runs.delete(runSessionId);
 			}
 			cancel.dispose();
+			if (!cancelled && !turnFailed) {
+				this.maybeSummarizeTitle(runSessionId);
+				// Task-completion cue: soft chime in the webview + editor system
+				// notification (no custom in-page UI). Success-only, fired once per
+				// finished agent turn (title side-calls never reach here).
+				const doneTitle = this.sessionList.find(s => s.id === runSessionId)?.title;
+				void this.view?.webview.postMessage({
+					type: 'turnCompleted',
+					title: doneTitle && doneTitle !== '新对话' ? doneTitle : undefined,
+				});
+				// Raise the editor notification only when the chat view is off-screen;
+				// when the user is already watching the chat, the chime alone is enough.
+				if (!this.view?.visible) {
+					const label = doneTitle && doneTitle !== '新对话' ? `AI 任务已完成：${doneTitle}` : 'AI 任务已完成';
+					void vscode.window.showInformationMessage(label, '查看').then(choice => {
+						if (choice === '查看') void vscode.commands.executeCommand('zcode.chatView.focus');
+					});
+				}
+			}
 			if (!cancelled) {
 				this.unreadDoneIds.add(runSessionId);
 			} else {
@@ -1584,9 +1700,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				void this.startTurn(runSessionId, force.content, { text: force.text, attachments: force.attachments });
 			} else if (!cancelled && !turnFailed && this.sessionHasPendingQueue(runSessionId)) {
 				void this.flushQueue(runSessionId);
-			} else if (!cancelled) {
-				// Notify when this session is idle again (not on Stop, not mid-queue).
-				this.playCompletionSound(turnFailed ? 'error' : 'success');
 			}
 		}
 	}
@@ -1597,15 +1710,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		const parked = this.parked.get(sessionId);
 		return !!parked && !parked.queuePaused && parked.queue.length > 0;
-	}
-
-	/** Soft chime in the chat webview when a turn settles. */
-	private playCompletionSound(outcome: 'success' | 'error'): void {
-		const enabled = vscode.workspace.getConfiguration('zcode').get<boolean>('completionSound');
-		if (enabled === false) {
-			return;
-		}
-		void this.view?.webview.postMessage({ type: 'playCompletionSound', outcome });
 	}
 
 	private async bootstrapSession(): Promise<void> {
@@ -1911,7 +2015,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean }): Promise<void> {
+	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean; titleOverride?: string }): Promise<void> {
 		const messages = IdeChatStore.messagesFromTimeline(chat.items);
 		if (messages.length === 0) {
 			if (chat.persisted) {
@@ -1928,9 +2032,15 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const provider = brain === 'cursor' ? 'cursor' : getProviderMode();
 		const model = brain === 'cursor' ? getCursorModel() : getSelectedModelId(getProviderMode());
 		const createdAt = this.sessionList.find(s => s.id === sessionId)?.createdAt ?? Date.now();
+		// A stored title that differs from the truncation fallback is an AI-generated
+		// (or otherwise real) title — keep it instead of regenerating on every save.
+		const storedTitle = this.sessionList.find(s => s.id === sessionId)?.title;
+		const fallbackTitle = titleFromMessages(messages);
+		const keptTitle = storedTitle && storedTitle !== '新对话' && storedTitle !== fallbackTitle ? storedTitle : '';
+		const title = opts?.titleOverride?.trim() || keptTitle || fallbackTitle;
 		await this.ideChat.saveSession({
 			id: sessionId,
-			title: titleFromMessages(messages),
+			title,
 			createdAt,
 			updatedAt: Date.now(),
 			source: this.sessionSource(),
@@ -1946,6 +2056,99 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.sessionPersisted = true;
 		}
 		await this.refreshSessionList();
+	}
+
+	/** In-flight AI title jobs, keyed by session id (prevents duplicate side calls). */
+	private aiTitleJobs = new Map<string, Promise<void>>();
+
+	/**
+	 * After the first completed exchange, replace the truncated-first-message
+	 * fallback title with a short AI summary of what the session is about.
+	 * Idempotent: once a real title exists, later turns never re-summarize.
+	 */
+	private maybeSummarizeTitle(sessionId: string): void {
+		if (this.aiTitleJobs.has(sessionId)) {
+			return;
+		}
+		const chat = sessionId === this.sessionId ? this.captureView() : this.parked.get(sessionId);
+		if (!chat) {
+			return;
+		}
+		const messages = IdeChatStore.messagesFromTimeline(chat.items);
+		const stored = this.sessionList.find(s => s.id === sessionId)?.title;
+		if (stored && stored !== '新对话' && stored !== titleFromMessages(messages)) {
+			return; // already carries a real (AI-generated) title
+		}
+		if (!messages.some(m => m.role === 'user') || !messages.some(m => m.role === 'assistant')) {
+			return;
+		}
+		const job = this.generateTitle(sessionId).catch(() => undefined);
+		this.aiTitleJobs.set(sessionId, job);
+		void job.finally(() => this.aiTitleJobs.delete(sessionId));
+	}
+
+	private async generateTitle(sessionId: string): Promise<void> {
+		const chat = sessionId === this.sessionId ? this.captureView() : this.parked.get(sessionId);
+		if (!chat) {
+			return;
+		}
+		const messages = IdeChatStore.messagesFromTimeline(chat.items)
+			.filter(m => m.content.trim() && !m.content.startsWith('此前对话摘要：'))
+			.slice(0, 4);
+		if (!messages.some(m => m.role === 'user') || !messages.some(m => m.role === 'assistant')) {
+			return;
+		}
+		const transcript = messages
+			.map(m => `${m.role === 'user' ? '用户' : '助手'}: ${m.content.replace(/\s+/g, ' ').slice(0, 400)}`)
+			.join('\n');
+		const brain = getActiveBrain();
+		const provider = getProviderMode();
+		const model = brain === 'cursor'
+			? (getCursorModel() || undefined)
+			: getSelectedModelId(provider);
+		const cancel = new vscode.CancellationTokenSource();
+		try {
+			// Silent side call: no progress handler, no UI rows — title only.
+			const result = await completeChatTurn({
+				messages: [{
+					role: 'user',
+					content: [
+						'根据下面的对话生成一个简短的会话标题，要求：',
+						'- 不超过 16 个字',
+						'- 概括用户的核心诉求或任务主题',
+						'- 不要引号、标点结尾、序号或前缀，直接输出标题本身',
+						'',
+						'对话：',
+						transcript,
+					].join('\n'),
+				}],
+				brain,
+				provider,
+				model,
+				reasoningLevel: getSelectedReasoningLevel(provider, getSelectedModelId(provider)),
+				workspaceRoot: workspaceRoot(),
+				promptPreamble: buildPromptPreamble(workspaceRoot()),
+			}, cancel.token);
+			const raw = result.content.split('\n').map(l => l.trim()).filter(Boolean)[0] ?? '';
+			const title = raw.replace(/^["'「」『』【】\s]+/, '').replace(/["'「」『』【】。.!！？?\s]+$/, '').slice(0, 30).trim();
+			if (!title) {
+				return;
+			}
+			// Re-validate at apply time: another title may have landed while we ran.
+			const chatNow = sessionId === this.sessionId ? this.captureView() : this.parked.get(sessionId);
+			if (!chatNow) {
+				return;
+			}
+			const storedNow = this.sessionList.find(s => s.id === sessionId)?.title;
+			const fallbackNow = titleFromMessages(IdeChatStore.messagesFromTimeline(chatNow.items));
+			if (storedNow && storedNow !== '新对话' && storedNow !== fallbackNow) {
+				return;
+			}
+			await this.persistChat(sessionId, chatNow, sessionId === this.sessionId, { titleOverride: title });
+			this.pushState();
+		} finally {
+			cancel.dispose();
+		}
 	}
 
 	private applyProgress(sessionId: string, event: AgentProgressEvent): void {

@@ -1480,7 +1480,7 @@ class EditorAccessibilitySupport extends BaseEditorOption<EditorOption.accessibi
 
 	constructor() {
 		super(
-			EditorOption.accessibilitySupport, 'accessibilitySupport', AccessibilitySupport.Unknown,
+			EditorOption.accessibilitySupport, 'accessibilitySupport', AccessibilitySupport.Disabled,
 			{
 				type: 'string',
 				enum: ['auto', 'on', 'off'],
@@ -1489,7 +1489,7 @@ class EditorAccessibilitySupport extends BaseEditorOption<EditorOption.accessibi
 					nls.localize('accessibilitySupport.on', "Optimize for usage with a Screen Reader."),
 					nls.localize('accessibilitySupport.off', "Assume a screen reader is not attached."),
 				],
-				default: 'auto',
+				default: 'off',
 				tags: ['accessibility'],
 				description: nls.localize('accessibilitySupport', "Controls if the UI should run in a mode where it is optimized for screen readers.")
 			}

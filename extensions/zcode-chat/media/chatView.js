@@ -71,6 +71,12 @@
 	let skillItems = [];
 	let skillIndex = 0;
 	let skillRange = null;
+	let slashItems = [];
+	let slashIndex = 0;
+	let slashRange = null;
+	let mentionItems = [];
+	let mentionIndex = 0;
+	let mentionRange = null;
 	let historyOpen = false;
 	let contextPanelOpen = false;
 	const CONTEXT_RING_R = 10;
@@ -91,8 +97,18 @@
 	];
 	/** @type {Record<string, { top: number, stickBottom: boolean }>} */
 	const reasoningScroll = Object.create(null);
-	/** Stick timeline to bottom unless the user scrolls up. */
+	/** Follow the bottom while a reply grows. An upward user scroll releases
+	 *  the follow; scrolling back to the bottom grabs it again. */
 	let timelineStickBottom = true;
+	/** Subpixel slack. A real upward gesture releases even inside this range. */
+	const TIMELINE_BOTTOM_EPSILON = 2;
+	let timelineScrollProgrammatic = 0;
+	let timelineStickFollowFrame = 0;
+	/** 'away' | 'toward' | 'none' — set by the gesture, consumed by the scroll event. */
+	let timelineUserIntent = 'none';
+	let timelineUserIntentAt = 0;
+	/** Ignore an at-bottom scroll that is just the tail of an upward gesture. */
+	let timelineSuppressRepinUntil = 0;
 	let workingSetCollapsed = false;
 	/** Local draft selections for pending question cards: askId -> { [qId]: { selected: string[], freeText: string } } */
 	const questionDrafts = Object.create(null);
@@ -225,7 +241,7 @@
 			case 'run_terminal_cmd':
 			case 'Bash':
 			case 'bash':
-			case 'shell': return 'Ran';
+			case 'shell': return 'Run';
 			case 'get_diagnostics': return 'Checked';
 			case 'web_fetch':
 			case 'WebFetch': return 'Fetched';
@@ -491,6 +507,12 @@
 		skillRange = null;
 		skillItems = [];
 		skillIndex = 0;
+		slashRange = null;
+		slashItems = [];
+		slashIndex = 0;
+		mentionRange = null;
+		mentionItems = [];
+		mentionIndex = 0;
 		plusBtn.setAttribute('aria-expanded', 'false');
 		providerBtn.setAttribute('aria-expanded', 'false');
 		modelBtn.setAttribute('aria-expanded', 'false');
@@ -696,24 +718,71 @@
 		});
 	}
 
-	let timelineScrollQuiet = false;
+	function timelineIsAtBottom() {
+		return timelineEl.scrollHeight - timelineEl.scrollTop - timelineEl.clientHeight <= TIMELINE_BOTTOM_EPSILON;
+	}
+
+	function writeTimelineScrollTop(top) {
+		timelineScrollProgrammatic++;
+		timelineEl.scrollTop = top;
+		timelineScrollProgrammatic--;
+	}
+
+	function releaseTimelineStick() {
+		timelineStickBottom = false;
+		timelineStickFollowFrame++;
+	}
+
+	function markTimelineIntent(intent) {
+		timelineUserIntent = intent;
+		timelineUserIntentAt = performance.now();
+		if (intent === 'away') {
+			releaseTimelineStick();
+			timelineSuppressRepinUntil = timelineUserIntentAt + 180;
+		}
+	}
+
+	function consumeTimelineIntent() {
+		if (performance.now() - timelineUserIntentAt > 250) {
+			timelineUserIntent = 'none';
+		}
+		const intent = timelineUserIntent;
+		timelineUserIntent = 'none';
+		return intent;
+	}
+
+	/** Wheel/keys inside a nested scroller should not change the transcript follow. */
+	function nestedScrollerConsumes(target, direction) {
+		let node = target instanceof Element ? target : null;
+		while (node && node !== timelineEl) {
+			if (node.matches && node.matches('.reasoning-body, .tool-diff')
+				&& node.scrollHeight > node.clientHeight + 1) {
+				const remaining = node.scrollHeight - node.scrollTop - node.clientHeight;
+				if (direction < 0 && node.scrollTop > 0) return true;
+				if (direction > 0 && remaining > 1) return true;
+			}
+			node = node.parentElement;
+		}
+		return false;
+	}
 
 	function scrollTimelineToBottom() {
 		if (!timelineStickBottom) {
 			return;
 		}
-		timelineScrollQuiet = true;
-		timelineEl.scrollTop = timelineEl.scrollHeight;
+		const frame = ++timelineStickFollowFrame;
+		writeTimelineScrollTop(timelineEl.scrollHeight);
 		requestAnimationFrame(() => {
-			if (timelineStickBottom) {
-				timelineEl.scrollTop = timelineEl.scrollHeight;
+			if (frame !== timelineStickFollowFrame || !timelineStickBottom) {
+				return;
 			}
-			timelineScrollQuiet = false;
+			writeTimelineScrollTop(timelineEl.scrollHeight);
 		});
 	}
 
 	function pinTimelineToBottom() {
 		timelineStickBottom = true;
+		timelineSuppressRepinUntil = 0;
 		scrollTimelineToBottom();
 	}
 
@@ -861,7 +930,7 @@
 		header.querySelector('.glyph').innerHTML = toolIcon(item.toolName, item.status);
 		const title = toolTitle(item.toolName);
 		const summaryText = toolSummaryText(item);
-		// Cursor-style: one quiet line — "Edited path" / "Ran cmd", not stacked cards.
+		// Cursor-style: one quiet line — "Edited path" / "Run cmd", not stacked cards.
 		if (summaryText) {
 			header.querySelector('.name').textContent = title;
 			header.querySelector('.summary').textContent = summaryText;
@@ -1093,12 +1162,23 @@
 		}
 		const existingIds = [...timelineEl.querySelectorAll('[data-item-id]')].map((el) => el.getAttribute('data-item-id'));
 		const nextIds = items.map((i) => i.id);
-		if (existingIds.length !== nextIds.length || existingIds.some((id, idx) => id !== nextIds[idx])) {
+		const sameItems = existingIds.length === nextIds.length && existingIds.every((id, idx) => id === nextIds[idx]);
+		// Streaming mostly appends rows (new reasoning / tool / assistant). Keep the existing
+		// DOM and build only the new tail so text selections survive and cost stays O(delta).
+		const appendOnly = !sameItems
+			&& existingIds.length > 0
+			&& nextIds.length > existingIds.length
+			&& existingIds.every((id, idx) => id === nextIds[idx]);
+		if (!sameItems && !appendOnly) {
 			return false;
 		}
 		if (!expansionMatches(items)) {
 			return false;
 		}
+		if (appendOnly && !appendTimelineItems(items, existingIds.length)) {
+			return false;
+		}
+		const actions = turnActionIds(items);
 
 		for (const item of items) {
 			const el = timelineEl.querySelector(`[data-item-id="${CSS.escape(item.id)}"]`);
@@ -1152,6 +1232,7 @@
 				if (body.innerHTML !== html) {
 					body.innerHTML = html;
 				}
+				syncRowActions(el, actions.retry.has(item.id) ? ['retry'] : [], false);
 				continue;
 			}
 			if (item.kind === 'status') {
@@ -1177,6 +1258,7 @@
 				if (!bubble || bubble.dataset.key !== key) {
 					return false;
 				}
+				syncRowActions(el, actions.rewind.has(item.id) ? ['rewind'] : [], true);
 				continue;
 			}
 			if (item.kind === 'question') {
@@ -1192,6 +1274,208 @@
 		scrollTimelineToBottom();
 		timelineContentKey = timelineKey(items);
 		return true;
+	}
+
+	/**
+	 * Reconcile the conditional action buttons (rewind on user rows, retry on
+	 * assistant rows) without rebuilding the row. keepEdit keeps the "修改" button.
+	 */
+	function syncRowActions(row, wanted, keepEdit) {
+		let actions = row.querySelector(':scope > .turn-actions');
+		if (!wanted.length && !keepEdit) {
+			if (actions) {
+				actions.remove();
+			}
+			return;
+		}
+		if (!actions) {
+			actions = document.createElement('div');
+			actions.className = 'turn-actions';
+			actions.hidden = !!(state && state.busy);
+			row.appendChild(actions);
+		}
+		const id = row.getAttribute('data-item-id');
+		const find = (name) => actions.querySelector(`[data-turn-action="${name}"]`);
+		[['rewind', '回到这里'], ['retry', '重试']].forEach(([name, label]) => {
+			const has = find(name);
+			const need = wanted.includes(name);
+			if (need && !has) {
+				actions.insertBefore(turnActionButton(label, name, id), keepEdit ? find('editUser') : null);
+			} else if (!need && has) {
+				has.remove();
+			}
+		});
+		if (keepEdit && !find('editUser')) {
+			actions.appendChild(turnActionButton('修改', 'editUser', id));
+		}
+	}
+
+	/**
+	 * Append-only streaming fast path: the existing DOM is untouched and only the
+	 * new rows are built into the last turn. Falls back (returns false) for kinds
+	 * that start new turns or need interactive controls — the caller then does a
+	 * full rebuild.
+	 */
+	function appendTimelineItems(items, fromIndex) {
+		const lastTurn = timelineEl.lastElementChild;
+		if (!lastTurn || !lastTurn.classList.contains('turn')) {
+			return false;
+		}
+		for (let i = fromIndex; i < items.length; i++) {
+			const kind = items[i].kind;
+			if (kind === 'user' || kind === 'summary' || kind === 'question' || !kind) {
+				return false;
+			}
+		}
+		const ctx = {
+			turnActions: turnActionIds(items),
+			ensureTurn() { return lastTurn; },
+			startTurn() { return null; }
+		};
+		for (let i = fromIndex; i < items.length; i++) {
+			renderTimelineItem(items[i], ctx);
+		}
+		return true;
+	}
+
+	function renderTimelineItem(item, ctx) {
+		const mark = (el, id) => {
+			el.setAttribute('data-item-id', id);
+			return el;
+		};
+		if (item.kind === 'user') {
+			const turn = ctx.startTurn();
+			if (!turn) {
+				return;
+			}
+			const row = mark(document.createElement('div'), item.id);
+			row.className = 'user-row';
+			const bubble = document.createElement('div');
+			bubble.className = 'user-bubble';
+			bubble.dataset.key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
+			if (item.text) {
+				const textEl = document.createElement('div');
+				textEl.className = 'user-text';
+				textEl.textContent = item.text;
+				bubble.appendChild(textEl);
+			}
+			const atts = Array.isArray(item.attachments) ? item.attachments : [];
+			if (atts.length) {
+				const list = document.createElement('div');
+				list.className = 'user-attachments';
+				atts.forEach((a) => {
+					if (a.image && a.uri) {
+						const thumb = document.createElement('img');
+						thumb.className = 'attach-thumb';
+						thumb.src = a.uri;
+						thumb.title = a.name || '图片附件';
+						thumb.alt = a.name || '图片附件';
+						thumb.addEventListener('click', () => {
+							vscode.postMessage({ type: 'openAttachment', path: a.path });
+						});
+						list.appendChild(thumb);
+					} else {
+						const pill = document.createElement('span');
+						pill.className = 'attach-pill';
+						pill.textContent = (a.image ? '🖼 ' : '📄 ') + (a.name || '附件');
+						if (a.path) {
+							pill.title = a.path;
+							pill.addEventListener('click', () => {
+								vscode.postMessage({ type: 'openAttachment', path: a.path });
+							});
+						}
+						list.appendChild(pill);
+					}
+				});
+				bubble.appendChild(list);
+			}
+			row.appendChild(bubble);
+			const actions = document.createElement('div');
+			actions.className = 'turn-actions';
+			actions.hidden = !!(state && state.busy);
+			if (ctx.turnActions.rewind.has(item.id)) {
+				actions.appendChild(turnActionButton('回到这里', 'rewind', item.id));
+			}
+			actions.appendChild(turnActionButton('修改', 'editUser', item.id));
+			row.appendChild(actions);
+			turn.appendChild(row);
+			return;
+		}
+		if (item.kind === 'summary') {
+			const turn = ctx.startTurn();
+			if (!turn) {
+				return;
+			}
+			const row = mark(document.createElement('div'), item.id);
+			row.className = 'summary-row';
+			const label = document.createElement('div');
+			label.className = 'summary-label';
+			label.textContent = `已压缩更早的 ${item.turnCount || 1} 轮对话`;
+			const body = document.createElement('div');
+			body.className = 'summary-body';
+			body.textContent = item.text || '';
+			row.appendChild(label);
+			row.appendChild(body);
+			turn.appendChild(row);
+			return;
+		}
+
+		const host = ctx.ensureTurn();
+		if (!host) {
+			return;
+		}
+		if (item.kind === 'reasoning') {
+			renderReasoning(item, host);
+			const last = host.lastElementChild;
+			if (last) mark(last, item.id);
+			return;
+		}
+		if (item.kind === 'work') {
+			renderWork(item, host);
+			const last = host.lastElementChild;
+			if (last) mark(last, item.id);
+			return;
+		}
+		if (item.kind === 'assistant') {
+			const row = mark(document.createElement('div'), item.id);
+			row.className = 'assistant-row';
+			const body = document.createElement('div');
+			body.className = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
+			body.innerHTML = renderMarkdown(item.text || '');
+			row.appendChild(body);
+			if (ctx.turnActions.retry.has(item.id)) {
+				const actions = document.createElement('div');
+				actions.className = 'turn-actions';
+				actions.hidden = !!(state && state.busy);
+				actions.appendChild(turnActionButton('重试', 'retry', item.id));
+				row.appendChild(actions);
+			}
+			host.appendChild(row);
+			return;
+		}
+		if (item.kind === 'tool') {
+			renderTool(item, host);
+			const last = host.lastElementChild;
+			if (last) mark(last, item.id);
+			return;
+		}
+		if (item.kind === 'question') {
+			renderQuestion(item, host);
+			const last = host.lastElementChild;
+			if (last) mark(last, item.id);
+			return;
+		}
+		if (item.kind === 'status') {
+			const row = mark(document.createElement('div'), item.id);
+			row.className = 'status-row' + (item.tone === 'error' ? ' error' : '');
+			if (item.tone !== 'error') {
+				row.innerHTML = '<span class="dot"></span><span class="text"></span>';
+				row.querySelector('.text').textContent = item.text;
+			} else {
+				row.textContent = item.text;
+			}
+			host.appendChild(row);
+		}
 	}
 
 	let timelineContentKey = '';
@@ -1356,6 +1640,47 @@
 		vscode.postMessage({ type: 'querySkills', query: next.query });
 	}
 
+
+	function currentSlashQuery() {
+		const caret = inputEl.selectionStart ?? inputEl.value.length;
+		const before = inputEl.value.slice(0, caret);
+		// Slash commands only count at the very start of the draft.
+		const match = /^\/([A-Za-z0-9_-]*)$/.exec(before);
+		if (!match) {
+			return null;
+		}
+		return { query: match[1], start: 0, end: caret };
+	}
+
+	function currentMentionQuery() {
+		const caret = inputEl.selectionStart ?? inputEl.value.length;
+		const before = inputEl.value.slice(0, caret);
+		const match = /(?:^|[\s\n])@([^\s\n@]*)$/.exec(before);
+		if (!match) {
+			return null;
+		}
+		return { query: match[1], start: caret - match[1].length - 1, end: caret };
+	}
+
+	function syncSlashQuery() {
+		const next = currentSlashQuery();
+		if (!next) {
+			if (openMenu === 'slash') closeMenus();
+			return;
+		}
+		slashRange = { start: next.start, end: next.end };
+		vscode.postMessage({ type: 'querySlash', query: next.query });
+	}
+
+	function syncMentionQuery() {
+		const next = currentMentionQuery();
+		if (!next) {
+			if (openMenu === 'mention') closeMenus();
+			return;
+		}
+		mentionRange = { start: next.start, end: next.end };
+		vscode.postMessage({ type: 'queryMentions', query: next.query });
+	}
 	function renderSkillMenu(skills) {
 		const query = currentSkillQuery();
 		if (!query || !skills.length) {
@@ -1400,6 +1725,104 @@
 		vscode.postMessage({ type: 'draft', draft: inputEl.value });
 	}
 
+
+	function renderSlashMenu(entries) {
+		const query = currentSlashQuery();
+		if (!query) {
+			if (openMenu === 'slash') closeMenus();
+			return;
+		}
+		const items = entries.length
+			? entries
+			: [{ placeholder: true, name: '无匹配命令', path: '无匹配命令', description: '', detail: '' }];
+		slashRange = { start: query.start, end: query.end };
+		slashItems = items;
+		slashIndex = Math.max(0, Math.min(slashIndex, items.length - 1));
+		openMenu = 'slash';
+		pickerMenu.innerHTML = '';
+		pickerMenu.classList.add('open', 'picker', 'skill-picker');
+		items.forEach((entry, index) => {
+			const btn = document.createElement('button');
+			btn.type = 'button';
+			btn.className = 'picker-item' + (index === slashIndex ? ' active' : '');
+			btn.innerHTML = '<span class="skill-copy"><span class="title"></span><span class="desc"></span></span>';
+			btn.querySelector('.title').textContent = entry.placeholder ? entry.name : '/' + (entry.path ?? entry.name);
+			btn.querySelector('.desc').textContent = entry.description || entry.detail || '';
+			if (!entry.placeholder) {
+				btn.addEventListener('mousedown', (event) => {
+					event.preventDefault();
+					insertSlash(entry.path ?? entry.name);
+				});
+			}
+			pickerMenu.appendChild(btn);
+		});
+		const rect = inputEl.getBoundingClientRect();
+		pickerMenu.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 240)) + 'px';
+		pickerMenu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+		pickerMenu.style.width = Math.min(380, Math.max(220, rect.width)) + 'px';
+	}
+
+	function insertSlash(value_) {
+		if (!slashRange) return;
+		const value = inputEl.value;
+		const insert = '/' + value_ + ' ';
+		inputEl.value = value.slice(0, slashRange.start) + insert + value.slice(slashRange.end);
+		const pos = slashRange.start + insert.length;
+		closeMenus();
+		inputEl.focus();
+		inputEl.setSelectionRange(pos, pos);
+		autosize();
+		vscode.postMessage({ type: 'draft', draft: inputEl.value });
+	}
+
+	function renderMentionMenu(entries) {
+		const query = currentMentionQuery();
+		if (!query) {
+			if (openMenu === 'mention') closeMenus();
+			return;
+		}
+		const items = entries.length
+			? entries
+			: [{ placeholder: true, name: '无匹配文件', path: '无匹配文件', description: '', detail: '' }];
+		mentionRange = { start: query.start, end: query.end };
+		mentionItems = items;
+		mentionIndex = Math.max(0, Math.min(mentionIndex, items.length - 1));
+		openMenu = 'mention';
+		pickerMenu.innerHTML = '';
+		pickerMenu.classList.add('open', 'picker', 'skill-picker');
+		items.forEach((entry, index) => {
+			const btn = document.createElement('button');
+			btn.type = 'button';
+			btn.className = 'picker-item' + (index === mentionIndex ? ' active' : '');
+			btn.innerHTML = '<span class="skill-copy"><span class="title"></span><span class="desc"></span></span>';
+			btn.querySelector('.title').textContent = entry.placeholder ? entry.name : '@' + (entry.path ?? entry.name);
+			btn.querySelector('.desc').textContent = entry.description || entry.detail || '';
+			if (!entry.placeholder) {
+				btn.addEventListener('mousedown', (event) => {
+					event.preventDefault();
+					insertMention(entry.path ?? entry.name);
+				});
+			}
+			pickerMenu.appendChild(btn);
+		});
+		const rect = inputEl.getBoundingClientRect();
+		pickerMenu.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - 240)) + 'px';
+		pickerMenu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+		pickerMenu.style.width = Math.min(380, Math.max(220, rect.width)) + 'px';
+	}
+
+	function insertMention(value_) {
+		if (!mentionRange) return;
+		const value = inputEl.value;
+		const insert = '@' + value_ + ' ';
+		inputEl.value = value.slice(0, mentionRange.start) + insert + value.slice(mentionRange.end);
+		const pos = mentionRange.start + insert.length;
+		closeMenus();
+		inputEl.focus();
+		inputEl.setSelectionRange(pos, pos);
+		autosize();
+		vscode.postMessage({ type: 'draft', draft: inputEl.value });
+	}
 	function renderQuota(quota) {
 		if (!quotaChip) {
 			return;
@@ -1443,150 +1866,24 @@
 
 		const frag = document.createDocumentFragment();
 		let turn = null;
-
-		function ensureTurn() {
-			if (!turn) {
+		const ctx = {
+			turnActions: turnActionIds(items),
+			ensureTurn() {
+				if (!turn) {
+					turn = document.createElement('div');
+					turn.className = 'turn';
+					frag.appendChild(turn);
+				}
+				return turn;
+			},
+			startTurn() {
 				turn = document.createElement('div');
 				turn.className = 'turn';
 				frag.appendChild(turn);
+				return turn;
 			}
-			return turn;
-		}
-
-		function mark(el, id) {
-			el.setAttribute('data-item-id', id);
-			return el;
-		}
-
-		const turnActions = turnActionIds(items);
-		items.forEach((item) => {
-			if (item.kind === 'user') {
-				turn = document.createElement('div');
-				turn.className = 'turn';
-				frag.appendChild(turn);
-				const row = mark(document.createElement('div'), item.id);
-				row.className = 'user-row';
-				const bubble = document.createElement('div');
-				bubble.className = 'user-bubble';
-				bubble.dataset.key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
-				if (item.text) {
-					const textEl = document.createElement('div');
-					textEl.className = 'user-text';
-					textEl.textContent = item.text;
-					bubble.appendChild(textEl);
-				}
-				const atts = Array.isArray(item.attachments) ? item.attachments : [];
-				if (atts.length) {
-					const list = document.createElement('div');
-					list.className = 'user-attachments';
-					atts.forEach((a) => {
-						if (a.image && a.uri) {
-							const thumb = document.createElement('img');
-							thumb.className = 'attach-thumb';
-							thumb.src = a.uri;
-							thumb.title = a.name || '图片附件';
-							thumb.alt = a.name || '图片附件';
-							thumb.addEventListener('click', () => {
-								vscode.postMessage({ type: 'openAttachment', path: a.path });
-							});
-							list.appendChild(thumb);
-						} else {
-							const pill = document.createElement('span');
-							pill.className = 'attach-pill';
-							pill.textContent = (a.image ? '🖼 ' : '📄 ') + (a.name || '附件');
-							if (a.path) {
-								pill.title = a.path;
-								pill.addEventListener('click', () => {
-									vscode.postMessage({ type: 'openAttachment', path: a.path });
-								});
-							}
-							list.appendChild(pill);
-						}
-					});
-					bubble.appendChild(list);
-				}
-				row.appendChild(bubble);
-				const actions = document.createElement('div');
-				actions.className = 'turn-actions';
-				if (turnActions.rewind.has(item.id)) {
-					actions.appendChild(turnActionButton('回到这里', 'rewind', item.id));
-				}
-				actions.appendChild(turnActionButton('修改', 'editUser', item.id));
-				row.appendChild(actions);
-				turn.appendChild(row);
-				return;
-			}
-			if (item.kind === 'summary') {
-				turn = document.createElement('div');
-				turn.className = 'turn';
-				frag.appendChild(turn);
-				const row = mark(document.createElement('div'), item.id);
-				row.className = 'summary-row';
-				const label = document.createElement('div');
-				label.className = 'summary-label';
-				label.textContent = `已压缩更早的 ${item.turnCount || 1} 轮对话`;
-				const body = document.createElement('div');
-				body.className = 'summary-body';
-				body.textContent = item.text || '';
-				row.appendChild(label);
-				row.appendChild(body);
-				turn.appendChild(row);
-				return;
-			}
-
-			const host = ensureTurn();
-			if (item.kind === 'reasoning') {
-				renderReasoning(item, host);
-				const last = host.lastElementChild;
-				if (last) mark(last, item.id);
-				return;
-			}
-			if (item.kind === 'work') {
-				renderWork(item, host);
-				const last = host.lastElementChild;
-				if (last) mark(last, item.id);
-				return;
-			}
-			if (item.kind === 'assistant') {
-				const row = mark(document.createElement('div'), item.id);
-				row.className = 'assistant-row';
-				const body = document.createElement('div');
-				body.className = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
-				body.innerHTML = renderMarkdown(item.text || '');
-				row.appendChild(body);
-				if (turnActions.retry.has(item.id)) {
-					const actions = document.createElement('div');
-					actions.className = 'turn-actions';
-					actions.appendChild(turnActionButton('重试', 'retry', item.id));
-					row.appendChild(actions);
-				}
-				host.appendChild(row);
-				return;
-			}
-			if (item.kind === 'tool') {
-				renderTool(item, host);
-				const last = host.lastElementChild;
-				if (last) mark(last, item.id);
-				return;
-			}
-			if (item.kind === 'question') {
-				renderQuestion(item, host);
-				const last = host.lastElementChild;
-				if (last) mark(last, item.id);
-				return;
-			}
-			if (item.kind === 'status') {
-				const row = mark(document.createElement('div'), item.id);
-				row.className = 'status-row' + (item.tone === 'error' ? ' error' : '');
-				if (item.tone !== 'error') {
-					row.innerHTML = '<span class="dot"></span><span class="text"></span>';
-					row.querySelector('.text').textContent = item.text;
-				} else {
-					row.textContent = item.text;
-				}
-				host.appendChild(row);
-			}
-		});
+		};
+		items.forEach((item) => renderTimelineItem(item, ctx));
 
 		timelineEl.appendChild(frag);
 		timelineContentKey = timelineKey(items);
@@ -1594,17 +1891,104 @@
 			if (timelineStickBottom) {
 				scrollTimelineToBottom();
 			} else {
-				timelineEl.scrollTop = prevTop;
+				writeTimelineScrollTop(prevTop);
 			}
 		});
 	}
 
-	timelineEl.addEventListener('scroll', () => {
-		if (timelineScrollQuiet) {
+	function onTimelineUserScroll() {
+		if (timelineScrollProgrammatic > 0) {
 			return;
 		}
-		timelineStickBottom = isNearBottom(timelineEl, 64);
-	}, { passive: true });
+		const intent = consumeTimelineIntent();
+		if (intent === 'away') {
+			releaseTimelineStick();
+			return;
+		}
+		if (!timelineIsAtBottom()) {
+			releaseTimelineStick();
+			return;
+		}
+		if (performance.now() < timelineSuppressRepinUntil && intent !== 'toward') {
+			return;
+		}
+		const wasFollowing = timelineStickBottom;
+		timelineStickBottom = true;
+		timelineSuppressRepinUntil = 0;
+		if (!wasFollowing) {
+			scrollTimelineToBottom();
+		}
+	}
+
+	timelineEl.addEventListener('wheel', (event) => {
+		if (nestedScrollerConsumes(event.target, event.deltaY)) {
+			return;
+		}
+		if (event.deltaY < 0 && timelineEl.scrollTop > 0) {
+			markTimelineIntent('away');
+		} else if (event.deltaY > 0) {
+			markTimelineIntent('toward');
+		}
+	}, { passive: true, capture: true });
+
+	let timelineTouchY = null;
+	timelineEl.addEventListener('touchstart', (event) => {
+		timelineTouchY = event.touches[0] ? event.touches[0].clientY : null;
+	}, { passive: true, capture: true });
+	timelineEl.addEventListener('touchmove', (event) => {
+		const y = event.touches[0] ? event.touches[0].clientY : null;
+		if (y == null || timelineTouchY == null) {
+			return;
+		}
+		const delta = y - timelineTouchY;
+		timelineTouchY = y;
+		if (nestedScrollerConsumes(event.target, -delta)) {
+			return;
+		}
+		// Finger moving down reads earlier content.
+		if (delta > 2 && timelineEl.scrollTop > 0) {
+			markTimelineIntent('away');
+		} else if (delta < -2) {
+			markTimelineIntent('toward');
+		}
+	}, { passive: true, capture: true });
+	timelineEl.addEventListener('touchend', () => {
+		timelineTouchY = null;
+	}, { passive: true, capture: true });
+	timelineEl.addEventListener('touchcancel', () => {
+		timelineTouchY = null;
+	}, { passive: true, capture: true });
+
+	document.addEventListener('keydown', (event) => {
+		const target = event.target;
+		if (!target || target.closest('button, a, input, textarea, select, [contenteditable="true"]')) {
+			return;
+		}
+		const away = event.key === 'ArrowUp' || event.key === 'PageUp' || event.key === 'Home'
+			|| (event.key === ' ' && event.shiftKey);
+		const toward = event.key === 'ArrowDown' || event.key === 'PageDown' || event.key === 'End'
+			|| (event.key === ' ' && !event.shiftKey);
+		if (!away && !toward) {
+			return;
+		}
+		if (nestedScrollerConsumes(target, away ? -1 : 1)) {
+			return;
+		}
+		if (away && timelineEl.scrollTop > 0) {
+			markTimelineIntent('away');
+		} else if (toward) {
+			markTimelineIntent('toward');
+		}
+	}, true);
+
+	timelineEl.addEventListener('scroll', onTimelineUserScroll, { passive: true });
+
+	timelineEl.addEventListener('load', (event) => {
+		const target = event.target;
+		if (target && target.tagName === 'IMG' && timelineStickBottom) {
+			scrollTimelineToBottom();
+		}
+	}, true);
 
 	function renderTodos(todos) {
 		if (!todos || !todos.length) {
@@ -2149,18 +2533,40 @@
 		});
 	}
 	inputEl.addEventListener('keydown', (e) => {
-		if (openMenu === 'skill' && skillItems.length) {
+		const tokenItems =
+			openMenu === 'skill' ? skillItems :
+			openMenu === 'slash' ? slashItems :
+			openMenu === 'mention' ? mentionItems : [];
+		if (tokenItems.length && !tokenItems[0].placeholder) {
 			if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
 				e.preventDefault();
-				skillIndex = e.key === 'ArrowDown'
-					? (skillIndex + 1) % skillItems.length
-					: (skillIndex + skillItems.length - 1) % skillItems.length;
-				renderSkillMenu(skillItems);
+				if (openMenu === 'skill') {
+					skillIndex = e.key === 'ArrowDown'
+						? (skillIndex + 1) % skillItems.length
+						: (skillIndex + skillItems.length - 1) % skillItems.length;
+					renderSkillMenu(skillItems);
+				} else if (openMenu === 'slash') {
+					slashIndex = e.key === 'ArrowDown'
+						? (slashIndex + 1) % slashItems.length
+						: (slashIndex + slashItems.length - 1) % slashItems.length;
+					renderSlashMenu(slashItems);
+				} else {
+					mentionIndex = e.key === 'ArrowDown'
+						? (mentionIndex + 1) % mentionItems.length
+						: (mentionIndex + mentionItems.length - 1) % mentionItems.length;
+					renderMentionMenu(mentionItems);
+				}
 				return;
 			}
 			if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
 				e.preventDefault();
-				insertSkill(skillItems[skillIndex].name);
+				if (openMenu === 'skill') {
+					insertSkill(skillItems[skillIndex].name);
+				} else if (openMenu === 'slash') {
+					insertSlash(slashItems[slashIndex].name);
+				} else {
+					insertMention(mentionItems[mentionIndex].path);
+				}
 				return;
 			}
 		}
@@ -2179,11 +2585,19 @@
 		updateSendButton();
 		vscode.postMessage({ type: 'draft', draft: inputEl.value });
 		syncSkillQuery();
+		syncSlashQuery();
+		syncMentionQuery();
 	});
-	inputEl.addEventListener('click', () => syncSkillQuery());
+	inputEl.addEventListener('click', () => {
+		syncSkillQuery();
+		syncSlashQuery();
+		syncMentionQuery();
+	});
 	inputEl.addEventListener('keyup', (e) => {
 		if (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'Home' || e.key === 'End') {
 			syncSkillQuery();
+			syncSlashQuery();
+			syncMentionQuery();
 		}
 	});
 	// Paste / drop files & images as attachments (send bytes to host, which
@@ -2330,41 +2744,32 @@
 			setHistoryOpen(false);
 		}
 	});
-	let completionAudioCtx;
-	function playCompletionSound(outcome) {
+
+	// ---- Task-completion chime. Only fired by the host when a real agent turn
+	// finishes successfully; no other sounds exist in this view. The visible
+	// reminder is the editor's system notification, not in-page UI. ----
+	function playDoneChime() {
 		try {
-			const AudioCtx = window.AudioContext || window.webkitAudioContext;
-			if (!AudioCtx) {
-				return;
-			}
-			if (!completionAudioCtx) {
-				completionAudioCtx = new AudioCtx();
-			}
-			const ctx = completionAudioCtx;
-			if (ctx.state === 'suspended') {
-				void ctx.resume();
-			}
+			const Ctx = window.AudioContext || window.webkitAudioContext;
+			if (!Ctx) return;
+			const ctx = new Ctx();
+			if (ctx.state === 'suspended' && ctx.resume) void ctx.resume();
 			const now = ctx.currentTime;
-			const success = outcome !== 'error';
-			const notes = success
-				? [{ f: 660, t: 0, d: 0.09 }, { f: 880, t: 0.08, d: 0.14 }]
-				: [{ f: 440, t: 0, d: 0.1 }, { f: 330, t: 0.1, d: 0.16 }];
-			for (const note of notes) {
+			const gain = ctx.createGain();
+			gain.connect(ctx.destination);
+			gain.gain.setValueAtTime(0.0001, now);
+			gain.gain.exponentialRampToValueAtTime(0.09, now + 0.02);
+			gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+			[784, 1046.5].forEach((freq, i) => {
 				const osc = ctx.createOscillator();
-				const gain = ctx.createGain();
 				osc.type = 'sine';
-				osc.frequency.value = note.f;
-				gain.gain.setValueAtTime(0.0001, now + note.t);
-				gain.gain.exponentialRampToValueAtTime(0.045, now + note.t + 0.015);
-				gain.gain.exponentialRampToValueAtTime(0.0001, now + note.t + note.d);
+				osc.frequency.value = freq;
 				osc.connect(gain);
-				gain.connect(ctx.destination);
-				osc.start(now + note.t);
-				osc.stop(now + note.t + note.d + 0.02);
-			}
-		} catch {
-			// Audio may be blocked; ignore.
-		}
+				osc.start(now + i * 0.14);
+				osc.stop(now + 0.55);
+			});
+			setTimeout(() => { ctx.close().catch(() => {}); }, 900);
+		} catch { /* audio unavailable — the system notification still fires */ }
 	}
 
 	window.addEventListener('message', (event) => {
@@ -2372,11 +2777,21 @@
 		if (!data) return;
 		if (data.type === 'state') render(data);
 		if (data.type === 'contextUsage') renderContextUsage(data.contextUsage);
-		if (data.type === 'playCompletionSound') playCompletionSound(data.outcome);
+		if (data.type === 'turnCompleted') playDoneChime();
 		if (data.type === 'skillMatches') {
 			const query = currentSkillQuery();
 			if (!query || query.query !== (data.query || '')) return;
-			renderSkillMenu(data.skills || []);
+			renderSkillMenu((data.skills || []).length ? data.skills : [{ placeholder: true, name: '无匹配技能', description: '', scope: '' }]);
+		}
+		if (data.type === 'slashMatches') {
+			const query = currentSlashQuery();
+			if (!query || query.query !== (data.query || '')) return;
+			renderSlashMenu(data.commands || []);
+		}
+		if (data.type === 'mentionMatches') {
+			const query = currentMentionQuery();
+			if (!query || query.query !== (data.query || '')) return;
+			renderMentionMenu(data.files || []);
 		}
 	});
 	vscode.postMessage({ type: 'ready' });

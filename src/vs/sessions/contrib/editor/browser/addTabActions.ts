@@ -165,6 +165,8 @@ export class NewBrowserTabAction extends Action2 {
  * Session Activity Bar entry for the browser. Unlike {@link NewBrowserTabAction},
  * which explicitly adds a tab, this activates the most recent browser tab of the
  * active group, or opens a new one as a preview tab and focuses its URL input.
+ * When the most recent browser tab is already the active editor, invoking this
+ * again opens another browser tab so multiple pages can be open at once.
  */
 export class OpenBrowserAction extends Action2 {
 
@@ -191,10 +193,14 @@ export class OpenBrowserAction extends Action2 {
 		const commandService = accessor.get(ICommandService);
 		const group = editorGroupsService.mainPart.activeGroup;
 
-		// An existing browser tab is activated in place. Otherwise a new one opens as a
-		// preview tab, which the browser editor pins once it navigates.
+		// An existing browser tab is activated in place, unless it is already the
+		// active editor — then invoking this again opens another browser tab so
+		// multiple pages can be open at once. A new one opens as a preview tab,
+		// which the browser editor pins once it navigates.
 		const existing = group.getEditors(EditorsOrder.MOST_RECENTLY_ACTIVE).find(editor => editor instanceof BrowserEditorInput);
-		const browserInput = existing ?? browserViewWorkbenchService.getOrCreateLazy({ id: generateUuid() });
+		const browserInput = existing && existing !== group.activeEditor
+			? existing
+			: browserViewWorkbenchService.getOrCreateLazy({ id: generateUuid() });
 		const editorPane = await editorService.openEditor(browserInput, undefined, group);
 		if (editorPane && !browserInput.url) {
 			await commandService.executeCommand(BrowserViewCommandId.FocusUrlInput, editorPane);

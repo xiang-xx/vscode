@@ -26,7 +26,6 @@ import { URI } from '../../../../base/common/uri.js';
 import { TabFocus } from '../../../../editor/browser/config/tabFocus.js';
 import * as nls from '../../../../nls.js';
 import { IAccessibilityService } from '../../../../platform/accessibility/common/accessibility.js';
-import { AccessibilitySignal, IAccessibilitySignalService } from '../../../../platform/accessibilitySignal/browser/accessibilitySignalService.js';
 import { ICommandService } from '../../../../platform/commands/common/commands.js';
 import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
@@ -414,7 +413,6 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@IOpenerService private readonly _openerService: IOpenerService,
 		@ICommandService private readonly _commandService: ICommandService,
-		@IAccessibilitySignalService private readonly _accessibilitySignalService: IAccessibilitySignalService,
 		@IViewDescriptorService private readonly _viewDescriptorService: IViewDescriptorService,
 	) {
 		super();
@@ -890,7 +888,6 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
 						tooltip: nls.localize('bellStatus', "Bell")
 					}, this._terminalConfigurationService.config.bellDuration);
 				}
-				this._accessibilitySignalService.playSignal(AccessibilitySignal.terminalBell);
 			}));
 		}, 1000, this._store);
 		this._register(xterm.raw.onSelectionChange(() => this._onDidChangeSelection.fire(this)));

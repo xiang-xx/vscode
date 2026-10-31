@@ -3,7 +3,8 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { addDisposableListener, EventType, findParentWithClass, getWindow } from '../../../../base/browser/dom.js';
+import { addDisposableListener, EventType, findParentWithClass, getWindow, isActiveElement, isAncestorOfActiveElement } from '../../../../base/browser/dom.js';
+import { disposableTimeout } from '../../../../base/common/async.js';
 import { CancellationTokenSource } from '../../../../base/common/cancellation.js';
 import { Emitter } from '../../../../base/common/event.js';
 import { DisposableStore, IDisposable, MutableDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
@@ -49,6 +50,8 @@ export class WebviewViewPane extends ViewPane {
 
 	private readonly _webview = this._register(new MutableDisposable<IOverlayWebview>());
 	private readonly _webviewDisposables = this._register(new DisposableStore());
+	private readonly _reapplyViewFocus = this._register(new MutableDisposable());
+	private _webviewFocused = false;
 	private _activated = false;
 
 	private _container?: HTMLElement;
@@ -181,6 +184,7 @@ export class WebviewViewPane extends ViewPane {
 		});
 		webview.state = this.viewState[storageKeys.webviewState];
 		this._webview.value = webview;
+		this.trackOverlayFocus(webview);
 
 		this.layoutWebview();
 
@@ -269,6 +273,41 @@ export class WebviewViewPane extends ViewPane {
 
 	private async withProgress(task: () => Promise<void>): Promise<void> {
 		return this.progressService.withProgress({ location: this.id, delay: 500 }, task);
+	}
+
+	/**
+	 * The webview iframe is mounted on a workbench overlay, outside this view.
+	 * Focusing it therefore blurs the view element and clears `focusedView`,
+	 * so shortcuts such as Cmd+W fall through to the editor. Keep the view
+	 * focused for as long as that overlay webview has keyboard focus.
+	 */
+	private trackOverlayFocus(webview: IOverlayWebview): void {
+		this._webviewDisposables.add(webview.onDidFocus(() => {
+			this._webviewFocused = true;
+			this.fireDidFocus();
+		}));
+		this._webviewDisposables.add(webview.onDidBlur(() => {
+			this._webviewFocused = false;
+			if (!isActiveElement(this.element) && !isAncestorOfActiveElement(this.element)) {
+				this.fireDidBlur();
+			}
+		}));
+		this._webviewDisposables.add(this.onDidBlur(() => {
+			if (!this._webviewFocused) {
+				return;
+			}
+			// View-element blur is deferred with setTimeout(0) and clears
+			// `focusedView` after the webview focus event. Restore it.
+			this._reapplyViewFocus.value = disposableTimeout(() => {
+				if (this._webviewFocused) {
+					this.fireDidFocus();
+				}
+			}, 0);
+		}));
+		this._webviewDisposables.add(toDisposable(() => {
+			this._webviewFocused = false;
+			this._reapplyViewFocus.clear();
+		}));
 	}
 
 	private layoutWebview() {

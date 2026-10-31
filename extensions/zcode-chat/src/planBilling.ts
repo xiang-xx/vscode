@@ -53,6 +53,7 @@ export interface QuotaNotice {
 }
 
 export const QUOTA_NOTICE_SEEN_KEY = 'zcode.quotaNotice.seen';
+export const CLAIM_NOTICE_SEEN_KEY = 'zcode.claimNotice.seen';
 
 const LOW_QUOTA_RATIO = 0.1;
 

@@ -127,11 +127,6 @@
           "maximum": 2.4,
           "description": "%config.chatLineHeight%"
         },
-        "zcode.completionSound": {
-          "type": "boolean",
-          "default": true,
-          "description": "%config.completionSound%"
-        },
         "zcode.bridge.mode": {
           "type": "string",
           "default": "agent",
@@ -369,7 +364,7 @@
         "command": "zcode.closeActiveTab",
         "key": "ctrl+w",
         "mac": "cmd+w",
-        "when": "focusedView == 'zcode.chatView'"
+        "when": "focusedView == 'zcode.chatView' || (auxiliaryBarFocus && activeAuxiliary == 'workbench.view.extension.zcode')"
       },
       {
         "command": "zcode.addSelectionToChat",

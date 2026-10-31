@@ -684,6 +684,19 @@ export abstract class ViewPane extends Pane implements IView {
 		}
 	}
 
+	/**
+	 * Report keyboard focus that lives outside this view's DOM, such as an
+	 * overlay webview iframe. Does not move DOM focus.
+	 */
+	protected fireDidFocus(): void {
+		this._onDidFocus.fire();
+	}
+
+	/** Pair of {@link fireDidFocus} when that outside content blurs. */
+	protected fireDidBlur(): void {
+		this._onDidBlur.fire();
+	}
+
 	private setActions(): void {
 		if (this.toolbar) {
 			const primaryActions = [...this.menuActions.getPrimaryActions()];

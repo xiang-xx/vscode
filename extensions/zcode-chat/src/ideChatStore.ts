@@ -347,7 +347,7 @@ export class IdeChatStore {
 	async saveSession(session: IdeChatSession, opts?: { background?: boolean }): Promise<void> {
 		const next: IdeChatSession = {
 			...session,
-			title: titleFromMessages(session.messages) || session.title?.trim() || '新对话',
+			title: session.title?.trim() || titleFromMessages(session.messages) || '新对话',
 			updatedAt: Date.now(),
 		};
 		await this.enqueue(async () => {

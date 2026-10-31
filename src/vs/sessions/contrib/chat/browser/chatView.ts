@@ -5,7 +5,7 @@
 
 import { isLocalAgentHostProviderDisabledByPolicy } from '../../../../platform/agentHost/common/agentService.js';
 import './media/chatView.css';
-import { $, isHTMLElement, size } from '../../../../base/browser/dom.js';
+import { $, getWindow, isHTMLElement, scheduleAtNextAnimationFrame, size } from '../../../../base/browser/dom.js';
 import { renderAsPlaintext } from '../../../../base/browser/markdownRenderer.js';
 import { disposableTimeout } from '../../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../../base/common/cancellation.js';
@@ -389,6 +389,11 @@ export class ChatView extends AbstractChatView {
 	private readonly _isVisibleObs = observableValue(this, false);
 	private _lastLayout: { width: number; height: number } | undefined;
 	private _chatItemHorizontalPadding: number;
+	/** Whether a per-frame widget layout is already scheduled (sash drags fire one layout per pointer-move). */
+	private _widgetLayoutScheduled = false;
+	private readonly _widgetLayoutFrame = this._register(new MutableDisposable());
+	/** Cached progress bar container so a layout doesn't rescan this element's children. */
+	private _progressContainer: HTMLElement | undefined;
 
 	/**
 	 * Per-view mirror of `agentsVoiceInitiatedHere`, scoped above the chat widget.
@@ -1127,8 +1132,21 @@ export class ChatView extends AbstractChatView {
 
 	protected override doLayout(width: number, height: number, _top: number, _left: number): void {
 		this._lastLayout = { width, height };
-		this._ensureBannersMounted();
-		this._layoutChatWidget();
+		// A sash drag fires a workbench layout for every pointer-move, and each
+		// widget layout reflows the whole transcript (markdown re-wraps, code
+		// block editors relayout, sticky scroll re-measures), which makes width
+		// resizing janky once a conversation grows long. Coalesce to at most one
+		// layout per animation frame; the container itself is flex-sized and
+		// keeps tracking the sash meanwhile.
+		if (this._widgetLayoutScheduled) {
+			return;
+		}
+		this._widgetLayoutScheduled = true;
+		this._widgetLayoutFrame.value = scheduleAtNextAnimationFrame(getWindow(this.element), () => {
+			this._widgetLayoutScheduled = false;
+			this._ensureBannersMounted();
+			this._layoutChatWidget();
+		});
 	}
 
 	private _layoutChatWidget(): void {
@@ -1139,9 +1157,10 @@ export class ChatView extends AbstractChatView {
 		// Only the external-session banner precedes the widget in normal flow.
 		const widgetTop = this._externalSessionBanner.domNode.classList.contains('hidden') ? 0 : this._widgetContainer.offsetTop;
 		const widgetHeight = Math.max(0, height - widgetTop);
-		const progressContainer = Array.from(this.element.children).find(element => element.classList.contains('monaco-progress-container'));
-		if (isHTMLElement(progressContainer)) {
-			progressContainer.style.top = `${widgetTop}px`;
+		this._progressContainer ??= Array.from(this.element.children)
+			.find((element): element is HTMLElement => element.classList.contains('monaco-progress-container') && isHTMLElement(element));
+		if (this._progressContainer) {
+			this._progressContainer.style.top = `${widgetTop}px`;
 		}
 		this._comparisonResult.layout(width);
 		size(this._widgetContainer, width, widgetHeight);
