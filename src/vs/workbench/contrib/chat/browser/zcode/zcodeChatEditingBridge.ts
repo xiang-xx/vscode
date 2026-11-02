@@ -40,6 +40,8 @@ export const ZCODE_EDITING_APPLY_COMMAND = '_zcode.editing.applyEdit';
 export const ZCODE_EDITING_SYNC_COMMAND = '_zcode.editing.sync';
 export const ZCODE_EDITING_CLEAR_COMMAND = '_zcode.editing.clear';
 export const ZCODE_EDITING_STATUS_COMMAND = '_zcode.editing.status';
+/** Attach Chat diff decorations for an already-open modified file (no Keep/Undo chrome). */
+export const ZCODE_EDITING_ATTACH_COMMAND = '_zcode.editing.attachEditor';
 /** Fired to the extension when a hunk/file Keep or Undo settles an entry. */
 export const ZCODE_EDITING_SETTLED_COMMAND = 'zcode.fileEdits.onSettled';
 
@@ -192,18 +194,37 @@ class ZCodeEditReviewSession extends Disposable implements IChatEditReviewSessio
 		// Opt-in only: agent writes stay silent so the user's existing tabs
 		// are not displaced. Reveal when the user clicks the change list.
 		if (file.reveal === true) {
-			await this._editorService.openEditor({
-				resource: file.uri,
-				options: { preserveFocus: true, pinned: true, revealIfOpened: true },
-			});
-			// Touch integration now that an editor pane exists.
-			const pane = this._editorService.activeEditorPane;
-			if (pane) {
-				entry.getEditorIntegration(pane);
-			}
+			await this.attachEditor(file.uri, { preserveFocus: true, open: true });
 		}
 
 		return { changes };
+	}
+
+	/**
+	 * Open (optional) and attach {@link IModifiedFileEntry.getEditorIntegration}
+	 * so line/view-zone diff styling paints. Does not show Keep/Undo chrome.
+	 */
+	async attachEditor(uri: URI, options?: { preserveFocus?: boolean; open?: boolean }): Promise<boolean> {
+		const entry = this.getEntry(uri);
+		if (!entry || entry.state.get() !== ModifiedFileEntryState.Modified) {
+			return false;
+		}
+		if (options?.open !== false) {
+			await this._editorService.openEditor({
+				resource: uri,
+				options: {
+					preserveFocus: options?.preserveFocus ?? false,
+					pinned: true,
+					revealIfOpened: true,
+				},
+			});
+		}
+		const pane = this._editorService.activeEditorPane;
+		if (!pane) {
+			return false;
+		}
+		entry.getEditorIntegration(pane).reveal(true, options?.preserveFocus);
+		return true;
 	}
 
 	async syncFiles(files: readonly IZcodeEditingFileDto[]): Promise<void> {
@@ -378,6 +399,14 @@ export class ZCodeChatEditingBridge implements IWorkbenchContribution {
 		}));
 		this._store.add(CommandsRegistry.registerCommand(ZCODE_EDITING_STATUS_COMMAND, () => {
 			return this._session?.status() ?? { entryCount: 0, files: [] };
+		}));
+		this._store.add(CommandsRegistry.registerCommand(ZCODE_EDITING_ATTACH_COMMAND, async (_accessor, uri?: URI) => {
+			if (!uri) {
+				return false;
+			}
+			const session = this._ensureSession();
+			// File is already open from the extension; only attach decorations.
+			return session.attachEditor(URI.revive(uri), { open: false });
 		}));
 	}
 

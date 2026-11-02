@@ -4,7 +4,6 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as dom from '../../../../../base/browser/dom.js';
-import { RunOnceScheduler } from '../../../../../base/common/async.js';
 import { Action, IAction, Separator } from '../../../../../base/common/actions.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
@@ -45,15 +44,6 @@ function canArchiveWorker(state: SuperAgentWorkerState): boolean {
 		|| state === SuperAgentWorkerState.Cancelled;
 }
 
-/** Compact elapsed wording — keep short so the 2-col cell stays tight. */
-function formatDuration(ms: number): string {
-	const s = Math.max(0, Math.floor(ms / 1000));
-	if (s < 60) { return localize('dur.now', "刚刚"); }
-	const m = Math.floor(s / 60);
-	if (m < 60) { return localize('dur.minShort', "{0}分", m); }
-	return localize('dur.hourShort', "{0}时", Math.floor(m / 60));
-}
-
 /** Fixed row height used for content-hugging strip sizing (2-col grid). */
 const CELL_HEIGHT = 28;
 const EMPTY_HEIGHT = 48;
@@ -77,9 +67,7 @@ export class SuperAgentWorkersPanel extends Disposable {
 	private _historyMode = false;
 	private lastDesiredHeight = EMPTY_HEIGHT;
 
-	private readonly _tick = observableValue<number>(this, 0);
 	private readonly _renderSignal = observableValue<number>(this, 0);
-	private readonly tickScheduler = this._register(new RunOnceScheduler(() => this._tick.set(Date.now(), undefined), 30_000));
 
 	private readonly _onDidFocusWorker = this._register(new Emitter<ISuperAgentWorkerHandle>());
 	readonly onDidFocusWorker: Event<ISuperAgentWorkerHandle> = this._onDidFocusWorker.event;
@@ -113,7 +101,6 @@ export class SuperAgentWorkersPanel extends Disposable {
 		this.gridEl = dom.append(container, dom.$('.super-agent-rail'));
 
 		this._register(autorun(reader => {
-			this._tick.read(reader);
 			this._renderSignal.read(reader);
 			const workers = this.routerService.workers.read(reader);
 			const history = this.routerService.history.read(reader);
@@ -125,8 +112,6 @@ export class SuperAgentWorkersPanel extends Disposable {
 			}
 			this.renderGrid(workers, history);
 		}));
-
-		this.tickScheduler.schedule();
 	}
 
 	setHistoryMode(enabled: boolean): void {
@@ -295,12 +280,6 @@ export class SuperAgentWorkersPanel extends Disposable {
 		const chipText = dom.append(stateEl, dom.$('span.chip-text'));
 		chipText.textContent = visuals.stateLabel;
 
-		const since = state === SuperAgentWorkerState.Starting || state === SuperAgentWorkerState.Running || state === SuperAgentWorkerState.Idle
-			? worker.createdAt
-			: worker.lastActivityAt.get();
-		const duration = dom.append(tail, dom.$('.row-duration'));
-		duration.textContent = formatDuration(Date.now() - since);
-
 		const queued = worker.queuedInputs.get().length;
 		if (queued > 0) {
 			const queuedChip = dom.append(tail, dom.$('.queued-chip'));
@@ -370,9 +349,6 @@ export class SuperAgentWorkersPanel extends Disposable {
 		dom.append(stateEl, dom.$('.chip-dot'));
 		const chipText = dom.append(stateEl, dom.$('span.chip-text'));
 		chipText.textContent = visuals.stateLabel;
-
-		const duration = dom.append(tail, dom.$('.row-duration'));
-		duration.textContent = formatDuration(Date.now() - entry.closedAt);
 
 		this.mountActionBtn(tail, localize('btn.restore', "恢复"), true, () => this.restoreHistoryEntry(entry));
 		this.mountActionBtn(tail, localize('btn.forget', "删除"), false, () => this.routerService.deleteHistoryEntry(entry.id));

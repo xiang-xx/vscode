@@ -8,6 +8,7 @@ import { Disposable, DisposableStore } from '../../../../../base/common/lifecycl
 import { autorun } from '../../../../../base/common/observable.js';
 import { localize } from '../../../../../nls.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { IKeybindingService } from '../../../../../platform/keybinding/common/keybinding.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
 import { ViewContainerLocation } from '../../../../common/views.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
@@ -16,7 +17,7 @@ import { mainWindow } from '../../../../../base/browser/window.js';
 import { IChatRouterService } from '../../common/superAgent/chatRouterService.js';
 import { ISuperAgentPresentationQueue } from '../../common/superAgent/superAgentPresentationQueue.js';
 import { ZCODE_VIEW_CONTAINER_ID } from '../zcode/zcodeAuxiliaryBarChrome.js';
-import { ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
+import { ViewPendingSuperAgentWorkerAction, ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
 
 /**
  * Single-page presentation chrome (§5.5):
@@ -41,6 +42,7 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
 		@IPaneCompositePartService private readonly paneCompositeService: IPaneCompositePartService,
 		@ICommandService private readonly commandService: ICommandService,
+		@IKeybindingService private readonly keybindingService: IKeybindingService,
 	) {
 		super();
 
@@ -120,9 +122,15 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 		}
 
 		const view = dom.append(this.toastEl, dom.$<HTMLButtonElement>('button.zcode-superagent-toast-btn', { type: 'button' }));
-		view.textContent = localize('toast.view', "查看");
+		const kb = this.keybindingService.lookupKeybinding(ViewPendingSuperAgentWorkerAction.ID)?.getLabel();
+		view.textContent = kb
+			? localize('toast.viewWithKb', "查看 ({0})", kb)
+			: localize('toast.view', "查看");
+		view.title = kb
+			? localize('toast.viewTitleWithKb', "查看该 Worker（{0}）", kb)
+			: localize('toast.viewTitle', "查看该 Worker");
 		this.toastListeners.add(dom.addDisposableListener(view, dom.EventType.CLICK, () => {
-			this.presentationQueue.present(worker.id, { force: true });
+			void this.commandService.executeCommand(ViewPendingSuperAgentWorkerAction.ID);
 		}));
 	}
 

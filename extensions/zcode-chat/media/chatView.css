@@ -517,47 +517,100 @@ button {
 	display: flex;
 	align-items: center;
 	justify-content: flex-end;
-	gap: 6px;
+	gap: 8px;
 	max-width: min(100%, 36rem);
 	font-size: 11px;
+	line-height: 1.4;
 	color: var(--vscode-descriptionForeground);
 }
+/* Short worker title — plain muted label, no colored chip. */
 .dispatch-badge {
-	display: inline-flex;
-	align-items: center;
-	max-width: 11em;
+	display: inline-block;
+	max-width: 12em;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	padding: 0 6px;
-	border-radius: 3px;
-	font-size: 10px;
-	font-weight: 600;
-	letter-spacing: 0.01em;
-	line-height: 1.55;
-	color: var(--dispatch-accent, var(--vscode-badge-foreground));
-	background: color-mix(in srgb, var(--dispatch-accent, var(--vscode-badge-background)) 16%, transparent);
-	border: 1px solid color-mix(in srgb, var(--dispatch-accent, var(--vscode-widget-border, rgba(127,127,127,.35))) 40%, transparent);
+	font-weight: 400;
+	color: var(--vscode-descriptionForeground);
 }
 .dispatch-receipt {
-	opacity: 0.95;
-	font-weight: 500;
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	font-weight: 400;
+	color: var(--vscode-descriptionForeground);
 }
-.dispatch-receipt.is-pending,
-.dispatch-receipt.is-running {
-	color: var(--dispatch-accent, var(--vscode-focusBorder));
+.dispatch-status-icon {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 12px;
+	height: 12px;
+	flex-shrink: 0;
+	position: relative;
 }
-.dispatch-receipt.is-awaiting {
-	color: var(--vscode-editorWarning-foreground, var(--vscode-notificationsWarningIcon-foreground, #cca700));
+.dispatch-status-icon::before {
+	content: '';
+	box-sizing: border-box;
 }
-.dispatch-receipt.is-done {
+/* Quiet idle / queued */
+.dispatch-receipt.is-pending .dispatch-status-icon::before {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	border: 1px solid currentColor;
+	opacity: 0.7;
+}
+/* Breathing activity light */
+.dispatch-receipt.is-running .dispatch-status-icon::before {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--vscode-focusBorder, var(--vscode-progressBar-background));
+	animation: pulse 1.5s ease-in-out infinite;
+}
+.dispatch-receipt.is-awaiting .dispatch-status-icon::before {
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: var(--vscode-editorWarning-foreground, var(--vscode-notificationsWarningIcon-foreground, #cca700));
+	animation: pulse 1.2s ease-in-out infinite;
+}
+.dispatch-receipt.is-done .dispatch-status-icon::before {
+	content: '✓';
+	font-size: 11px;
+	line-height: 1;
+	font-weight: 600;
 	color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185));
 }
-.dispatch-receipt.is-error {
+.dispatch-receipt.is-error .dispatch-status-icon::before {
+	content: '✕';
+	font-size: 10px;
+	line-height: 1;
+	font-weight: 600;
 	color: var(--vscode-errorForeground, var(--vscode-testing-iconFailed, #f14c4c));
 }
 .dispatch-receipt.is-cancelled {
+	opacity: 0.7;
+}
+.dispatch-receipt.is-cancelled .dispatch-status-icon::before {
+	width: 7px;
+	height: 1.5px;
+	border-radius: 1px;
+	background: currentColor;
+}
+.dispatch-status-text {
+	color: inherit;
+}
+.dispatch-status-dur {
+	color: inherit;
 	opacity: 0.75;
+	font-variant-numeric: tabular-nums;
+}
+.dispatch-status-dur:not(:empty)::before {
+	content: '·';
+	margin: 0 0.35em 0 0.15em;
+	opacity: 0.7;
 }
 .dispatch-row.clickable {
 	cursor: pointer;
@@ -565,16 +618,9 @@ button {
 .dispatch-row.clickable:hover .dispatch-bubble {
 	border-color: var(--vscode-focusBorder);
 }
-.dispatch-row.clickable:hover .dispatch-receipt.is-pending,
-.dispatch-row.clickable:hover .dispatch-receipt.is-running,
-.dispatch-row.clickable:hover .dispatch-receipt.is-awaiting,
-.dispatch-row.clickable:hover .dispatch-receipt.is-done,
-.dispatch-row.clickable:hover .dispatch-receipt.is-error,
-.dispatch-row.clickable:hover .dispatch-receipt.is-cancelled {
-	opacity: 1;
-}
+.dispatch-row.clickable:hover .dispatch-receipt,
 .dispatch-row.clickable:hover .dispatch-badge {
-	border-color: color-mix(in srgb, var(--dispatch-accent, var(--vscode-focusBorder)) 55%, transparent);
+	color: var(--vscode-foreground);
 }
 .user-bubble .user-text {
 	white-space: pre-wrap;

@@ -63,6 +63,21 @@ export function dispatchStatusLabel(status: DispatchStatus | undefined): string 
 	}
 }
 
+/** Task still in flight — duration should keep ticking. */
+export function isDispatchStatusActive(status: DispatchStatus | undefined): boolean {
+	return status === 'pending'
+		|| status === 'queued'
+		|| status === 'starting'
+		|| status === 'running'
+		|| status === 'awaiting'
+		|| status === 'stalled';
+}
+
+/** Terminal outcomes freeze the per-dispatch duration. */
+export function isDispatchStatusTerminal(status: DispatchStatus | undefined): boolean {
+	return status === 'done' || status === 'failed' || status === 'cancelled';
+}
+
 export type ConversationItem =
 	| {
 		id: string;
@@ -127,6 +142,10 @@ export type ConversationItem =
 		receipt?: string;
 		/** Live worker turn status shown under the bubble. */
 		status?: DispatchStatus;
+		/** When this dispatched task started (not worker lifetime). */
+		startedAt?: number;
+		/** Frozen elapsed ms once the task reaches a terminal status. */
+		durationMs?: number;
 	}
 	| {
 		id: string;

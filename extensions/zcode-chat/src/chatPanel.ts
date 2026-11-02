@@ -35,6 +35,8 @@ import { buildPlusMenuSections, formatSlashInsert, CAPABILITY_COMMANDS, QUICK_AD
 import {
 	dispatchStatusLabel,
 	formatWorkDuration,
+	isDispatchStatusActive,
+	isDispatchStatusTerminal,
 	newItemId,
 	toolDisplayName,
 	type ConversationItem,
@@ -236,6 +238,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private activeWorkId?: string;
 	private turnStartedAt?: number;
 	private elapsedTimer?: ReturnType<typeof setInterval>;
+	/** Live-ticks Router dispatch cards while any task is still active. */
+	private dispatchElapsedTimer?: ReturnType<typeof setInterval>;
 
 	private fileChanges: FileChangeView[] = [];
 	private cursorModels: string[] = [];
@@ -575,12 +579,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				text: trimmed,
 				receipt: dispatchStatusLabel('running'),
 				status: 'running',
+				startedAt: Date.now(),
 			});
 		});
 		if (!applied) {
 			return;
 		}
 		if (this.sessionId === routerId) {
+			this.startDispatchElapsedTimer();
 			this.pushState();
 		}
 		await this.persistSessionById(routerId);
@@ -619,16 +625,18 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				item.accent = accent;
 			}
 			if (status) {
-				item.status = status;
-				item.receipt = dispatchStatusLabel(status);
+				this.applyDispatchStatus(item, status);
 			} else if (!item.status) {
-				item.status = 'running';
-				item.receipt = item.receipt || dispatchStatusLabel('running');
+				this.applyDispatchStatus(item, 'running');
 			} else {
+				if (!item.startedAt) {
+					item.startedAt = Date.now();
+				}
 				item.receipt = item.receipt || dispatchStatusLabel(item.status);
 			}
 		});
 		if (this.sessionId === sessionId) {
+			this.startDispatchElapsedTimer();
 			this.pushState();
 		}
 		void this.persistSessionById(sessionId);
@@ -703,22 +711,27 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			// Historical cards stay frozen once a turn ends; only the active
 			// (latest) card should flip back to running on a follow-up.
-			const terminal = item.status === 'done' || item.status === 'failed' || item.status === 'cancelled';
-			const nextTerminal = status === 'done' || status === 'failed' || status === 'cancelled';
+			const terminal = isDispatchStatusTerminal(item.status);
+			const nextTerminal = isDispatchStatusTerminal(status);
 			if (terminal && !nextTerminal && !dispatchItemId) {
 				return;
 			}
 			if (item.status === status && item.receipt === dispatchStatusLabel(status)) {
+				// Still stamp timing if a terminal card somehow missed durationMs.
+				if (nextTerminal && item.durationMs === undefined && item.startedAt) {
+					item.durationMs = Math.max(0, Date.now() - item.startedAt);
+					changed = true;
+				}
 				return;
 			}
-			item.status = status;
-			item.receipt = dispatchStatusLabel(status);
+			this.applyDispatchStatus(item, status);
 			changed = true;
 		});
 		if (!changed) {
 			return;
 		}
 		if (this.sessionId === sessionId) {
+			this.startDispatchElapsedTimer();
 			this.pushState();
 		}
 		void this.persistSessionById(sessionId);
@@ -1489,6 +1502,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		this.parked.set(this.sessionId, this.captureView());
 		this.stopElapsedTimer();
+		this.stopDispatchElapsedTimer();
 	}
 
 	/** Working-set rows for the visible chat only. */
@@ -1811,8 +1825,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 					text: displayText,
 					receipt: dispatchStatusLabel('pending'),
 					status: 'pending',
+					startedAt: Date.now(),
 				});
 			});
+			this.startDispatchElapsedTimer();
 			this.pushState({ clearDraft: true });
 			void this.persistSessionById(sessionId);
 			void vscode.commands.executeCommand('zcode.internal.superAgent.routerSubmit', {
@@ -2224,6 +2240,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private applySession(id: string, items: ConversationItem[], todos: TodoItem[], persisted = true): void {
 		this.stopElapsedTimer();
+		this.stopDispatchElapsedTimer();
 		this.sessionId = id;
 		this.sessionPersisted = persisted;
 		this.reportedUsageTokens = undefined;
@@ -2336,6 +2353,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.stopRunning(sessionId);
 			if (sessionId === this.sessionId) {
 				this.stopElapsedTimer();
+				this.stopDispatchElapsedTimer();
 			}
 			// Detach the run marker now — the async run loop's tail must not keep
 			// the closed tab alive via refreshSessionList()/persistSessionById().
@@ -2943,6 +2961,60 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	/**
+	 * Applies live status onto a Router dispatch card and keeps per-task timing.
+	 * Duration is task-scoped (this card), not worker lifetime.
+	 */
+	private applyDispatchStatus(
+		item: Extract<ConversationItem, { kind: 'dispatch' }>,
+		status: DispatchStatus,
+	): void {
+		const wasTerminal = isDispatchStatusTerminal(item.status);
+		const nextTerminal = isDispatchStatusTerminal(status);
+		if (wasTerminal && !nextTerminal) {
+			item.startedAt = Date.now();
+			item.durationMs = undefined;
+		} else if (!item.startedAt) {
+			item.startedAt = Date.now();
+		}
+		if (nextTerminal && item.durationMs === undefined && item.startedAt) {
+			item.durationMs = Math.max(0, Date.now() - item.startedAt);
+		}
+		item.status = status;
+		item.receipt = dispatchStatusLabel(status);
+	}
+
+	private hasActiveDispatchTiming(items: readonly ConversationItem[]): boolean {
+		return items.some(item =>
+			item.kind === 'dispatch'
+			&& isDispatchStatusActive(item.status)
+			&& item.durationMs === undefined
+			&& !!item.startedAt);
+	}
+
+	private startDispatchElapsedTimer(): void {
+		if (this.dispatchElapsedTimer) {
+			return;
+		}
+		if (!this.hasActiveDispatchTiming(this.items)) {
+			return;
+		}
+		this.dispatchElapsedTimer = setInterval(() => {
+			if (!this.hasActiveDispatchTiming(this.items)) {
+				this.stopDispatchElapsedTimer();
+				return;
+			}
+			this.pushState();
+		}, 1000);
+	}
+
+	private stopDispatchElapsedTimer(): void {
+		if (this.dispatchElapsedTimer) {
+			clearInterval(this.dispatchElapsedTimer);
+			this.dispatchElapsedTimer = undefined;
+		}
+	}
+
 	private clearStatusOn(chat: MutableChat): void {
 		if (!chat.activeStatusId) {
 			return;
@@ -3001,8 +3073,25 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 						: undefined,
 				};
 			}
+			if (item.kind === 'dispatch') {
+				let durationLabel: string | undefined;
+				if (item.durationMs !== undefined) {
+					durationLabel = formatWorkDuration(item.durationMs);
+				} else if (item.startedAt && isDispatchStatusActive(item.status)) {
+					durationLabel = formatWorkDuration(Date.now() - item.startedAt);
+				}
+				return {
+					...item,
+					durationLabel,
+				};
+			}
 			return item;
 		});
+		if (this.hasActiveDispatchTiming(this.items)) {
+			this.startDispatchElapsedTimer();
+		} else {
+			this.stopDispatchElapsedTimer();
+		}
 
 		void this.view?.webview.postMessage({
 			type: 'state',

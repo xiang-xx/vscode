@@ -513,8 +513,12 @@ export class FileEditSession {
 			await vscode.commands.executeCommand('vscode.diff', originalUri, entry.uri, title);
 			return;
 		}
-		// Open the live file so Chat-style line markers can decorate the editor.
+		// Open the live file, then ask the workbench bridge to attach Chat diff
+		// decorations (Keep/Undo chrome stays opt-in and is not shown here).
 		await vscode.window.showTextDocument(entry.uri, { preview: false });
+		await vscode.commands.executeCommand('_zcode.editing.attachEditor', entry.uri).then(undefined, () => {
+			/* older shell / bridge not loaded — EditDecorationController still paints */
+		});
 	}
 
 	async openAllChanges(sessionId?: string): Promise<void> {

@@ -5,10 +5,12 @@
 
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
+import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
 import { localize, localize2 } from '../../../../../nls.js';
 import { Action2, registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { KeybindingWeight } from '../../../../../platform/keybinding/common/keybindingsRegistry.js';
 import { INotificationService } from '../../../../../platform/notification/common/notification.js';
 import { IQuickInputService } from '../../../../../platform/quickinput/common/quickInput.js';
 import { IChatWidgetService } from '../chat.js';
@@ -161,8 +163,48 @@ export class BindCurrentChatAsWorkerAction extends Action2 {
 	}
 }
 
+/**
+ * Same as clicking the bottom-right toast「查看」: jump to the next pending
+ * worker that needs attention. Bound globally (incl. while typing in another
+ * worker's webview input — webview key events are re-dispatched to the
+ * workbench keybinding service).
+ */
+export class ViewPendingSuperAgentWorkerAction extends Action2 {
+
+	static readonly ID = 'workbench.action.chat.superAgent.viewPendingWorker';
+
+	constructor() {
+		super({
+			id: ViewPendingSuperAgentWorkerAction.ID,
+			title: localize2('viewPendingWorker', "View Pending Super Agent Worker"),
+			category: localize2('superAgentCategory3', "Chat"),
+			f1: true,
+			keybinding: {
+				// ⌘⌥J / Ctrl+Alt+J — free of common editor/chat bindings; modifiers
+				// keep it alive while focus is in a text input.
+				primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyJ,
+				weight: KeybindingWeight.WorkbenchContrib + 10,
+			},
+		});
+	}
+
+	override async run(accessor: ServicesAccessor): Promise<void> {
+		const presentationQueue = accessor.get(ISuperAgentPresentationQueue);
+		const commandService = accessor.get(ICommandService);
+
+		const workerId = presentationQueue.toast.get()?.workerId
+			?? presentationQueue.pending.get()[0]?.workerId;
+		if (!workerId) {
+			return;
+		}
+
+		await commandService.executeCommand(ZCODE_INTERNAL_SUPERAGENT_PRESENT_WORKER, workerId);
+	}
+}
+
 export function registerSuperAgentActions(): void {
 	registerAction2(ShowSuperAgentWorkersPageAction);
 	registerAction2(NewSuperAgentWorkerAction);
 	registerAction2(BindCurrentChatAsWorkerAction);
+	registerAction2(ViewPendingSuperAgentWorkerAction);
 }

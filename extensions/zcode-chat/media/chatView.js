@@ -1455,7 +1455,41 @@
 			case 'cancelled':
 				return 'dispatch-receipt is-cancelled';
 			default:
-				return 'dispatch-receipt';
+				return 'dispatch-receipt is-pending';
+		}
+	}
+
+	function syncDispatchReceipt(receiptEl, item) {
+		const statusText = dispatchStatusText(item);
+		const statusClass = dispatchStatusClass(item.status);
+		const durText = item.durationLabel || '';
+		if (receiptEl.className !== statusClass) {
+			receiptEl.className = statusClass;
+		}
+		let iconEl = receiptEl.querySelector('.dispatch-status-icon');
+		let labelEl = receiptEl.querySelector('.dispatch-status-text');
+		let durEl = receiptEl.querySelector('.dispatch-status-dur');
+		if (!iconEl || !labelEl || !durEl) {
+			receiptEl.replaceChildren();
+			iconEl = document.createElement('span');
+			iconEl.className = 'dispatch-status-icon';
+			iconEl.setAttribute('aria-hidden', 'true');
+			labelEl = document.createElement('span');
+			labelEl.className = 'dispatch-status-text';
+			durEl = document.createElement('span');
+			durEl.className = 'dispatch-status-dur';
+			receiptEl.append(iconEl, labelEl, durEl);
+		}
+		if (labelEl.textContent !== statusText) {
+			labelEl.textContent = statusText;
+		}
+		if (durEl.textContent !== durText) {
+			durEl.textContent = durText;
+		}
+		durEl.hidden = !durText;
+		const title = durText ? `${statusText} · ${durText}` : statusText;
+		if (receiptEl.title !== title) {
+			receiptEl.title = title;
 		}
 	}
 
@@ -1465,7 +1499,6 @@
 		if (el.className !== nextClass) {
 			el.className = nextClass;
 		}
-		el.style.setProperty('--dispatch-accent', dispatchAccent(item.accent));
 		el.title = wantClickable ? '打开 Worker' : '';
 		const receiptEl = el.querySelector('.dispatch-receipt');
 		const textEl = el.querySelector('.dispatch-text');
@@ -1473,15 +1506,8 @@
 		if (!textEl) {
 			return false;
 		}
-		const statusText = dispatchStatusText(item);
-		const statusClass = dispatchStatusClass(item.status);
 		if (receiptEl) {
-			if (receiptEl.textContent !== statusText) {
-				receiptEl.textContent = statusText;
-			}
-			if (receiptEl.className !== statusClass) {
-				receiptEl.className = statusClass;
-			}
+			syncDispatchReceipt(receiptEl, item);
 		}
 		if (textEl.textContent !== (item.text || '')) {
 			textEl.textContent = item.text || '';
@@ -1936,22 +1962,11 @@
 		}
 	}
 
-	function dispatchAccent(accent) {
-		if (!accent) {
-			return 'var(--vscode-focusBorder)';
-		}
-		if (accent.startsWith('#') || accent.startsWith('rgb') || accent.startsWith('hsl') || accent.startsWith('var(')) {
-			return accent;
-		}
-		return `var(--vscode-${String(accent).replace(/\./g, '-')})`;
-	}
-
 	function renderDispatchCard(item, mark) {
 		// Same right-aligned bubble shape as a user turn — Router is still a
 		// chat transcript; the Workers strip is the task board.
 		const row = mark(document.createElement('div'), item.id);
 		row.className = 'dispatch-row' + (item.workerId ? ' clickable' : '');
-		row.style.setProperty('--dispatch-accent', dispatchAccent(item.accent));
 		if (item.workerId) {
 			row.title = '打开 Worker';
 			row.addEventListener('click', () => {
@@ -1974,8 +1989,7 @@
 			meta.appendChild(badge);
 		}
 		const receipt = document.createElement('span');
-		receipt.className = dispatchStatusClass(item.status);
-		receipt.textContent = dispatchStatusText(item);
+		syncDispatchReceipt(receipt, item);
 		meta.appendChild(receipt);
 		row.appendChild(bubble);
 		row.appendChild(meta);
@@ -2008,7 +2022,8 @@
 				return `${item.id}|s|${item.tone || ''}|${item.text || ''}`;
 			}
 			if (item.kind === 'dispatch') {
-				return `${item.id}|d|${item.text || ''}|${item.workerId || ''}|${item.badge || ''}|${item.accent || ''}|${item.receipt || ''}|${item.status || ''}`;
+				// durationLabel ticks live via tryPatchElapsed — omit it from the key.
+				return `${item.id}|d|${item.text || ''}|${item.workerId || ''}|${item.badge || ''}|${item.accent || ''}|${item.receipt || ''}|${item.status || ''}|${item.startedAt || ''}|${item.durationMs || ''}`;
 			}
 			return `${item.id}|${item.kind}|${item.text || ''}|${item.status || ''}`;
 		}).join('\u0001');
@@ -2031,6 +2046,19 @@
 		}
 	}
 
+	function patchDispatchDurations(items) {
+		for (const item of items || []) {
+			if (item.kind !== 'dispatch') {
+				continue;
+			}
+			const receiptEl = timelineEl.querySelector(`.dispatch-row[data-item-id="${CSS.escape(item.id)}"] .dispatch-receipt`);
+			if (!receiptEl) {
+				continue;
+			}
+			syncDispatchReceipt(receiptEl, item);
+		}
+	}
+
 	function tryPatchElapsed(items) {
 		if (!items || !items.length || timelineKey(items) !== timelineContentKey) {
 			return false;
@@ -2041,6 +2069,7 @@
 			return false;
 		}
 		patchWorkLabel(items);
+		patchDispatchDurations(items);
 		return true;
 	}
 

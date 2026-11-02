@@ -350,8 +350,7 @@ class ChatEditingOverlayController {
 			const data = sessionAndEntry.read(r);
 			const keepUndo = reviewPreferences.keepUndoEnabled.read(r);
 
-			if (!data || !keepUndo) {
-				// Diff styling stays in the editor; Keep/Undo overlay is opt-in.
+			if (!data) {
 				hide();
 				return;
 			}
@@ -362,6 +361,15 @@ class ChatEditingOverlayController {
 				// any session with changes
 				const editorPane = group.activeEditorPane;
 				assertType(editorPane);
+
+				// Always attach so line/view-zone diff styling paints, even when
+				// Keep/Undo chrome is off (opt-in preference below).
+				entry.getEditorIntegration(editorPane);
+
+				if (!keepUndo) {
+					hide();
+					return;
+				}
 
 				const changeIndex = derived(r => entry
 					? entry.getEditorIntegration(editorPane).currentIndex.read(r)
