@@ -28,7 +28,8 @@ export class ChatSessionReviewPreferencesService extends Disposable implements I
 		super();
 		this._keepUndoEnabled = this._register(observableMemento({
 			key: 'chat.sessionReview.keepUndoEnabled',
-			defaultValue: true,
+			// ZCode: AI edits apply directly — Keep/Undo is opt-in noise, not the default review path.
+			defaultValue: false,
 			toStorage: value => String(value),
 			fromStorage: value => value !== 'false',
 		})(StorageScope.PROFILE, StorageTarget.USER, storageService));

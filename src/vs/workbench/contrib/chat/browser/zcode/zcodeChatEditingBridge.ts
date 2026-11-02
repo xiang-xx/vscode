@@ -189,7 +189,9 @@ class ZCodeEditReviewSession extends Disposable implements IChatEditReviewSessio
 		const changes = diff.changes.length;
 		this._logService.info('[zcode editing] applied edit', file.uri.toString(), `changes=${changes}`, `identical=${diff.identical}`);
 
-		if (file.reveal !== false) {
+		// Opt-in only: agent writes stay silent so the user's existing tabs
+		// are not displaced. Reveal when the user clicks the change list.
+		if (file.reveal === true) {
 			await this._editorService.openEditor({
 				resource: file.uri,
 				options: { preserveFocus: true, pinned: true, revealIfOpened: true },

@@ -12,19 +12,19 @@ import { ChatSessionReviewPreferencesService } from '../../common/editing/chatSe
 suite('ChatSessionReviewPreferences', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	test('defaults to Keep and Undo and persists the user choice across instances', () => {
+	test('defaults Keep/Undo off and persists the user choice across instances', () => {
 		const storage = store.add(new InMemoryStorageService());
 		const preferences = store.add(new ChatSessionReviewPreferencesService(storage));
 		const states: boolean[] = [];
 		store.add(autorun(reader => states.push(preferences.keepUndoEnabled.read(reader))));
-		preferences.setKeepUndoEnabled(false);
+		preferences.setKeepUndoEnabled(true);
 		preferences.dispose();
 
 		const restored = store.add(new ChatSessionReviewPreferencesService(storage));
-		const disabled = restored.keepUndoEnabled.get();
-		restored.setKeepUndoEnabled(true);
-		const enabled = store.add(new ChatSessionReviewPreferencesService(storage)).keepUndoEnabled.get();
+		const enabled = restored.keepUndoEnabled.get();
+		restored.setKeepUndoEnabled(false);
+		const disabled = store.add(new ChatSessionReviewPreferencesService(storage)).keepUndoEnabled.get();
 
-		assert.deepStrictEqual({ states, disabled, enabled }, { states: [true, false], disabled: false, enabled: true });
+		assert.deepStrictEqual({ states, enabled, disabled }, { states: [false, true], enabled: true, disabled: false });
 	});
 });

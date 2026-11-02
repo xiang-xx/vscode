@@ -69,7 +69,7 @@ export function registerChatParticipant(context: vscode.ExtensionContext): void 
 			}, token);
 
 			// When proposed chatParticipantAdditions is available, attribute disk
-			// writes as chat agent edits so the built-in Keep/Undo UI can attach.
+			// writes as chat agent edits so the built-in diff decorations attach.
 			let result;
 			if (typeof stream.externalEdit === 'function' && root) {
 				await stream.externalEdit(vscode.Uri.file(root), async () => {
@@ -86,7 +86,7 @@ export function registerChatParticipant(context: vscode.ExtensionContext): void 
 			response.markdown(result!.content);
 			const changes = getFileEditSession().list();
 			if (changes.length) {
-				response.markdown(`\n\n_${changes.length} file(s) changed — review in the editor (Keep / Undo) or the ZCode working set._`);
+				response.markdown(`\n\n_${changes.length} file(s) changed — open from the ZCode working set to review the diff._`);
 			}
 
 			return {

@@ -8,7 +8,7 @@
  * - Track original → modified per URI
  * - Bottom file list with +/- stats
  * - Open as diff (review) or go-to-file
- * - Keep / Undo (all or per file)
+ * - Diff styling in the editor (Keep/Undo is opt-in, off by default)
  *
  * Originals are served via TextDocumentContentProvider so we can reuse
  * `vscode.diff` / `vscode.changes` like the built-in chat multi-diff flow.
@@ -372,8 +372,9 @@ export class FileEditSession {
 
 	/**
 	 * Ask workbench `_zcode.editing.applyEdit` to create a review entry and
-	 * paint Chat Keep/Undo markers. Failures are logged; extension decorations
-	 * still cover the file via {@link EditDecorationController}.
+	 * paint Chat Keep/Undo markers. Never auto-opens the editor — the user
+	 * opens files from the bottom change list. Failures are logged; extension
+	 * decorations still cover the file via {@link EditDecorationController}.
 	 */
 	private async applyViaChatEditing(
 		uri: vscode.Uri,
@@ -384,7 +385,7 @@ export class FileEditSession {
 		try {
 			const result = await vscode.commands.executeCommand<{ changes?: number }>(
 				'_zcode.editing.applyEdit',
-				{ uri, content, original, kind, reveal: true },
+				{ uri, content, original, kind, reveal: false },
 			);
 			console.info('[zcode-chat] applyEdit ok', uri.toString(), result);
 		} catch (err) {

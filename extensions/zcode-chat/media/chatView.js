@@ -10,8 +10,6 @@
 	const workingSetList = document.getElementById('workingSetList');
 	const workingSetTotals = document.getElementById('workingSetTotals');
 	const workingSetCollapse = document.getElementById('workingSetCollapse');
-	const keepAllBtn = document.getElementById('keepAllBtn');
-	const undoAllBtn = document.getElementById('undoAllBtn');
 	const viewAllBtn = document.getElementById('viewAllBtn');
 	const chipsEl = document.getElementById('chips');
 	const queuePanel = document.getElementById('queuePanel');
@@ -112,6 +110,8 @@
 	let workingSetCollapsed = false;
 	/** Local draft selections for pending question cards: askId -> { [qId]: { selected: string[], freeText: string } } */
 	const questionDrafts = Object.create(null);
+	/** Activity groups (tool/reasoning/work/status) stay collapsed unless the user expands them. */
+	const activityExpanded = Object.create(null);
 
 	function escapeHtml(text) {
 		if (window.ZCodeMarkdown && window.ZCodeMarkdown.escapeHtml) {
@@ -637,8 +637,10 @@
 		const items = Array.isArray(queue) ? queue : [];
 		if (!queuePanel || !queueList) return;
 		queuePanel.hidden = items.length === 0;
+		// While a turn is in flight, queued items are just waiting — do not show
+		// the "队列已暂停" banner (pause only matters once the turn ends).
 		if (queuePausedBanner) {
-			queuePausedBanner.hidden = !paused || items.length === 0;
+			queuePausedBanner.hidden = !paused || items.length === 0 || busy;
 		}
 		if (queuePausedText) {
 			queuePausedText.textContent = '队列已暂停 — 停止或出错后不会自动发送';
@@ -1151,129 +1153,582 @@
 		return true;
 	}
 
+	function timelineHasSelection() {
+		const sel = document.getSelection();
+		if (!sel || sel.isCollapsed || !sel.rangeCount) {
+			return false;
+		}
+		const node = sel.getRangeAt(0).commonAncestorContainer;
+		const el = node.nodeType === 1 ? node : node.parentElement;
+		return !!(el && timelineEl.contains(el));
+	}
+
+	function itemStartsTurn(kind) {
+		return kind === 'user' || kind === 'dispatch' || kind === 'summary';
+	}
+
+	function isActivityKind(kind) {
+		return kind === 'tool' || kind === 'reasoning' || kind === 'work' || kind === 'status';
+	}
+
+	function truncateActivityDetail(text, max) {
+		const value = String(text || '').replace(/\s+/g, ' ').trim();
+		if (!value) {
+			return '';
+		}
+		const limit = max || 42;
+		return value.length > limit ? value.slice(0, limit - 1) + '…' : value;
+	}
+
+	function activitySummaryLabel(items) {
+		const list = Array.isArray(items) ? items : [];
+		const runningTool = [...list].reverse().find((item) => item.kind === 'tool' && item.status === 'running');
+		if (runningTool) {
+			const title = toolTitle(runningTool.toolName);
+			const detail = truncateActivityDetail(toolSummaryText(runningTool));
+			return detail ? `正在 ${title} ${detail}` : `正在 ${title}…`;
+		}
+		if (list.some((item) => item.kind === 'reasoning' && item.streaming)) {
+			return '正在思考…';
+		}
+		const runningWork = list.find((item) => item.kind === 'work' && item.running);
+		if (runningWork) {
+			const dur = runningWork.durationLabel || '';
+			return dur ? `工作中 · ${dur}` : '工作中…';
+		}
+		const steps = list.filter((item) => item.kind === 'tool' || item.kind === 'reasoning').length;
+		if (steps > 0) {
+			return `已完成 ${steps} 步`;
+		}
+		if (list.length > 0) {
+			return `已完成 ${list.length} 步`;
+		}
+		return '活动';
+	}
+
+	function activityIsRunning(items) {
+		return (items || []).some((item) =>
+			(item.kind === 'tool' && item.status === 'running')
+			|| (item.kind === 'reasoning' && item.streaming)
+			|| (item.kind === 'work' && item.running)
+		);
+	}
+
 	/**
-	 * In-place timeline update when item ids/order are unchanged.
-	 * Avoids innerHTML rebuild so running spinners (tools / work) keep animating
-	 * while reasoning / assistant / status text streams in.
+	 * Split conversation items into turns, bundling consecutive tool/reasoning/work/status
+	 * rows into a single activity group so the transcript stays short by default.
 	 */
-	function tryPatchTimeline(items) {
+	function partitionConversation(items) {
+		const turns = [];
+		let current = null;
+		let activity = null;
+		const flushActivity = () => {
+			if (activity && current) {
+				current.rows.push(activity);
+			}
+			activity = null;
+		};
+		const startTurn = () => {
+			flushActivity();
+			current = { rows: [] };
+			turns.push(current);
+			return current;
+		};
+		for (const item of items || []) {
+			if (!item || !item.id) {
+				continue;
+			}
+			if (itemStartsTurn(item.kind) || !current) {
+				startTurn();
+				if (itemStartsTurn(item.kind)) {
+					current.rows.push({ type: 'item', item });
+					continue;
+				}
+			}
+			if (isActivityKind(item.kind)) {
+				if (!activity) {
+					activity = { type: 'activity', id: item.id, items: [] };
+				}
+				activity.items.push(item);
+				continue;
+			}
+			flushActivity();
+			current.rows.push({ type: 'item', item });
+		}
+		flushActivity();
+		return turns;
+	}
+
+	function fillActivityChrome(group, items) {
+		if (!group) {
+			return;
+		}
+		const groupId = group.dataset.activityId || '';
+		const expanded = !!activityExpanded[groupId];
+		const running = activityIsRunning(items);
+		group.className = 'activity-group'
+			+ (expanded ? ' expanded' : ' collapsed')
+			+ (running ? ' running' : '');
+		const label = group.querySelector('.activity-header .label');
+		if (label) {
+			const next = activitySummaryLabel(items);
+			if (label.textContent !== next) {
+				label.textContent = next;
+			}
+		}
+		const header = group.querySelector('.activity-header');
+		if (header) {
+			header.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+		}
+	}
+
+	function activityItemsFromGroup(group) {
+		const ids = [...group.querySelectorAll(':scope > .activity-body > [data-item-id]')]
+			.map((el) => el.getAttribute('data-item-id'))
+			.filter(Boolean);
+		const live = (state && Array.isArray(state.items)) ? state.items : [];
+		const byId = new Map(live.map((item) => [item.id, item]));
+		return ids.map((id) => byId.get(id) || { id, kind: 'status' });
+	}
+
+	function bindActivityToggle(header, groupId) {
+		const toggle = () => {
+			activityExpanded[groupId] = !activityExpanded[groupId];
+			const group = header.closest('.activity-group');
+			if (!group) {
+				return;
+			}
+			fillActivityChrome(group, activityItemsFromGroup(group));
+		};
+		header.addEventListener('pointerdown', (event) => {
+			if (event.button !== 0) {
+				return;
+			}
+			event.preventDefault();
+			event.stopPropagation();
+			toggle();
+		});
+		header.addEventListener('keydown', (event) => {
+			if (event.key !== 'Enter' && event.key !== ' ') {
+				return;
+			}
+			event.preventDefault();
+			toggle();
+		});
+	}
+
+	function createActivityGroup(groupId, items) {
+		const group = document.createElement('div');
+		group.dataset.activityId = groupId;
+		const header = document.createElement('button');
+		header.type = 'button';
+		header.className = 'activity-header';
+		header.innerHTML = '<span class="glyph" aria-hidden="true"></span><span class="label"></span><span class="chev" aria-hidden="true"></span>';
+		bindActivityToggle(header, groupId);
+		const body = document.createElement('div');
+		body.className = 'activity-body';
+		group.appendChild(header);
+		group.appendChild(body);
+		fillActivityChrome(group, items);
+		return group;
+	}
+
+	function createItemRow(item, actions) {
+		const host = document.createElement('div');
+		const ctx = {
+			turnActions: actions,
+			ensureTurn() { return host; },
+			startTurn() { return host; },
+		};
+		renderTimelineItem(item, ctx);
+		const row = host.firstElementChild;
+		if (row && item.id) {
+			row.setAttribute('data-item-id', item.id);
+		}
+		return row;
+	}
+
+	function patchWorkRow(el, item) {
+		const nextClass = 'work-row' + (item.running ? ' running' : '');
+		if (el.className !== nextClass) {
+			el.className = nextClass;
+		}
+		const textEl = el.querySelector('.text');
+		if (!textEl) {
+			return false;
+		}
+		const dur = item.durationLabel || '';
+		let text;
+		if (item.running) {
+			text = dur ? `已运行 ${dur}` : '工作中…';
+		} else if (item.label === 'Failed') {
+			text = dur ? `失败 · ${dur}` : '失败';
+		} else {
+			text = dur ? `完成 · ${dur}` : '完成';
+		}
+		if (textEl.textContent !== text) {
+			textEl.textContent = text;
+		}
+		return true;
+	}
+
+	function patchAssistantRow(el, item, actions) {
+		const body = el.querySelector('.assistant-body');
+		if (!body) {
+			return false;
+		}
+		const nextClass = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
+		if (body.className !== nextClass) {
+			body.className = nextClass;
+		}
+		const html = renderMarkdown(item.text || '');
+		if (body.innerHTML !== html) {
+			body.innerHTML = html;
+		}
+		syncRowActions(el, actions.retry.has(item.id) ? ['retry'] : [], false);
+		return true;
+	}
+
+	function patchStatusRow(el, item) {
+		const nextClass = 'status-row' + (item.tone === 'error' ? ' error' : '');
+		const wantError = item.tone === 'error';
+		const isError = el.classList.contains('error');
+		if (wantError !== isError || el.className !== nextClass) {
+			el.className = nextClass;
+			if (wantError) {
+				el.textContent = item.text || '';
+			} else {
+				el.innerHTML = '<span class="dot"></span><span class="text"></span>';
+				el.querySelector('.text').textContent = item.text || '';
+			}
+			return true;
+		}
+		if (wantError) {
+			if (el.textContent !== (item.text || '')) {
+				el.textContent = item.text || '';
+			}
+		} else {
+			const textEl = el.querySelector('.text');
+			if (!textEl) {
+				return false;
+			}
+			if (textEl.textContent !== (item.text || '')) {
+				textEl.textContent = item.text || '';
+			}
+		}
+		return true;
+	}
+
+	function dispatchStatusText(item) {
+		if (item.status) {
+			switch (item.status) {
+				case 'queued': return '排队中';
+				case 'starting': return '启动中';
+				case 'running': return '进行中';
+				case 'awaiting': return '需要你输入';
+				case 'done': return '已完成';
+				case 'failed': return '失败';
+				case 'cancelled': return '已取消';
+				case 'stalled': return '疑似卡死';
+				case 'pending': return '处理中';
+				default: break;
+			}
+		}
+		return item.receipt || '处理中';
+	}
+
+	function dispatchStatusClass(status) {
+		switch (status) {
+			case 'queued':
+			case 'pending':
+				return 'dispatch-receipt is-pending';
+			case 'starting':
+			case 'running':
+				return 'dispatch-receipt is-running';
+			case 'awaiting':
+				return 'dispatch-receipt is-awaiting';
+			case 'done':
+				return 'dispatch-receipt is-done';
+			case 'failed':
+			case 'stalled':
+				return 'dispatch-receipt is-error';
+			case 'cancelled':
+				return 'dispatch-receipt is-cancelled';
+			default:
+				return 'dispatch-receipt';
+		}
+	}
+
+	function patchDispatchRow(el, item) {
+		const wantClickable = !!item.workerId;
+		const nextClass = 'dispatch-row' + (wantClickable ? ' clickable' : '');
+		if (el.className !== nextClass) {
+			el.className = nextClass;
+		}
+		el.style.setProperty('--dispatch-accent', dispatchAccent(item.accent));
+		el.title = wantClickable ? '打开 Worker' : '';
+		const receiptEl = el.querySelector('.dispatch-receipt');
+		const textEl = el.querySelector('.dispatch-text');
+		const badgeEl = el.querySelector('.dispatch-badge');
+		if (!textEl) {
+			return false;
+		}
+		const statusText = dispatchStatusText(item);
+		const statusClass = dispatchStatusClass(item.status);
+		if (receiptEl) {
+			if (receiptEl.textContent !== statusText) {
+				receiptEl.textContent = statusText;
+			}
+			if (receiptEl.className !== statusClass) {
+				receiptEl.className = statusClass;
+			}
+		}
+		if (textEl.textContent !== (item.text || '')) {
+			textEl.textContent = item.text || '';
+		}
+		if (item.badge) {
+			if (badgeEl) {
+				if (badgeEl.textContent !== item.badge) {
+					badgeEl.textContent = item.badge;
+				}
+				badgeEl.title = item.badge;
+			} else {
+				const meta = el.querySelector('.dispatch-meta');
+				if (!meta) {
+					return false;
+				}
+				const badge = document.createElement('span');
+				badge.className = 'dispatch-badge';
+				badge.textContent = item.badge;
+				badge.title = item.badge;
+				meta.insertBefore(badge, meta.firstChild);
+			}
+		} else if (badgeEl) {
+			badgeEl.remove();
+		}
+		return true;
+	}
+
+	function patchUserRow(el, item, actions) {
+		const bubble = el.querySelector('.user-bubble');
+		const key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
+		if (!bubble || bubble.dataset.key !== key) {
+			return false;
+		}
+		syncRowActions(el, actions.rewind.has(item.id) ? ['rewind'] : [], true);
+		return true;
+	}
+
+	function patchSummaryRow(el, item) {
+		const label = el.querySelector('.summary-label');
+		const body = el.querySelector('.summary-body');
+		if (!label || !body) {
+			return false;
+		}
+		const nextLabel = `已压缩更早的 ${item.turnCount || 1} 轮对话`;
+		if (label.textContent !== nextLabel) {
+			label.textContent = nextLabel;
+		}
+		if (body.textContent !== (item.text || '')) {
+			body.textContent = item.text || '';
+		}
+		return true;
+	}
+
+	function patchItemInPlace(el, item, actions) {
+		if (item.kind === 'reasoning') {
+			return patchReasoningRow(item);
+		}
+		if (item.kind === 'work') {
+			return patchWorkRow(el, item);
+		}
+		if (item.kind === 'tool') {
+			return patchToolRow(item);
+		}
+		if (item.kind === 'assistant') {
+			return patchAssistantRow(el, item, actions);
+		}
+		if (item.kind === 'status') {
+			return patchStatusRow(el, item);
+		}
+		if (item.kind === 'dispatch') {
+			return patchDispatchRow(el, item);
+		}
+		if (item.kind === 'user') {
+			return patchUserRow(el, item, actions);
+		}
+		if (item.kind === 'summary') {
+			return patchSummaryRow(el, item);
+		}
+		// Questions keep interactive controls — recreate that one row only.
+		return false;
+	}
+
+	/**
+	 * Per-block timeline reconcile. Moves/patches existing rows by id instead of
+	 * wiping `timelineEl.innerHTML`, so text selection in untouched blocks survives
+	 * status ticks, work-row reordering, and streaming appends.
+	 * Consecutive tool/reasoning/work/status rows are nested under an activity group.
+	 */
+	function reconcileTimeline(items) {
 		if (!items || !items.length) {
 			return false;
 		}
-		const existingIds = [...timelineEl.querySelectorAll('[data-item-id]')].map((el) => el.getAttribute('data-item-id'));
-		const nextIds = items.map((i) => i.id);
-		const sameItems = existingIds.length === nextIds.length && existingIds.every((id, idx) => id === nextIds[idx]);
-		// Streaming mostly appends rows (new reasoning / tool / assistant). Keep the existing
-		// DOM and build only the new tail so text selections survive and cost stays O(delta).
-		const appendOnly = !sameItems
-			&& existingIds.length > 0
-			&& nextIds.length > existingIds.length
-			&& existingIds.every((id, idx) => id === nextIds[idx]);
-		if (!sameItems && !appendOnly) {
-			return false;
-		}
-		if (!expansionMatches(items)) {
-			return false;
-		}
-		if (appendOnly && !appendTimelineItems(items, existingIds.length)) {
-			return false;
-		}
+
+		const byId = new Map();
+		timelineEl.querySelectorAll('[data-item-id]').forEach((el) => {
+			const id = el.getAttribute('data-item-id');
+			if (id && !byId.has(id)) {
+				byId.set(id, el);
+			}
+		});
+		const byActivityId = new Map();
+		timelineEl.querySelectorAll('.activity-group[data-activity-id]').forEach((el) => {
+			const id = el.getAttribute('data-activity-id');
+			if (id && !byActivityId.has(id)) {
+				byActivityId.set(id, el);
+			}
+		});
+		timelineEl.querySelectorAll(':scope > .empty').forEach((el) => el.remove());
+
 		const actions = turnActionIds(items);
+		const turns = partitionConversation(items);
+		const placed = new Set();
+		const placedGroups = new Set();
+		let prevTurn = null;
 
-		for (const item of items) {
-			const el = timelineEl.querySelector(`[data-item-id="${CSS.escape(item.id)}"]`);
-			if (!el) {
-				return false;
+		const placeTurn = (nextTurn) => {
+			if (!nextTurn) {
+				return;
 			}
-			if (item.kind === 'reasoning') {
-				if (!patchReasoningRow(item)) {
-					return false;
+			if (prevTurn) {
+				if (prevTurn.nextElementSibling !== nextTurn) {
+					prevTurn.after(nextTurn);
 				}
-				continue;
+			} else if (timelineEl.firstElementChild !== nextTurn) {
+				timelineEl.insertBefore(nextTurn, timelineEl.firstElementChild);
 			}
-			if (item.kind === 'work') {
-				const nextClass = 'work-row' + (item.running ? ' running' : '');
-				if (el.className !== nextClass) {
-					el.className = nextClass;
-				}
-				const textEl = el.querySelector('.text');
-				if (textEl) {
-					const dur = item.durationLabel || '';
-					let text;
-					if (item.running) {
-						text = dur ? `已运行 ${dur}` : '工作中…';
-					} else if (item.label === 'Failed') {
-						text = dur ? `失败 · ${dur}` : '失败';
-					} else {
-						text = dur ? `完成 · ${dur}` : '完成';
-					}
-					if (textEl.textContent !== text) {
-						textEl.textContent = text;
-					}
-				}
-				continue;
+		};
+
+		const placeIn = (parent, row, prevRow) => {
+			if (!parent || !row) {
+				return;
 			}
-			if (item.kind === 'tool') {
-				if (!patchToolRow(item)) {
-					return false;
+			if (prevRow) {
+				if (row.parentElement !== parent || prevRow.nextElementSibling !== row) {
+					prevRow.after(row);
 				}
-				continue;
+			} else if (row.parentElement !== parent || parent.firstElementChild !== row) {
+				parent.insertBefore(row, parent.firstElementChild);
 			}
-			if (item.kind === 'assistant') {
-				const body = el.querySelector('.assistant-body');
-				if (!body) {
-					return false;
+		};
+
+		const resolveRow = (item) => {
+			let row = byId.get(item.id);
+			if (row && !patchItemInPlace(row, item, actions)) {
+				const replacement = createItemRow(item, actions);
+				if (!replacement) {
+					return null;
 				}
-				const nextClass = 'assistant-body rendered-markdown' + (item.streaming ? ' streaming' : '');
-				if (body.className !== nextClass) {
-					body.className = nextClass;
+				row.replaceWith(replacement);
+				row = replacement;
+				byId.set(item.id, row);
+			} else if (!row) {
+				row = createItemRow(item, actions);
+				if (!row) {
+					return null;
 				}
-				const html = renderMarkdown(item.text || '');
-				if (body.innerHTML !== html) {
-					body.innerHTML = html;
-				}
-				syncRowActions(el, actions.retry.has(item.id) ? ['retry'] : [], false);
-				continue;
+				byId.set(item.id, row);
 			}
-			if (item.kind === 'status') {
-				const nextClass = 'status-row' + (item.tone === 'error' ? ' error' : '');
-				if (el.className !== nextClass) {
-					return false;
-				}
-				if (item.tone === 'error') {
-					if (el.textContent !== item.text) {
-						el.textContent = item.text;
-					}
-				} else {
-					const textEl = el.querySelector('.text');
-					if (textEl && textEl.textContent !== item.text) {
-						textEl.textContent = item.text;
+			return row;
+		};
+
+		for (const turnSpec of turns) {
+			const firstItem = turnSpec.rows[0] && turnSpec.rows[0].type === 'item'
+				? turnSpec.rows[0].item
+				: turnSpec.rows[0] && turnSpec.rows[0].type === 'activity'
+					? turnSpec.rows[0].items[0]
+					: null;
+			let turn = null;
+			if (firstItem) {
+				const existing = byId.get(firstItem.id);
+				if (existing) {
+					const parent = existing.closest('.turn');
+					if (parent) {
+						turn = parent;
 					}
 				}
-				continue;
 			}
-			if (item.kind === 'user') {
-				const bubble = el.querySelector('.user-bubble');
-				const key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
-				if (!bubble || bubble.dataset.key !== key) {
+			if (!turn) {
+				turn = document.createElement('div');
+				turn.className = 'turn';
+			}
+			placeTurn(turn);
+			prevTurn = turn;
+
+			let prevRow = null;
+			for (const rowSpec of turnSpec.rows) {
+				if (rowSpec.type === 'activity') {
+					let group = byActivityId.get(rowSpec.id);
+					if (!group) {
+						group = createActivityGroup(rowSpec.id, rowSpec.items);
+						byActivityId.set(rowSpec.id, group);
+					}
+					placeIn(turn, group, prevRow);
+					placedGroups.add(rowSpec.id);
+					const body = group.querySelector(':scope > .activity-body') || group;
+					let prevInner = null;
+					// Keep the header as the first child; place rows inside body.
+					for (const item of rowSpec.items) {
+						const row = resolveRow(item);
+						if (!row) {
+							return false;
+						}
+						placeIn(body, row, prevInner);
+						placed.add(item.id);
+						prevInner = row;
+					}
+					fillActivityChrome(group, rowSpec.items);
+					prevRow = group;
+					continue;
+				}
+
+				const row = resolveRow(rowSpec.item);
+				if (!row) {
 					return false;
 				}
-				syncRowActions(el, actions.rewind.has(item.id) ? ['rewind'] : [], true);
-				continue;
+				placeIn(turn, row, prevRow);
+				placed.add(rowSpec.item.id);
+				prevRow = row;
 			}
-			if (item.kind === 'question') {
-				// Questions need full rebuild for interactive controls.
-				return false;
-			}
-			if (item.kind === 'summary') {
-				continue;
-			}
-			return false;
 		}
 
-		scrollTimelineToBottom();
+		byId.forEach((el, id) => {
+			if (!placed.has(id)) {
+				el.remove();
+			}
+		});
+		byActivityId.forEach((el, id) => {
+			if (!placedGroups.has(id)) {
+				el.remove();
+			}
+		});
+		timelineEl.querySelectorAll(':scope > .turn').forEach((el) => {
+			if (!el.querySelector('[data-item-id]')) {
+				el.remove();
+			}
+		});
+
+		if (timelineStickBottom && !timelineHasSelection()) {
+			scrollTimelineToBottom();
+		}
 		timelineContentKey = timelineKey(items);
 		return true;
+	}
+
+	/** @deprecated kept as a thin wrapper for older call sites / readability */
+	function tryPatchTimeline(items) {
+		return reconcileTimeline(items);
 	}
 
 	/**
@@ -1323,19 +1778,14 @@
 		}
 		for (let i = fromIndex; i < items.length; i++) {
 			const kind = items[i].kind;
-			if (kind === 'user' || kind === 'summary' || kind === 'question' || !kind) {
+			// dispatch starts its own turn (like user) — force a full rebuild.
+			if (kind === 'user' || kind === 'dispatch' || kind === 'summary' || kind === 'question' || !kind) {
 				return false;
 			}
 		}
-		const ctx = {
-			turnActions: turnActionIds(items),
-			ensureTurn() { return lastTurn; },
-			startTurn() { return null; }
-		};
-		for (let i = fromIndex; i < items.length; i++) {
-			renderTimelineItem(items[i], ctx);
-		}
-		return true;
+		// Activity grouping makes append-only unsafe when new tools should join
+		// an existing collapsed group — fall back to reconcile.
+		return false;
 	}
 
 	function renderTimelineItem(item, ctx) {
@@ -1475,7 +1925,61 @@
 				row.textContent = item.text;
 			}
 			host.appendChild(row);
+			return;
 		}
+		if (item.kind === 'dispatch') {
+			const turn = ctx.startTurn();
+			if (!turn) {
+				return;
+			}
+			turn.appendChild(renderDispatchCard(item, mark));
+		}
+	}
+
+	function dispatchAccent(accent) {
+		if (!accent) {
+			return 'var(--vscode-focusBorder)';
+		}
+		if (accent.startsWith('#') || accent.startsWith('rgb') || accent.startsWith('hsl') || accent.startsWith('var(')) {
+			return accent;
+		}
+		return `var(--vscode-${String(accent).replace(/\./g, '-')})`;
+	}
+
+	function renderDispatchCard(item, mark) {
+		// Same right-aligned bubble shape as a user turn — Router is still a
+		// chat transcript; the Workers strip is the task board.
+		const row = mark(document.createElement('div'), item.id);
+		row.className = 'dispatch-row' + (item.workerId ? ' clickable' : '');
+		row.style.setProperty('--dispatch-accent', dispatchAccent(item.accent));
+		if (item.workerId) {
+			row.title = '打开 Worker';
+			row.addEventListener('click', () => {
+				vscode.postMessage({ type: 'openDispatch', workerId: item.workerId });
+			});
+		}
+		const bubble = document.createElement('div');
+		bubble.className = 'dispatch-bubble';
+		const text = document.createElement('div');
+		text.className = 'dispatch-text';
+		text.textContent = item.text || '';
+		bubble.appendChild(text);
+		const meta = document.createElement('div');
+		meta.className = 'dispatch-meta';
+		if (item.badge) {
+			const badge = document.createElement('span');
+			badge.className = 'dispatch-badge';
+			badge.textContent = item.badge;
+			badge.title = item.badge;
+			meta.appendChild(badge);
+		}
+		const receipt = document.createElement('span');
+		receipt.className = dispatchStatusClass(item.status);
+		receipt.textContent = dispatchStatusText(item);
+		meta.appendChild(receipt);
+		row.appendChild(bubble);
+		row.appendChild(meta);
+		return row;
 	}
 
 	let timelineContentKey = '';
@@ -1503,6 +2007,9 @@
 			if (item.kind === 'status') {
 				return `${item.id}|s|${item.tone || ''}|${item.text || ''}`;
 			}
+			if (item.kind === 'dispatch') {
+				return `${item.id}|d|${item.text || ''}|${item.workerId || ''}|${item.badge || ''}|${item.accent || ''}|${item.receipt || ''}|${item.status || ''}`;
+			}
 			return `${item.id}|${item.kind}|${item.text || ''}|${item.status || ''}`;
 		}).join('\u0001');
 	}
@@ -1518,6 +2025,10 @@
 		}
 		const d = work.durationLabel || '';
 		workEl.textContent = d ? `已运行 ${d}` : '工作中…';
+		const group = workEl.closest('.activity-group');
+		if (group) {
+			fillActivityChrome(group, activityItemsFromGroup(group));
+		}
 	}
 
 	function tryPatchElapsed(items) {
@@ -1845,50 +2356,67 @@
 	}
 
 	function renderTimeline(items) {
-		if (tryPatchTimeline(items)) {
-			return;
-		}
 		if (tryPatchElapsed(items)) {
 			return;
 		}
-
-		captureReasoningScrollState();
-		const prevTop = timelineEl.scrollTop;
-		timelineEl.innerHTML = '';
 		if (!items || !items.length) {
+			if (timelineEl.querySelector(':scope > .empty') && !timelineEl.querySelector('[data-item-id]')) {
+				timelineContentKey = '';
+				return;
+			}
+			timelineEl.replaceChildren();
 			const empty = document.createElement('div');
 			empty.className = 'empty';
-			empty.textContent = 'Ask ZCode to edit, explain, or run something in this workspace.';
+			empty.textContent = state && state.isRouter
+				? '描述要派发给 Worker 的任务。派发记录会出现在这里。'
+				: 'Ask ZCode to edit, explain, or run something in this workspace.';
 			timelineEl.appendChild(empty);
 			timelineContentKey = '';
 			return;
 		}
 
+		// Prefer per-block reconcile so only changed rows rewrite their DOM.
+		if (reconcileTimeline(items)) {
+			return;
+		}
+
+		// Last resort: full rebuild (e.g. createItemRow failed mid-pass).
+		captureReasoningScrollState();
+		const prevTop = timelineEl.scrollTop;
+		const hadSelection = timelineHasSelection();
+		timelineEl.innerHTML = '';
+
 		const frag = document.createDocumentFragment();
-		let turn = null;
-		const ctx = {
-			turnActions: turnActionIds(items),
-			ensureTurn() {
-				if (!turn) {
-					turn = document.createElement('div');
-					turn.className = 'turn';
-					frag.appendChild(turn);
+		const actions = turnActionIds(items);
+		for (const turnSpec of partitionConversation(items)) {
+			const turn = document.createElement('div');
+			turn.className = 'turn';
+			for (const rowSpec of turnSpec.rows) {
+				if (rowSpec.type === 'activity') {
+					const group = createActivityGroup(rowSpec.id, rowSpec.items);
+					const body = group.querySelector(':scope > .activity-body') || group;
+					for (const item of rowSpec.items) {
+						const row = createItemRow(item, actions);
+						if (row) {
+							body.appendChild(row);
+						}
+					}
+					fillActivityChrome(group, rowSpec.items);
+					turn.appendChild(group);
+					continue;
 				}
-				return turn;
-			},
-			startTurn() {
-				turn = document.createElement('div');
-				turn.className = 'turn';
-				frag.appendChild(turn);
-				return turn;
+				const row = createItemRow(rowSpec.item, actions);
+				if (row) {
+					turn.appendChild(row);
+				}
 			}
-		};
-		items.forEach((item) => renderTimelineItem(item, ctx));
+			frag.appendChild(turn);
+		}
 
 		timelineEl.appendChild(frag);
 		timelineContentKey = timelineKey(items);
 		requestAnimationFrame(() => {
-			if (timelineStickBottom) {
+			if (timelineStickBottom && !hadSelection) {
 				scrollTimelineToBottom();
 			} else {
 				writeTimelineScrollTop(prevTop);
@@ -2166,21 +2694,13 @@
 			li.className = 'chat-summary-list-row';
 			li.innerHTML =
 				'<button type="button" class="file-label"></button>' +
-				'<span class="insertions-and-deletions"><span class="insertions"></span><span class="deletions"></span></span>' +
-				'<span class="chat-summary-list-icon-actions">' +
-				'<button type="button" class="keep">Keep</button>' +
-				'<button type="button" class="undo" title="撤销此文件（需确认）">Undo</button>' +
-				'</span>';
+				'<span class="insertions-and-deletions"><span class="insertions"></span><span class="deletions"></span></span>';
 			li.querySelector('.file-label').textContent = f.relativePath || f.name;
 			li.querySelector('.file-label').title = f.fsPath || f.relativePath;
 			li.querySelector('.insertions').textContent = `+${f.added || 0}`;
 			li.querySelector('.deletions').textContent = `-${f.removed || 0}`;
 			li.querySelector('.file-label').onclick = () =>
 				vscode.postMessage({ type: 'openFileChange', uri: f.uri, mode: 'file' });
-			li.querySelector('.keep').onclick = () =>
-				vscode.postMessage({ type: 'keepFileChanges', uri: f.uri });
-			li.querySelector('.undo').onclick = () =>
-				vscode.postMessage({ type: 'undoFileChanges', uri: f.uri });
 			workingSetList.appendChild(li);
 		});
 	}
@@ -2376,6 +2896,12 @@
 		}
 
 		historyOpen = !!next.historyOpen;
+		document.body.classList.toggle('router-session', !!next.isRouter);
+		if (inputEl) {
+			inputEl.placeholder = next.isRouter
+				? '描述要派发给 Worker 的任务'
+				: 'Plan, @ for context, / for commands, $ for skills';
+		}
 		renderTimeline(next.items || []);
 		renderTodos(next.todos || []);
 		renderWorkingSet(next.fileChanges || []);
@@ -2513,12 +3039,6 @@
 	}
 	if (contextPanel) {
 		contextPanel.addEventListener('click', (e) => e.stopPropagation());
-	}
-	if (keepAllBtn) {
-		keepAllBtn.addEventListener('click', () => vscode.postMessage({ type: 'keepFileChanges' }));
-	}
-	if (undoAllBtn) {
-		undoAllBtn.addEventListener('click', () => vscode.postMessage({ type: 'undoFileChanges' }));
 	}
 	if (viewAllBtn) {
 		viewAllBtn.addEventListener('click', () => vscode.postMessage({ type: 'viewAllFileChanges' }));

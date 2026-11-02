@@ -33,10 +33,12 @@ import { completeChatTurn, getBridgeMode, getCursorBrainStatusLine, workspaceRoo
 import { compactConversation } from './contextCompact';
 import { buildPlusMenuSections, formatSlashInsert, CAPABILITY_COMMANDS, QUICK_ADD_COMMANDS } from './composerActions';
 import {
+	dispatchStatusLabel,
 	formatWorkDuration,
 	newItemId,
 	toolDisplayName,
 	type ConversationItem,
+	type DispatchStatus,
 	type TodoItem,
 	type UserAttachmentRef,
 } from './conversation';
@@ -81,6 +83,7 @@ import {
 	IDE_CHAT_SOURCE_CURSOR,
 	IDE_CHAT_SOURCE_ZCODE,
 	IdeChatStore,
+	isProvisionalSessionTitle,
 	titleFromMessages,
 	type IdeChatSessionMeta,
 } from './ideChatStore';
@@ -246,9 +249,117 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private accountQuota: AccountQuota | null = null;
 	private seenNotices = new Set<string>();
 	private billingSeq = 0;
+	/** Session id of the Super Agent Router dispatch surface (pinned Workers page). */
+	private routerSessionId: string | undefined;
+	/** Resolved once the initial session restore finishes (Router open must wait). */
+	private readonly bootstrapDone: Promise<void>;
+	private resolveBootstrapDone: (() => void) | undefined;
+	/** Throttle Super Agent worker heartbeats (streaming can be very chatty). */
+	private readonly routerActivityAt = new Map<string, number>();
+	/**
+	 * Keepalive for the whole in-flight turn. Long model gaps / silent shell tools
+	 * otherwise trip the router's 120s watchdog → sticky "疑似卡死".
+	 */
+	private readonly routerTurnKeepalives = new Map<string, ReturnType<typeof setInterval>>();
+	/** Nested-tool keepalive (belt-and-suspenders while a tool is open). */
+	private readonly routerToolKeepalives = new Map<string, { count: number; timer: ReturnType<typeof setInterval> }>();
 
 	private isRunning(sessionId: string | undefined): boolean {
 		return !!sessionId && this.runs.has(sessionId);
+	}
+
+	/** Heartbeat the Super Agent router so Workers do not false-trip "疑似卡死". */
+	private notifyRouterWorkerActivity(sessionId: string, detail?: string, opts?: { force?: boolean }): void {
+		if (sessionId === this.routerSessionId) {
+			return;
+		}
+		const now = Date.now();
+		if (!opts?.force) {
+			const last = this.routerActivityAt.get(sessionId) ?? 0;
+			if (now - last < 1000) {
+				return;
+			}
+		}
+		this.routerActivityAt.set(sessionId, now);
+		void vscode.commands.executeCommand('zcode.internal.superAgent.workerActivity', { sessionId, detail });
+	}
+
+	private notifyRouterWorkerIdle(sessionId: string, detail?: string): void {
+		if (sessionId === this.routerSessionId) {
+			return;
+		}
+		this.clearRouterTurnKeepalive(sessionId);
+		this.clearRouterToolKeepalive(sessionId);
+		this.routerActivityAt.delete(sessionId);
+		void vscode.commands.executeCommand('zcode.internal.superAgent.workerIdle', { sessionId, detail });
+	}
+
+	private notifyRouterWorkerAwaiting(sessionId: string, detail?: string): void {
+		if (sessionId === this.routerSessionId) {
+			return;
+		}
+		// Waiting on the human is intentionally quiet — stop keepalives so we do
+		// not keep "recovering" into Running while AwaitingUser.
+		this.clearRouterTurnKeepalive(sessionId);
+		this.clearRouterToolKeepalive(sessionId);
+		void vscode.commands.executeCommand('zcode.internal.superAgent.workerAwaitingUser', { sessionId, detail });
+	}
+
+	private startRouterTurnKeepalive(sessionId: string): void {
+		if (sessionId === this.routerSessionId) {
+			return;
+		}
+		this.clearRouterTurnKeepalive(sessionId);
+		const timer = setInterval(() => {
+			this.notifyRouterWorkerActivity(sessionId, 'turn keepalive', { force: true });
+		}, 45_000);
+		this.routerTurnKeepalives.set(sessionId, timer);
+	}
+
+	private clearRouterTurnKeepalive(sessionId: string): void {
+		const timer = this.routerTurnKeepalives.get(sessionId);
+		if (!timer) {
+			return;
+		}
+		clearInterval(timer);
+		this.routerTurnKeepalives.delete(sessionId);
+	}
+
+	private noteRouterToolStart(sessionId: string): void {
+		if (sessionId === this.routerSessionId) {
+			return;
+		}
+		let entry = this.routerToolKeepalives.get(sessionId);
+		if (!entry) {
+			entry = {
+				count: 0,
+				timer: setInterval(() => {
+					this.notifyRouterWorkerActivity(sessionId, 'tool keepalive', { force: true });
+				}, 45_000),
+			};
+			this.routerToolKeepalives.set(sessionId, entry);
+		}
+		entry.count++;
+	}
+
+	private noteRouterToolEnd(sessionId: string): void {
+		const entry = this.routerToolKeepalives.get(sessionId);
+		if (!entry) {
+			return;
+		}
+		entry.count = Math.max(0, entry.count - 1);
+		if (entry.count === 0) {
+			this.clearRouterToolKeepalive(sessionId);
+		}
+	}
+
+	private clearRouterToolKeepalive(sessionId: string): void {
+		const entry = this.routerToolKeepalives.get(sessionId);
+		if (!entry) {
+			return;
+		}
+		clearInterval(entry.timer);
+		this.routerToolKeepalives.delete(sessionId);
 	}
 
 	/** True when the visible tab has an in-flight AI turn. */
@@ -266,6 +377,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	) {
 		this.seenNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(QUOTA_NOTICE_SEEN_KEY)));
 		this.seenClaimNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(CLAIM_NOTICE_SEEN_KEY)));
+		this.bootstrapDone = new Promise<void>(resolve => {
+			this.resolveBootstrapDone = resolve;
+		});
 		this.fileEdits.onDidChange(() => {
 			this.refreshFileChanges();
 			this.pushState();
@@ -310,6 +424,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				clearInterval(this.scheduleTipTimer);
 				this.scheduleTipTimer = undefined;
 			}
+			for (const sessionId of [...this.routerTurnKeepalives.keys()]) {
+				this.clearRouterTurnKeepalive(sessionId);
+			}
+			for (const sessionId of [...this.routerToolKeepalives.keys()]) {
+				this.clearRouterToolKeepalive(sessionId);
+			}
 		});
 		if (this.scheduleTipTimer) {
 			clearInterval(this.scheduleTipTimer);
@@ -319,12 +439,293 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushState();
 			void this.refreshBilling();
 		}, 60_000);
-		void this.bootstrapSession();
+		void this.bootstrapSession().finally(() => {
+			this.resolveBootstrapDone?.();
+			this.resolveBootstrapDone = undefined;
+		});
 		void this.refreshBilling();
 	}
 
 	async newChat(): Promise<void> {
 		await this.startNewSession();
+	}
+
+	/**
+	 * Ensures a dedicated "Router" chat session exists and is focused.
+	 * The Workers rail docks above this session — its composer is the
+	 * Super Agent dispatch box (messages spawn workers instead of answering).
+	 */
+	async ensureRouterSession(): Promise<string> {
+		await this.open();
+		// Webview resolve bootstraps a draft asynchronously; wait so it cannot
+		// delete the empty Router session we are about to create/reuse.
+		await Promise.race([
+			this.bootstrapDone,
+			new Promise<void>(resolve => setTimeout(resolve, 4000)),
+		]);
+
+		const reuse = async (id: string): Promise<string> => {
+			this.routerSessionId = id;
+			await this.openSession(id);
+			return id;
+		};
+
+		if (this.routerSessionId) {
+			const id = this.routerSessionId;
+			const alive = id === this.sessionId
+				|| this.openTabIds.includes(id)
+				|| this.parked.has(id)
+				|| this.sessionList.some(s => s.id === id);
+			if (alive) {
+				return reuse(id);
+			}
+			this.routerSessionId = undefined;
+		}
+
+		const titled = this.buildTitleTabs().find(t => t.title === 'Router')
+			?? this.sessionList.find(s => s.title === 'Router');
+		if (titled) {
+			return reuse(titled.id);
+		}
+
+		// Park whatever is currently open, then create a persisted Router session.
+		if (this.sessionId && (this.isRunning(this.sessionId) || !this.isSessionEmpty() || this.sessionPersisted)) {
+			this.parkCurrent();
+			if (!this.isSessionEmpty() || this.sessionPersisted) {
+				await this.persistSession(true);
+			}
+		}
+		const session = await this.ideChat.createSession({
+			...this.draftSessionOptions(),
+			title: 'Router',
+		});
+		this.applySession(session.id, [], [], true);
+		// Router+Worker mode: no session tab strip. Keep the Router as the
+		// focused surface under the Workers rail without open-tab bookkeeping.
+		this.routerSessionId = session.id;
+		await this.refreshSessionList();
+		this.pushAfterSessionSwitch({ focusInput: true });
+		return session.id;
+	}
+
+	/**
+	 * Spawns an isolated worker session (optionally starts its first turn in
+	 * the background without stealing focus from the Router).
+	 */
+	async createWorkerSession(opts: { title?: string; message?: string }): Promise<string> {
+		// Keep a provisional title only. The first completed turn replaces it
+		// with a short AI summary — never stamp the full user task as the title.
+		const title = opts.title?.trim() || '新对话';
+		const session = await this.ideChat.createSession({
+			...this.draftSessionOptions(),
+			title,
+		});
+		this.parked.set(session.id, {
+			items: [],
+			todos: [],
+			persisted: true,
+			draftText: '',
+			attachments: [],
+			queue: [],
+			queuePaused: false,
+		});
+		// Workers are reached via the Super Agent rail / presentation dock —
+		// never as title-bar session tabs.
+		await this.refreshSessionList();
+		this.pushState();
+
+		const message = opts.message?.trim();
+		if (message) {
+			void this.startTurn(session.id, message, { text: message });
+		}
+		return session.id;
+	}
+
+	/**
+	 * When the user follows up on a presented Worker, mirror that text onto the
+	 * Router transcript as a right-aligned dispatch receipt so handing off back
+	 * to Router still shows "what I just sent".
+	 */
+	private async mirrorWorkerFollowUpToRouter(text: string, workerSessionId: string): Promise<void> {
+		const routerId = this.routerSessionId;
+		const trimmed = text.trim();
+		if (!routerId || !trimmed || workerSessionId === routerId) {
+			return;
+		}
+		if (this.sessionId !== routerId && !this.parked.has(routerId)) {
+			const session = await this.ideChat.getSession(routerId);
+			if (!session) {
+				return;
+			}
+			this.parked.set(routerId, {
+				items: [...(session.timeline ?? [])],
+				todos: [...(session.todos ?? [])],
+				persisted: true,
+				draftText: '',
+				attachments: [],
+				queue: [],
+				queuePaused: false,
+			});
+		}
+		const dispatchItemId = newItemId('dispatch');
+		const applied = this.mutateChat(routerId, chat => {
+			chat.items.push({
+				id: dispatchItemId,
+				kind: 'dispatch',
+				text: trimmed,
+				receipt: dispatchStatusLabel('running'),
+				status: 'running',
+			});
+		});
+		if (!applied) {
+			return;
+		}
+		if (this.sessionId === routerId) {
+			this.pushState();
+		}
+		await this.persistSessionById(routerId);
+		void vscode.commands.executeCommand('zcode.internal.superAgent.bindRouterDispatch', {
+			sessionId: routerId,
+			dispatchItemId,
+			workerSessionId,
+		});
+	}
+
+	/**
+	 * Fills worker identity onto a Router dispatch card after the worker exists.
+	 */
+	patchRouterDispatch(opts: {
+		sessionId: string;
+		dispatchItemId: string;
+		workerId: string;
+		badge?: string;
+		accent?: string;
+		status?: DispatchStatus;
+	}): void {
+		const { sessionId, dispatchItemId, workerId, badge, accent, status } = opts;
+		if (!sessionId || !dispatchItemId || !workerId) {
+			return;
+		}
+		this.mutateChat(sessionId, chat => {
+			const item = chat.items.find(row => row.id === dispatchItemId && row.kind === 'dispatch');
+			if (!item || item.kind !== 'dispatch') {
+				return;
+			}
+			item.workerId = workerId;
+			if (badge) {
+				item.badge = badge;
+			}
+			if (accent) {
+				item.accent = accent;
+			}
+			if (status) {
+				item.status = status;
+				item.receipt = dispatchStatusLabel(status);
+			} else if (!item.status) {
+				item.status = 'running';
+				item.receipt = item.receipt || dispatchStatusLabel('running');
+			} else {
+				item.receipt = item.receipt || dispatchStatusLabel(item.status);
+			}
+		});
+		if (this.sessionId === sessionId) {
+			this.pushState();
+		}
+		void this.persistSessionById(sessionId);
+	}
+
+	/**
+	 * Updates the short title chip on every Router dispatch receipt for a worker
+	 * (e.g. after AI title summarization).
+	 */
+	patchRouterDispatchLabel(opts: {
+		sessionId: string;
+		workerId: string;
+		badge: string;
+	}): void {
+		const { sessionId, workerId, badge } = opts;
+		const next = badge.trim();
+		if (!sessionId || !workerId || !next) {
+			return;
+		}
+		let changed = false;
+		this.mutateChat(sessionId, chat => {
+			for (const item of chat.items) {
+				if (item.kind !== 'dispatch' || item.workerId !== workerId || item.badge === next) {
+					continue;
+				}
+				item.badge = next;
+				changed = true;
+			}
+		});
+		if (!changed) {
+			return;
+		}
+		if (this.sessionId === sessionId) {
+			this.pushState();
+		}
+		void this.persistSessionById(sessionId);
+	}
+
+	/**
+	 * Syncs live worker turn status onto a Router dispatch receipt.
+	 * Prefer a specific dispatchItemId; otherwise update the latest card for workerId.
+	 */
+	patchRouterDispatchStatus(opts: {
+		sessionId: string;
+		status: DispatchStatus;
+		workerId?: string;
+		dispatchItemId?: string;
+	}): void {
+		const { sessionId, status, workerId, dispatchItemId } = opts;
+		if (!sessionId || !status) {
+			return;
+		}
+		if (!dispatchItemId && !workerId) {
+			return;
+		}
+		let changed = false;
+		this.mutateChat(sessionId, chat => {
+			let item: ConversationItem | undefined;
+			if (dispatchItemId) {
+				item = chat.items.find(row => row.id === dispatchItemId && row.kind === 'dispatch');
+			} else if (workerId) {
+				for (let i = chat.items.length - 1; i >= 0; i--) {
+					const row = chat.items[i];
+					if (row.kind === 'dispatch' && row.workerId === workerId) {
+						item = row;
+						break;
+					}
+				}
+			}
+			if (!item || item.kind !== 'dispatch') {
+				return;
+			}
+			// Historical cards stay frozen once a turn ends; only the active
+			// (latest) card should flip back to running on a follow-up.
+			const terminal = item.status === 'done' || item.status === 'failed' || item.status === 'cancelled';
+			const nextTerminal = status === 'done' || status === 'failed' || status === 'cancelled';
+			if (terminal && !nextTerminal && !dispatchItemId) {
+				return;
+			}
+			if (item.status === status && item.receipt === dispatchStatusLabel(status)) {
+				return;
+			}
+			item.status = status;
+			item.receipt = dispatchStatusLabel(status);
+			changed = true;
+		});
+		if (!changed) {
+			return;
+		}
+		if (this.sessionId === sessionId) {
+			this.pushState();
+		}
+		void this.persistSessionById(sessionId);
+	}
+
+	getActiveSessionId(): string | undefined {
+		return this.sessionId;
 	}
 
 	async openSessionFromTitle(sessionId: string): Promise<void> {
@@ -638,6 +1039,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			await this.openSession(msg.sessionId);
 			return;
 		}
+		if (msg.type === 'openDispatch' && typeof msg.workerId === 'string' && msg.workerId) {
+			void vscode.commands.executeCommand('zcode.internal.superAgent.presentWorker', msg.workerId);
+			return;
+		}
 		if (msg.type === 'closeTab' && typeof msg.sessionId === 'string') {
 			await this.closeTab(msg.sessionId);
 			return;
@@ -913,6 +1318,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (run.pendingAsk) {
 			this.resolveAsk(run.pendingAsk.id, { outcome: 'cancelled' });
 		}
+		this.notifyRouterWorkerAwaiting(sessionId, prompt.title || 'ask user');
 		return new Promise(resolve => {
 			const cancel = token.onCancellationRequested(() => {
 				this.resolveAsk(prompt.id, { outcome: 'cancelled' });
@@ -963,6 +1369,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				}
 			});
 			this.pushState();
+			if (result.outcome === 'answered') {
+				// Ask done — worker is live again; clear AwaitingUser / any sticky stall.
+				this.notifyRouterWorkerActivity(sessionId, 'ask resolved', { force: true });
+				this.startRouterTurnKeepalive(sessionId);
+			}
 			pending.resolve(result);
 			return;
 		}
@@ -974,6 +1385,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const text = `${attachmentBlock}${raw}`.trim();
 		if (!text) {
 			return;
+		}
+		// Queuing while a turn is still running means the user wants follow-ups
+		// to auto-drain after it finishes — clear a stale pause from an earlier
+		// stop/error so the banner does not claim "队列已暂停" mid-run.
+		if (this.busy) {
+			this.queuePaused = false;
 		}
 		this.queue.push({
 			id: newItemId('queue'),
@@ -1099,20 +1516,22 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	/**
 	 * Apply a mutation to a session's chat. Visible tab writes through
 	 * capture/adopt; background tabs write into `parked`.
+	 * @returns false when the session is neither active nor parked.
 	 */
-	private mutateChat(sessionId: string, mutator: (chat: MutableChat) => void): void {
+	private mutateChat(sessionId: string, mutator: (chat: MutableChat) => void): boolean {
 		if (sessionId === this.sessionId) {
 			const chat = this.captureView();
 			mutator(chat);
 			this.adoptView(chat);
-			return;
+			return true;
 		}
 		const parked = this.parked.get(sessionId);
 		if (!parked) {
-			return;
+			return false;
 		}
 		mutator(parked);
 		this.parked.set(sessionId, parked);
+		return true;
 	}
 
 	private async refreshBilling(): Promise<void> {
@@ -1378,6 +1797,32 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		this.attachments = [];
 		this.draftText = '';
+
+		// Router session: dispatch, don't answer. The workbench Super Agent
+		// dispatcher listens on zcode.internal.superAgent.routerSubmit.
+		if (this.sessionId === this.routerSessionId) {
+			const sessionId = this.sessionId;
+			const displayText = prepared.displayText;
+			const dispatchItemId = newItemId('dispatch');
+			this.mutateChat(sessionId, chat => {
+				chat.items.push({
+					id: dispatchItemId,
+					kind: 'dispatch',
+					text: displayText,
+					receipt: dispatchStatusLabel('pending'),
+					status: 'pending',
+				});
+			});
+			this.pushState({ clearDraft: true });
+			void this.persistSessionById(sessionId);
+			void vscode.commands.executeCommand('zcode.internal.superAgent.routerSubmit', {
+				sessionId,
+				text: prepared.modelText,
+				dispatchItemId,
+			});
+			return;
+		}
+
 		this.pushState({ clearDraft: true });
 		await this.startTurn(this.sessionId, content, { text: prepared.displayText, attachments });
 	}
@@ -1513,6 +1958,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		let sentUserId = reuseUserId ?? '';
 
 		this.mutateChat(runSessionId, chat => {
+			// Starting work again re-arms auto-drain; a prior stop/error pause
+			// must not stick across the new turn (and its queued follow-ups).
+			chat.queuePaused = false;
 			const reused = reuseUserId
 				? chat.items.find(item => item.id === reuseUserId && item.kind === 'user')
 				: undefined;
@@ -1522,6 +1970,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				chat.items.push({ id: userId, kind: 'user', text: displayText, attachments: attachmentRefs });
 			}
 			this.fileEdits.beginCheckpoint(userId, runSessionId);
+			// New user turn: drop the previous Tasks panel so it does not stay
+			// pinned across rounds. Prior chat history still carries context.
+			chat.todos = [];
 			chat.activeStatusId = undefined;
 			chat.activeAssistantId = undefined;
 			chat.activeReasoningId = undefined;
@@ -1581,12 +2032,24 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				}] : []);
 				return { role: 'user' as const, content: `${formatAttachmentBlock(chips)}${item.text}`.trim() };
 			});
-		const initialTodos = [...snapshot.todos];
+		// Fresh Tasks list each turn; agent rewrites via TodoWrite when needed.
+		const initialTodos: TodoItem[] = [];
 		const sessionAwareness = this.buildSessionAwareness(runSessionId);
 
 		const cancel = new vscode.CancellationTokenSource();
 		const run: SessionRun = { cancel };
 		this.runs.set(runSessionId, run);
+		// Follow-up typed on a presented worker: also land a right-side receipt on
+		// the Router log. After send we often hand off to Router (no other 待查看),
+		// so without this the message only lives in the parked worker stream.
+		// Background first turns from createWorkerSession stay off this path —
+		// Router already has the initial dispatch card from handleSend.
+		// Await so the card exists before Running → dismissPresented swaps the webview.
+		if (runSessionId === this.sessionId && this.routerSessionId && runSessionId !== this.routerSessionId) {
+			await this.mirrorWorkerFollowUpToRouter(displayText, runSessionId);
+		}
+		this.notifyRouterWorkerActivity(runSessionId, 'turn started', { force: true });
+		this.startRouterTurnKeepalive(runSessionId);
 		let cancelled = false;
 		let turnFailed = false;
 		try {
@@ -1608,9 +2071,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.mutateChat(runSessionId, chat => {
 				this.clearStatusOn(chat);
 				this.finishReasoningOn(chat);
-				if (result.todos?.length) {
-					chat.todos = result.todos;
-				}
+				chat.todos = result.todos ?? [];
 				if (chat.activeAssistantId) {
 					const existing = chat.items.find(i => i.id === chat.activeAssistantId);
 					if (existing && existing.kind === 'assistant') {
@@ -1666,6 +2127,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.runs.delete(runSessionId);
 			}
 			cancel.dispose();
+			this.notifyRouterWorkerIdle(
+				runSessionId,
+				cancelled ? 'turn cancelled' : turnFailed ? 'turn failed' : 'turn finished',
+			);
 			if (!cancelled && !turnFailed) {
 				this.maybeSummarizeTitle(runSessionId);
 				// Task-completion cue: soft chime in the webview + editor system
@@ -1717,6 +2182,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const active = await this.ideChat.getActiveSession(this.sessionListScope());
 		if (active && active.messages.length > 0) {
 			this.applySession(active.id, active.timeline ?? [], active.todos ?? [], true);
+		} else if (active && active.title === 'Router') {
+			// Keep the Super Agent Router even when still empty — bootstrap must
+			// not replace it with a blank draft.
+			this.applySession(active.id, active.timeline ?? [], active.todos ?? [], true);
+			this.routerSessionId = active.id;
 		} else {
 			if (active) {
 				await this.ideChat.deleteSession(active.id);
@@ -1805,7 +2275,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (this.sessionId && (this.isRunning(this.sessionId) || !this.isSessionEmpty() || this.sessionPersisted)) {
 			this.parkCurrent();
-			if (this.isSessionEmpty() && this.sessionPersisted && !this.isRunning(this.sessionId)) {
+			if (this.isSessionEmpty() && this.sessionPersisted && !this.isRunning(this.sessionId) && this.sessionId !== this.routerSessionId) {
 				await this.ideChat.deleteSession(this.sessionId);
 				this.parked.delete(this.sessionId);
 			} else if (!this.isSessionEmpty()) {
@@ -1873,6 +2343,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		const closingActive = this.sessionId === sessionId;
 		const closingDraft = closingActive && !this.sessionPersisted && !this.runs.has(sessionId);
+		if (sessionId === this.routerSessionId) {
+			this.routerSessionId = undefined;
+		}
 
 		// Snapshot and drop the closing chat FIRST. openSession()/startNewSession()
 		// both park the current view, which used to resurrect the closed tab at the
@@ -2018,7 +2491,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean; titleOverride?: string }): Promise<void> {
 		const messages = IdeChatStore.messagesFromTimeline(chat.items);
 		if (messages.length === 0) {
-			if (chat.persisted) {
+			// Never garbage-collect the Super Agent Router while it is still empty.
+			if (chat.persisted && sessionId !== this.routerSessionId) {
 				await this.ideChat.deleteSession(sessionId);
 				chat.persisted = false;
 				if (adoptPersistedFlag) {
@@ -2032,11 +2506,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const provider = brain === 'cursor' ? 'cursor' : getProviderMode();
 		const model = brain === 'cursor' ? getCursorModel() : getSelectedModelId(getProviderMode());
 		const createdAt = this.sessionList.find(s => s.id === sessionId)?.createdAt ?? Date.now();
-		// A stored title that differs from the truncation fallback is an AI-generated
-		// (or otherwise real) title — keep it instead of regenerating on every save.
+		// A stored title that is not still provisional (first-message truncation /
+		// placeholder) is an AI-generated or user-chosen label — keep it.
 		const storedTitle = this.sessionList.find(s => s.id === sessionId)?.title;
 		const fallbackTitle = titleFromMessages(messages);
-		const keptTitle = storedTitle && storedTitle !== '新对话' && storedTitle !== fallbackTitle ? storedTitle : '';
+		const keptTitle = storedTitle && !isProvisionalSessionTitle(storedTitle, messages) ? storedTitle : '';
 		const title = opts?.titleOverride?.trim() || keptTitle || fallbackTitle;
 		await this.ideChat.saveSession({
 			id: sessionId,
@@ -2076,8 +2550,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		const messages = IdeChatStore.messagesFromTimeline(chat.items);
 		const stored = this.sessionList.find(s => s.id === sessionId)?.title;
-		if (stored && stored !== '新对话' && stored !== titleFromMessages(messages)) {
-			return; // already carries a real (AI-generated) title
+		if (!isProvisionalSessionTitle(stored, messages)) {
+			return; // already carries a real (AI-generated / user-chosen) title
 		}
 		if (!messages.some(m => m.role === 'user') || !messages.some(m => m.role === 'assistant')) {
 			return;
@@ -2139,12 +2613,19 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			if (!chatNow) {
 				return;
 			}
+			const messagesNow = IdeChatStore.messagesFromTimeline(chatNow.items);
 			const storedNow = this.sessionList.find(s => s.id === sessionId)?.title;
-			const fallbackNow = titleFromMessages(IdeChatStore.messagesFromTimeline(chatNow.items));
-			if (storedNow && storedNow !== '新对话' && storedNow !== fallbackNow) {
+			if (!isProvisionalSessionTitle(storedNow, messagesNow)) {
 				return;
 			}
 			await this.persistChat(sessionId, chatNow, sessionId === this.sessionId, { titleOverride: title });
+			// Workers rail / page header read router worker.label — keep it in sync.
+			if (sessionId !== this.routerSessionId) {
+				void vscode.commands.executeCommand('zcode.internal.superAgent.renameWorker', {
+					sessionId,
+					label: title,
+				});
+			}
 			this.pushState();
 		} finally {
 			cancel.dispose();
@@ -2159,6 +2640,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.pushState();
 			}
 			return;
+		}
+
+		// Any real turn progress proves the worker is alive — clears sticky "疑似卡死".
+		this.notifyRouterWorkerActivity(sessionId, event.type);
+		if (event.type === 'tool_start') {
+			this.noteRouterToolStart(sessionId);
+		} else if (event.type === 'tool_end') {
+			this.noteRouterToolEnd(sessionId);
 		}
 
 		this.mutateChat(sessionId, chat => {
@@ -2556,7 +3045,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				running: this.runs.has(s.id),
 				done: this.unreadDoneIds.has(s.id),
 			})),
-			tabs: this.buildTitleTabs(),
+			// Session tabs retired under Router+Worker — Workers rail owns navigation.
+			tabs: [],
+			isRouter: !!this.routerSessionId && this.sessionId === this.routerSessionId,
 			attachments: this.attachments.map(a => ({ id: a.id, name: a.name, title: a.detail ?? a.fsPath })),
 			queue: this.queue.map(item => ({ id: item.id, text: item.text })),
 			queuePaused: this.queuePaused,
@@ -2564,7 +3055,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			accountLabel,
 			signedIn,
 			busy: this.busy,
-			historyOpen: this.historyOpen,
+			// Legacy history drawer stays closed; closed workers live in Super Agent History.
+			historyOpen: false,
 			fontSize: getChatFontSize(),
 			lineHeight: getChatLineHeight(),
 			contextUsage: this.buildContextUsage(),
@@ -2579,7 +3071,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			openPlus: extra?.openPlus ?? false,
 			focusInput: extra?.focusInput ?? false,
 		});
-		void vscode.commands.executeCommand('zcode.internal.setTitleTabs', this.buildTitleTabs());
 	}
 
 	private buildTitleTabs(): Array<{
@@ -2678,8 +3169,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				<span class="insertions-and-deletions" id="workingSetTotals"><span class="insertions"></span><span class="deletions"></span></span>
 			</button>
 			<div class="working-set-actions">
-				<button type="button" class="monaco-text-button" id="keepAllBtn" title="Keep All Edits">Keep</button>
-				<button type="button" class="monaco-text-button secondary undo-quiet" id="undoAllBtn" title="撤销全部修改（需确认）">Undo</button>
 				<button type="button" class="monaco-text-button secondary icon" id="viewAllBtn" title="View All Edits" aria-label="View All Edits">⧉</button>
 			</div>
 		</div>

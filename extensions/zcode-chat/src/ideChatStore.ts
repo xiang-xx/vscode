@@ -90,6 +90,45 @@ export function titleFromMessages(messages: IdeChatMessage[]): string {
 	return oneLine.length > 42 ? `${oneLine.slice(0, 42)}…` : oneLine;
 }
 
+/**
+ * True when `title` is still a placeholder / first-message truncation, not an
+ * AI (or user-chosen) short label. Used so title summarization can replace the
+ * long provisional stamp after the first completed turn.
+ */
+export function isProvisionalSessionTitle(title: string | undefined, messages: IdeChatMessage[]): boolean {
+	if (!title || title === '新对话' || title === 'Worker') {
+		return true;
+	}
+	const fallback = titleFromMessages(messages);
+	if (title === fallback) {
+		return true;
+	}
+	const first = messages.find(m => m.role === 'user' && m.content.trim() && !m.content.startsWith('此前对话摘要：'));
+	if (!first) {
+		return false;
+	}
+	const oneLine = first.content.replace(/\s+/g, ' ').trim();
+	if (!oneLine) {
+		return false;
+	}
+	if (title === oneLine) {
+		return true;
+	}
+	// createWorkerSession / router dispatch used to stamp message.slice(0, N)
+	// (sometimes with a trailing …). AI titles are capped ~30 chars, so longer
+	// prefixes of the first user message are still provisional.
+	if (title.endsWith('…')) {
+		const stem = title.slice(0, -1);
+		if (stem && oneLine.startsWith(stem)) {
+			return true;
+		}
+	}
+	if (title.length > 30 && oneLine.startsWith(title)) {
+		return true;
+	}
+	return false;
+}
+
 function toMeta(session: IdeChatSession): IdeChatSessionMeta {
 	return {
 		id: session.id,
@@ -298,6 +337,11 @@ export class IdeChatStore {
 		const index = await this.readIndex();
 		const emptyIds: string[] = [];
 		for (const meta of index.sessions) {
+			// Keep the Super Agent Router even while it has no messages yet —
+			// it is a dedicated dispatch surface, not an abandoned draft.
+			if (meta.title === 'Router') {
+				continue;
+			}
 			const session = await this.getSession(meta.id);
 			if (!session || session.messages.length === 0) {
 				emptyIds.push(meta.id);

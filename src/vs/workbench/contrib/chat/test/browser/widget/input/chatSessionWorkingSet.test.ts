@@ -50,6 +50,8 @@ suite('ChatSessionWorkingSet', () => {
 		instantiationService.stub(IConfigurationService, configurationService);
 		instantiationService.stub(IConfigurationService, 'updateValue', (key: string, value: boolean) => configurationService.setUserConfiguration(key, value));
 		const reviewPreferences = store.add(instantiationService.createInstance(ChatSessionReviewPreferencesService));
+		// Product default is off; tests that exercise Keep/Undo opt back in.
+		reviewPreferences.setKeepUndoEnabled(true);
 		instantiationService.stub(IChatSessionReviewPreferencesService, reviewPreferences);
 		let menuActions: readonly IAction[] = [];
 		let closeMenu = () => { };

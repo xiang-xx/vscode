@@ -1,12 +1,12 @@
 /*---------------------------------------------------------------------------------------------
  *  Copyright (c) ZCode contributors. All rights reserved.
- *  Licensed under the MIT License.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
 /**
- * Extension-side line markers + Keep/Undo CodeLens for pending ZCode edits.
- * Always on so the user sees review UI even when the workbench Chat overlay
- * does not attach.
+ * Extension-side line markers for pending ZCode edits.
+ * Diff styling only — Keep/Undo actions live behind an opt-in preference and
+ * are not shown here.
  */
 
 import * as vscode from 'vscode';
@@ -63,33 +63,16 @@ export class EditDecorationController implements vscode.Disposable {
 		overviewRulerLane: vscode.OverviewRulerLane.Left,
 	});
 	private readonly disposables: vscode.Disposable[] = [];
-	private readonly lensByUri = new Map<string, LineHunk[]>();
-	private readonly _onDidChangeCodeLenses = new vscode.EventEmitter<void>();
 
 	constructor(private readonly session: FileEditSession) {
 		this.disposables.push(
 			this.added,
 			this.modified,
-			this._onDidChangeCodeLenses,
 			session.onDidChange(() => void this.refresh()),
 			vscode.window.onDidChangeActiveTextEditor(() => void this.refresh()),
 			vscode.workspace.onDidChangeTextDocument(e => {
 				if (this.session.list().some(f => f.uri === e.document.uri.toString())) {
 					void this.refresh();
-				}
-			}),
-			vscode.languages.registerCodeLensProvider({ scheme: 'file' }, {
-				onDidChangeCodeLenses: this._onDidChangeCodeLenses.event,
-				provideCodeLenses: (document) => this.provideLenses(document),
-			}),
-			vscode.commands.registerCommand('zcode.fileEdits.keepFromLens', async (uri?: string) => {
-				if (uri) {
-					await this.session.keep([uri]);
-				}
-			}),
-			vscode.commands.registerCommand('zcode.fileEdits.undoFromLens', async (uri?: string) => {
-				if (uri) {
-					await this.session.undo([uri]);
 				}
 			}),
 		);
@@ -100,34 +83,11 @@ export class EditDecorationController implements vscode.Disposable {
 		for (const d of this.disposables) {
 			d.dispose();
 		}
-		this.lensByUri.clear();
-	}
-
-	private provideLenses(document: vscode.TextDocument): vscode.CodeLens[] {
-		const hunks = this.lensByUri.get(document.uri.toString());
-		if (!hunks?.length) {
-			return [];
-		}
-		const uri = document.uri.toString();
-		const range = new vscode.Range(hunks[0].start, 0, hunks[0].start, 0);
-		return [
-			new vscode.CodeLens(range, {
-				title: '$(check) Keep',
-				command: 'zcode.fileEdits.keepFromLens',
-				arguments: [uri],
-			}),
-			new vscode.CodeLens(range, {
-				title: '$(discard) Undo',
-				command: 'zcode.fileEdits.undoFromLens',
-				arguments: [uri],
-			}),
-		];
 	}
 
 	private async refresh(): Promise<void> {
 		const files = this.session.list();
 		const byUri = new Set(files.map(f => f.uri));
-		this.lensByUri.clear();
 
 		for (const editor of vscode.window.visibleTextEditors) {
 			const key = editor.document.uri.toString();
@@ -143,7 +103,6 @@ export class EditDecorationController implements vscode.Disposable {
 				continue;
 			}
 			const hunks = computeHunks(original, editor.document.getText());
-			this.lensByUri.set(key, hunks);
 			const addedRanges: vscode.Range[] = [];
 			const modRanges: vscode.Range[] = [];
 			for (const h of hunks) {
@@ -153,6 +112,5 @@ export class EditDecorationController implements vscode.Disposable {
 			editor.setDecorations(this.added, addedRanges);
 			editor.setDecorations(this.modified, modRanges);
 		}
-		this._onDidChangeCodeLenses.fire();
 	}
 }

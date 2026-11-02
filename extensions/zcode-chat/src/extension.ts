@@ -24,6 +24,15 @@ import {
 } from './ideChatStore';
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
+import type { DispatchStatus } from './conversation';
+
+const DISPATCH_STATUSES: ReadonlySet<string> = new Set([
+	'pending', 'queued', 'starting', 'running', 'awaiting', 'done', 'failed', 'cancelled', 'stalled',
+]);
+
+function isDispatchStatus(value: unknown): value is DispatchStatus {
+	return typeof value === 'string' && DISPATCH_STATUSES.has(value);
+}
 
 export async function activate(context: vscode.ExtensionContext): Promise<IdeChatExtensionApi> {
 	setBrowserMcpExtensionRoot(context.extensionPath);
@@ -111,9 +120,70 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			await panel.addEditorSelectionToChat();
 		}),
 		vscode.commands.registerCommand('zcode.newChat', async () => {
-			await panel.newChat();
-			await panel.open();
+			// Router+Worker: "new chat" means focus the Router dispatch surface.
+			await panel.ensureRouterSession();
+			await vscode.commands.executeCommand('workbench.action.chat.superAgent.showWorkersPage');
 		}),
+		vscode.commands.registerCommand('zcode.ensureRouterSession', async () => {
+			return panel.ensureRouterSession();
+		}),
+		vscode.commands.registerCommand('zcode.createWorkerSession', async (opts?: { title?: string; message?: string }) => {
+			return panel.createWorkerSession({
+				title: typeof opts?.title === 'string' ? opts.title : undefined,
+				message: typeof opts?.message === 'string' ? opts.message : undefined,
+			});
+		}),
+		vscode.commands.registerCommand('zcode.patchRouterDispatch', async (opts?: {
+			sessionId?: string;
+			dispatchItemId?: string;
+			workerId?: string;
+			badge?: string;
+			accent?: string;
+			status?: string;
+		}) => {
+			if (!opts || typeof opts.sessionId !== 'string' || typeof opts.dispatchItemId !== 'string' || typeof opts.workerId !== 'string') {
+				return;
+			}
+			panel.patchRouterDispatch({
+				sessionId: opts.sessionId,
+				dispatchItemId: opts.dispatchItemId,
+				workerId: opts.workerId,
+				badge: typeof opts.badge === 'string' ? opts.badge : undefined,
+				accent: typeof opts.accent === 'string' ? opts.accent : undefined,
+				status: isDispatchStatus(opts.status) ? opts.status : undefined,
+			});
+		}),
+		vscode.commands.registerCommand('zcode.patchRouterDispatchLabel', async (opts?: {
+			sessionId?: string;
+			workerId?: string;
+			badge?: string;
+		}) => {
+			if (!opts || typeof opts.sessionId !== 'string' || typeof opts.workerId !== 'string' || typeof opts.badge !== 'string') {
+				return;
+			}
+			panel.patchRouterDispatchLabel({
+				sessionId: opts.sessionId,
+				workerId: opts.workerId,
+				badge: opts.badge,
+			});
+		}),
+		vscode.commands.registerCommand('zcode.patchRouterDispatchStatus', async (opts?: {
+			sessionId?: string;
+			workerId?: string;
+			dispatchItemId?: string;
+			status?: string;
+		}) => {
+			if (!opts || typeof opts.sessionId !== 'string' || !isDispatchStatus(opts.status)) {
+				return;
+			}
+			panel.patchRouterDispatchStatus({
+				sessionId: opts.sessionId,
+				workerId: typeof opts.workerId === 'string' ? opts.workerId : undefined,
+				dispatchItemId: typeof opts.dispatchItemId === 'string' ? opts.dispatchItemId : undefined,
+				status: opts.status,
+			});
+		}),
+		vscode.commands.registerCommand('zcode.getActiveSessionId', () => panel.getActiveSessionId()),
 		vscode.commands.registerCommand('zcode.openSession', async (sessionId?: string) => {
 			if (typeof sessionId !== 'string' || !sessionId) {
 				return;
@@ -138,8 +208,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			panel.clearTabDoneFromTitle(sessionId);
 		}),
 		vscode.commands.registerCommand('zcode.toggleHistory', async () => {
-			panel.toggleHistory();
-			await panel.open();
+			// Router+Worker: closed workers live in the Super Agent history list.
+			await vscode.commands.executeCommand('zcode.internal.toggleSuperAgentWorkerHistory');
 		}),
 		vscode.commands.registerCommand('zcode.switchBrain', async () => {
 			await panel.switchBrain();

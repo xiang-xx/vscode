@@ -31,7 +31,7 @@ import { NOTEBOOK_CELL_LIST_FOCUSED, NOTEBOOK_EDITOR_FOCUSED } from '../../../no
 import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
 import { findChatEditingSessionEntry, IChatEditReviewSession, IChatEditingService, IModifiedFileEntry, IModifiedFileEntryChangeHunk, IModifiedFileEntryEditorIntegration, ModifiedFileEntryState, parseChatMultiDiffUri, CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME } from '../../common/editing/chatEditingService.js';
 import { CHAT_CATEGORY } from '../actions/chatActions.js';
-import { ctxCursorInChangeRange, ctxHasEditorModification, ctxHasRequestInProgress, ctxIsCurrentlyBeingModified, ctxIsGlobalEditingSession, ctxReviewModeEnabled } from './chatEditingEditorContextKeys.js';
+import { ctxCursorInChangeRange, ctxHasEditorModification, ctxHasRequestInProgress, ctxIsCurrentlyBeingModified, ctxIsGlobalEditingSession, ctxKeepUndoActionsEnabled, ctxReviewModeEnabled } from './chatEditingEditorContextKeys.js';
 import { ChatEditingExplanationWidgetManager } from './chatEditingExplanationWidget.js';
 import { IChatEditingExplanationModelManager, IExplanationDiffInfo } from './chatEditingExplanationModelManager.js';
 import { DiffEditorViewModel } from '../../../../../editor/browser/widget/diffEditor/diffEditorViewModel.js';
@@ -190,13 +190,13 @@ abstract class KeepOrUndoAction extends ChatEditingEditorAction {
 			tooltip: _keep
 				? localize2('accept3', 'Keep Chat Edits in this File')
 				: localize2('discard3', 'Undo Chat Edits in this File'),
-			precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate()),
+			precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate(), ctxKeepUndoActionsEnabled),
 			icon: _keep
 				? Codicon.check
 				: Codicon.discard,
 			f1: true,
 			keybinding: {
-				when: ContextKeyExpr.or(EditorContextKeys.focus, NOTEBOOK_EDITOR_FOCUSED),
+				when: ContextKeyExpr.and(ctxKeepUndoActionsEnabled, ContextKeyExpr.or(EditorContextKeys.focus, NOTEBOOK_EDITOR_FOCUSED)),
 				weight: KeybindingWeight.WorkbenchContrib + 10, // win over new-window-action
 				primary: _keep
 					? KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyY
@@ -206,7 +206,7 @@ abstract class KeepOrUndoAction extends ChatEditingEditorAction {
 				id: MenuId.ChatEditingEditorContent,
 				group: 'a_resolve',
 				order: _keep ? 0 : 1,
-				when: ContextKeyExpr.and(!_keep ? ctxReviewModeEnabled : undefined, ContextKeyExpr.or(ctxIsGlobalEditingSession, ctxHasRequestInProgress.negate()))
+				when: ContextKeyExpr.and(ctxKeepUndoActionsEnabled, !_keep ? ctxReviewModeEnabled : undefined, ContextKeyExpr.or(ctxIsGlobalEditingSession, ctxHasRequestInProgress.negate()))
 			}
 		});
 	}
@@ -258,10 +258,10 @@ abstract class AcceptRejectHunkAction extends ChatEditingEditorAction {
 				id: _accept ? acceptHunkId : undoHunkId,
 				title: _accept ? localize2('acceptHunk', 'Keep this Change') : localize2('undo', 'Undo this Change'),
 				shortTitle: _accept ? localize2('acceptHunkShort', 'Keep') : localize2('undoShort', 'Undo'),
-				precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate()),
+				precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate(), ctxKeepUndoActionsEnabled),
 				f1: true,
 				keybinding: {
-					when: ContextKeyExpr.and(ctxCursorInChangeRange, ContextKeyExpr.or(EditorContextKeys.focus, NOTEBOOK_CELL_LIST_FOCUSED)),
+					when: ContextKeyExpr.and(ctxKeepUndoActionsEnabled, ctxCursorInChangeRange, ContextKeyExpr.or(EditorContextKeys.focus, NOTEBOOK_CELL_LIST_FOCUSED)),
 					weight: KeybindingWeight.WorkbenchContrib + 1,
 					primary: _accept
 						? KeyMod.CtrlCmd | KeyCode.KeyY
@@ -269,7 +269,8 @@ abstract class AcceptRejectHunkAction extends ChatEditingEditorAction {
 				},
 				menu: {
 					id: MenuId.ChatEditingEditorHunk,
-					order: 1
+					order: 1,
+					when: ctxKeepUndoActionsEnabled,
 				}
 			}
 		);
@@ -373,12 +374,12 @@ export class ReviewChangesAction extends ChatEditingEditorAction {
 		super({
 			id: 'chatEditor.action.reviewChanges',
 			title: localize2('review', "Review"),
-			precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate()),
+			precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate(), ctxKeepUndoActionsEnabled),
 			menu: [{
 				id: MenuId.ChatEditingEditorContent,
 				group: 'a_resolve',
 				order: 3,
-				when: ContextKeyExpr.and(ctxReviewModeEnabled.negate(), ctxIsCurrentlyBeingModified.negate(), ContextKeyExpr.or(ctxIsGlobalEditingSession, ctxHasRequestInProgress.negate())),
+				when: ContextKeyExpr.and(ctxKeepUndoActionsEnabled, ctxReviewModeEnabled.negate(), ctxIsCurrentlyBeingModified.negate(), ContextKeyExpr.or(ctxIsGlobalEditingSession, ctxHasRequestInProgress.negate())),
 			}]
 		});
 	}
@@ -397,11 +398,11 @@ export class AcceptAllEditsAction extends ChatEditingEditorAction {
 			id: AcceptAllEditsAction.ID,
 			title: localize2('acceptAllEdits', 'Keep All Chat Edits'),
 			tooltip: localize2('acceptAllEditsTooltip', 'Keep All Chat Edits in this Session'),
-			precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate()),
+			precondition: ContextKeyExpr.and(ctxHasEditorModification, ctxIsCurrentlyBeingModified.negate(), ctxKeepUndoActionsEnabled),
 			icon: Codicon.checkAll,
 			f1: true,
 			keybinding: {
-				when: ContextKeyExpr.or(EditorContextKeys.focus, NOTEBOOK_EDITOR_FOCUSED),
+				when: ContextKeyExpr.and(ctxKeepUndoActionsEnabled, ContextKeyExpr.or(EditorContextKeys.focus, NOTEBOOK_EDITOR_FOCUSED)),
 				weight: KeybindingWeight.WorkbenchContrib + 10,
 				primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyY,
 			},
@@ -424,7 +425,10 @@ abstract class MultiDiffAcceptDiscardAction extends Action2 {
 			title: accept ? localize('accept4', 'Keep All Edits') : localize('discard4', 'Undo All Edits'),
 			icon: accept ? Codicon.check : Codicon.discard,
 			menu: {
-				when: ContextKeyExpr.equals('resourceScheme', CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME),
+				when: ContextKeyExpr.and(
+					ContextKeyExpr.equals('resourceScheme', CHAT_EDITING_MULTI_DIFF_SOURCE_RESOLVER_SCHEME),
+					ctxKeepUndoActionsEnabled,
+				),
 				id: MenuId.EditorTitle,
 				order: accept ? 0 : 1,
 				group: 'navigation',

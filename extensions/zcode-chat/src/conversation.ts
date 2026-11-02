@@ -27,6 +27,42 @@ export interface UserAttachmentRef {
 	path?: string;
 }
 
+/** Live status on a Router dispatch receipt (mirrors Super Agent worker state). */
+export type DispatchStatus =
+	| 'pending'
+	| 'queued'
+	| 'starting'
+	| 'running'
+	| 'awaiting'
+	| 'done'
+	| 'failed'
+	| 'cancelled'
+	| 'stalled';
+
+export function dispatchStatusLabel(status: DispatchStatus | undefined): string {
+	switch (status) {
+		case 'queued':
+			return '排队中';
+		case 'starting':
+			return '启动中';
+		case 'running':
+			return '进行中';
+		case 'awaiting':
+			return '需要你输入';
+		case 'done':
+			return '已完成';
+		case 'failed':
+			return '失败';
+		case 'cancelled':
+			return '已取消';
+		case 'stalled':
+			return '疑似卡死';
+		case 'pending':
+		default:
+			return '处理中';
+	}
+}
+
 export type ConversationItem =
 	| {
 		id: string;
@@ -76,6 +112,21 @@ export type ConversationItem =
 		kind: 'status';
 		text: string;
 		tone?: 'info' | 'error';
+	}
+	| {
+		/** Router dispatch receipt — right-aligned bubble in the Router transcript. */
+		id: string;
+		kind: 'dispatch';
+		text: string;
+		workerId?: string;
+		/** Short worker title chip under the receipt (not the slot number). */
+		badge?: string;
+		/** Theme color id (e.g. charts.blue) or CSS color for the left accent. */
+		accent?: string;
+		/** Static receipt fallback (e.g. 已派发); live progress prefers {@link status}. */
+		receipt?: string;
+		/** Live worker turn status shown under the bubble. */
+		status?: DispatchStatus;
 	}
 	| {
 		id: string;

@@ -14,12 +14,14 @@ import { EditorResourceAccessor, SideBySideEditor } from '../../../../common/edi
 import { IEditorGroup, IEditorGroupsService } from '../../../../services/editor/common/editorGroupsService.js';
 import { IInlineChatSessionService } from '../../../inlineChat/browser/inlineChatSessionService.js';
 import { findChatEditingSessionEntry, IChatEditReviewSession, IChatEditingService, IModifiedFileEntry, ModifiedFileEntryState } from '../../common/editing/chatEditingService.js';
+import { IChatSessionReviewPreferencesService } from '../../common/editing/chatSessionReviewPreferences.js';
 import { IChatService } from '../../common/chatService/chatService.js';
 
 export const ctxIsGlobalEditingSession = new RawContextKey<boolean>('chatEdits.isGlobalEditingSession', undefined, localize('chat.ctxEditSessionIsGlobal', "The current editor is part of the global edit session"));
 export const ctxHasEditorModification = new RawContextKey<boolean>('chatEdits.hasEditorModifications', undefined, localize('chat.hasEditorModifications', "The current editor contains chat modifications"));
 export const ctxIsCurrentlyBeingModified = new RawContextKey<boolean>('chatEdits.isCurrentlyBeingModified', undefined, localize('chat.isCurrentlyBeingModified', "The current editor is currently being modified"));
 export const ctxReviewModeEnabled = new RawContextKey<boolean>('chatEdits.isReviewModeEnabled', true, localize('chat.ctxReviewModeEnabled', "Review mode for chat changes is enabled"));
+export const ctxKeepUndoActionsEnabled = new RawContextKey<boolean>('chatEdits.keepUndoActionsEnabled', false, localize('chat.ctxKeepUndoActionsEnabled', "Keep and Undo actions for chat edits are enabled"));
 export const ctxHasRequestInProgress = new RawContextKey<boolean>('chatEdits.isRequestInProgress', false, localize('chat.ctxHasRequestInProgress', "The current editor shows a file from an edit session which is still in progress"));
 export const ctxRequestCount = new RawContextKey<number>('chatEdits.requestCount', 0, localize('chatEdits.requestCount', "The number of turns the editing session in this editor has"));
 export const ctxCursorInChangeRange = new RawContextKey<boolean>('chatEdits.cursorInChangeRange', false, localize('chat.ctxCursorInChangeRange', "The cursor is inside a change range made by chat editing."));
@@ -76,6 +78,7 @@ class ContextKeyGroup {
 	private readonly _ctxHasEditorModification: IContextKey<boolean>;
 	private readonly _ctxHasRequestInProgress: IContextKey<boolean>;
 	private readonly _ctxReviewModeEnabled: IContextKey<boolean>;
+	private readonly _ctxKeepUndoActionsEnabled: IContextKey<boolean>;
 	private readonly _ctxIsCurrentlyBeingModified: IContextKey<boolean>;
 	private readonly _ctxRequestCount: IContextKey<number>;
 
@@ -86,13 +89,19 @@ class ContextKeyGroup {
 		@IInlineChatSessionService inlineChatSessionService: IInlineChatSessionService,
 		@IChatEditingService chatEditingService: IChatEditingService,
 		@IChatService chatService: IChatService,
+		@IChatSessionReviewPreferencesService reviewPreferences: IChatSessionReviewPreferencesService,
 	) {
 		this._ctxIsGlobalEditingSession = ctxIsGlobalEditingSession.bindTo(group.scopedContextKeyService);
 		this._ctxHasEditorModification = ctxHasEditorModification.bindTo(group.scopedContextKeyService);
 		this._ctxIsCurrentlyBeingModified = ctxIsCurrentlyBeingModified.bindTo(group.scopedContextKeyService);
 		this._ctxHasRequestInProgress = ctxHasRequestInProgress.bindTo(group.scopedContextKeyService);
 		this._ctxReviewModeEnabled = ctxReviewModeEnabled.bindTo(group.scopedContextKeyService);
+		this._ctxKeepUndoActionsEnabled = ctxKeepUndoActionsEnabled.bindTo(group.scopedContextKeyService);
 		this._ctxRequestCount = ctxRequestCount.bindTo(group.scopedContextKeyService);
+
+		this._store.add(autorun(r => {
+			this._ctxKeepUndoActionsEnabled.set(reviewPreferences.keepUndoEnabled.read(r));
+		}));
 
 		const editorObs = observableFromEvent(this, group.onDidModelChange, () => group.activeEditor);
 		const tupleObs = derived(r => {
@@ -139,6 +148,7 @@ class ContextKeyGroup {
 		this._ctxIsCurrentlyBeingModified.reset();
 		this._ctxHasRequestInProgress.reset();
 		this._ctxReviewModeEnabled.reset();
+		// keepUndo preference is profile-scoped — leave its context key alone on editor switch
 		this._ctxRequestCount.reset();
 	}
 

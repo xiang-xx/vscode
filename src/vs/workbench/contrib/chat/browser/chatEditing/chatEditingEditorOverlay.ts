@@ -9,6 +9,7 @@ import { autorun, derived, derivedOpts, IObservable, observableFromEvent, observ
 import { HiddenItemStrategy, MenuWorkbenchToolBar } from '../../../../../platform/actions/browser/toolbar.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { findChatEditingSessionEntry, IChatEditReviewSession, IChatEditingService, IModifiedFileEntry, ModifiedFileEntryState } from '../../common/editing/chatEditingService.js';
+import { IChatSessionReviewPreferencesService } from '../../common/editing/chatSessionReviewPreferences.js';
 import { MenuId } from '../../../../../platform/actions/common/actions.js';
 import { ActionViewItem, IActionViewItemOptions } from '../../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { IAction, IActionRunner } from '../../../../../base/common/actions.js';
@@ -287,6 +288,7 @@ class ChatEditingOverlayController {
 		group: IEditorGroup,
 		@IInstantiationService instaService: IInstantiationService,
 		@IChatEditingService chatEditingService: IChatEditingService,
+		@IChatSessionReviewPreferencesService reviewPreferences: IChatSessionReviewPreferencesService,
 	) {
 
 		this._domNode.classList.add('chat-editing-editor-overlay');
@@ -346,8 +348,10 @@ class ChatEditingOverlayController {
 		this._store.add(autorun(r => {
 
 			const data = sessionAndEntry.read(r);
+			const keepUndo = reviewPreferences.keepUndoEnabled.read(r);
 
-			if (!data) {
+			if (!data || !keepUndo) {
+				// Diff styling stays in the editor; Keep/Undo overlay is opt-in.
 				hide();
 				return;
 			}

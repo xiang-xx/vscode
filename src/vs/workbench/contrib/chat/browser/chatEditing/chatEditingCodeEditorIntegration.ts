@@ -37,6 +37,7 @@ import { EditorsOrder, IEditorIdentifier, isDiffEditorInput } from '../../../../
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { minimapGutterAddedBackground, minimapGutterDeletedBackground, minimapGutterModifiedBackground, overviewRulerAddedForeground, overviewRulerDeletedForeground, overviewRulerModifiedForeground } from '../../../scm/common/quickDiff.js';
 import { IChatEditingService, IModifiedFileEntry, IModifiedFileEntryChangeHunk, IModifiedFileEntryEditorIntegration, ModifiedFileEntryState } from '../../common/editing/chatEditingService.js';
+import { IChatSessionReviewPreferencesService } from '../../common/editing/chatSessionReviewPreferences.js';
 import { isTextDiffEditorForEntry } from './chatEditing.js';
 import { ActionViewItem } from '../../../../../base/browser/ui/actionbar/actionViewItems.js';
 import { IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
@@ -109,6 +110,7 @@ export class ChatEditingCodeEditorIntegration implements IModifiedFileEntryEdito
 		@IChatEditingExplanationModelManager private readonly _explanationModelManager: IChatEditingExplanationModelManager,
 		@IChatWidgetService private readonly _chatWidgetService: IChatWidgetService,
 		@IViewsService private readonly _viewsService: IViewsService,
+		@IChatSessionReviewPreferencesService private readonly _reviewPreferences: IChatSessionReviewPreferencesService,
 	) {
 		this._diffLineDecorations = _editor.createDecorationsCollection();
 		const codeEditorObs = observableCodeEditor(_editor);
@@ -198,8 +200,9 @@ export class ChatEditingCodeEditorIntegration implements IModifiedFileEntryEdito
 				codeEditorObs.getOption(EditorOption.lineHeight).read(r);
 
 				const reviewMode = _entry.reviewMode.read(r);
+				const keepUndo = this._reviewPreferences.keepUndoEnabled.read(r);
 				const diff = documentDiffInfo.read(r);
-				this._updateDiffRendering(diff, reviewMode, isDiffEditor);
+				this._updateDiffRendering(diff, reviewMode, isDiffEditor, keepUndo);
 			}
 		}));
 
@@ -326,7 +329,7 @@ export class ChatEditingCodeEditorIntegration implements IModifiedFileEntryEdito
 		this._diffVisualDecorations.clear();
 	}
 
-	private _updateDiffRendering(diff: IDocumentDiff2, reviewMode: boolean, diffMode: boolean): void {
+	private _updateDiffRendering(diff: IDocumentDiff2, reviewMode: boolean, diffMode: boolean, keepUndoActions = true): void {
 
 		const chatDiffAddDecoration = ModelDecorationOptions.createDynamic({
 			...diffAddDecoration,
@@ -441,7 +444,8 @@ export class ChatEditingCodeEditorIntegration implements IModifiedFileEntryEdito
 					}
 				}
 
-				if (reviewMode || diffMode) {
+				// Hunk Keep/Undo toolbars are opt-in; diff line/view-zone styling stays either way.
+				if (keepUndoActions && (reviewMode || diffMode)) {
 
 					// Add content widget for each diff change
 					let widget = this._diffHunkWidgetPool.get();
