@@ -367,33 +367,44 @@
 	padding: 0 10px 0 12px;
 	gap: 5px;
 	border-right: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent);
+	/* Passive status chip: it labels the Workers surface, it is not a
+	 * switch — no pointer or hover affordance. */
+	cursor: default;
+	user-select: none;
+}
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.zcode-tab-pinned:hover:not(.active) {
+	background-color: transparent;
+	color: var(--vscode-tab-inactiveForeground);
+}
+.modern-ui-tabs.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-session-tab.zcode-tab-pinned:hover:not(.active) {
+	background-color: var(--vscode-modernEditorTab-inactiveBackground, var(--vscode-tab-inactiveBackground, transparent));
+	color: color-mix(in srgb, var(--vscode-foreground) 50%, transparent);
 }
 .monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-icon {
 	font-size: 14px;
 	opacity: 0.9;
 }
-.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-badge {
-	min-width: 16px;
-	height: 16px;
-	padding: 0 4px;
-	border-radius: 8px;
-	font-size: 10px;
-	line-height: 16px;
-	text-align: center;
-	background-color: var(--vscode-badge-background);
-	color: var(--vscode-badge-foreground);
+/* Attention dot — the only live signal on the chip. Shown while some
+ * worker awaits the user; per-state counts live in the strip header. */
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-attention {
+	flex: 0 0 auto;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background-color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+	animation: zcode-superagent-attention-breathe 1.6s ease-in-out infinite;
 }
-.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-badge.attention {
-	background-color: var(--vscode-statusBarItem-warningBackground, var(--vscode-badge-background));
-	color: var(--vscode-statusBarItem-warningForeground, var(--vscode-badge-foreground));
-}
-.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-badge.hidden {
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-attention.hidden {
 	display: none;
 }
-.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-badge.pulse {
-	animation: zcode-superagent-badge-pulse 1.1s ease-out 2;
+.monaco-workbench .part.auxiliarybar.zcode-chat-active .zcode-tab-pinned .zcode-tab-attention.pulse {
+	animation: zcode-superagent-attention-pulse 1.1s ease-out 2, zcode-superagent-attention-breathe 1.6s ease-in-out infinite;
 }
-@keyframes zcode-superagent-badge-pulse {
+@keyframes zcode-superagent-attention-breathe {
+	0%, 100% { opacity: 0.45; }
+	50% { opacity: 1; }
+}
+@keyframes zcode-superagent-attention-pulse {
 	0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--vscode-editorWarning-foreground) 70%, transparent); }
 	100% { box-shadow: 0 0 0 8px transparent; }
 }

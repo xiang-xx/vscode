@@ -255,6 +255,13 @@ export interface IChatRouterService {
 	recordActivity(workerId: string, detail?: string): void;
 
 	/**
+	 * A deliberate follow-up dispatch to a terminal (Failed/Cancelled) worker
+	 * makes it Running again. Heartbeats alone can't do this — they ignore
+	 * terminal states — so call this when the user re-dispatches to a worker.
+	 */
+	reviveWorker(workerId: string, detail?: string): void;
+
+	/**
 	 * User viewed a finished turn (or acknowledged the worker). Moves
 	 * Completed → Idle so the tip / toast clears. Keeps the concurrency slot.
 	 */

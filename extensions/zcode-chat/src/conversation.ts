@@ -78,6 +78,14 @@ export function isDispatchStatusTerminal(status: DispatchStatus | undefined): bo
 	return status === 'done' || status === 'failed' || status === 'cancelled';
 }
 
+/** One working-set file mirrored onto a Router dispatch receipt. */
+export interface RouterDispatchFile {
+	uri: string;
+	relativePath: string;
+	added: number;
+	removed: number;
+}
+
 export type ConversationItem =
 	| {
 		id: string;
@@ -134,6 +142,8 @@ export type ConversationItem =
 		kind: 'dispatch';
 		text: string;
 		workerId?: string;
+		/** Worker zcode session id — result stamping and Root follow-up target. */
+		workerSessionId?: string;
 		/** Short worker title chip under the receipt (not the slot number). */
 		badge?: string;
 		/** Theme color id (e.g. charts.blue) or CSS color for the left accent. */
@@ -146,6 +156,10 @@ export type ConversationItem =
 		startedAt?: number;
 		/** Frozen elapsed ms once the task reaches a terminal status. */
 		durationMs?: number;
+		/** Worker's final reply for this task, mirrored under the receipt. */
+		resultText?: string;
+		/** Worker's unkept working-set files, mirrored under the receipt. */
+		files?: RouterDispatchFile[];
 	}
 	| {
 		id: string;

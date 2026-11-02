@@ -1494,12 +1494,7 @@
 	}
 
 	function patchDispatchRow(el, item) {
-		const wantClickable = !!item.workerId;
-		const nextClass = 'dispatch-row' + (wantClickable ? ' clickable' : '');
-		if (el.className !== nextClass) {
-			el.className = nextClass;
-		}
-		el.title = wantClickable ? '打开 Worker' : '';
+		syncDispatchRowChrome(el, item, false);
 		const receiptEl = el.querySelector('.dispatch-receipt');
 		const textEl = el.querySelector('.dispatch-text');
 		const badgeEl = el.querySelector('.dispatch-badge');
@@ -1508,6 +1503,12 @@
 		}
 		if (receiptEl) {
 			syncDispatchReceipt(receiptEl, item);
+		}
+		if (item.workerId && !el.querySelector('.dispatch-open')) {
+			const meta = el.querySelector('.dispatch-meta');
+			if (meta) {
+				meta.appendChild(createDispatchOpenButton(item));
+			}
 		}
 		if (textEl.textContent !== (item.text || '')) {
 			textEl.textContent = item.text || '';
@@ -1962,17 +1963,16 @@
 		}
 	}
 
+	/** Dispatch results the user expanded (item ids); survives rebuilds. */
+	const expandedDispatchResults = new Set();
+
 	function renderDispatchCard(item, mark) {
 		// Same right-aligned bubble shape as a user turn — Router is still a
-		// chat transcript; the Workers strip is the task board.
+		// chat transcript; the Workers strip is the task board. Clicking the
+		// bubble binds the composer to this worker for follow-ups; the ↗ button
+		// still jumps into the worker stream.
 		const row = mark(document.createElement('div'), item.id);
-		row.className = 'dispatch-row' + (item.workerId ? ' clickable' : '');
-		if (item.workerId) {
-			row.title = '打开 Worker';
-			row.addEventListener('click', () => {
-				vscode.postMessage({ type: 'openDispatch', workerId: item.workerId });
-			});
-		}
+		syncDispatchRowChrome(row, item, true);
 		const bubble = document.createElement('div');
 		bubble.className = 'dispatch-bubble';
 		const text = document.createElement('div');
@@ -1991,9 +1991,120 @@
 		const receipt = document.createElement('span');
 		syncDispatchReceipt(receipt, item);
 		meta.appendChild(receipt);
+		if (item.workerId) {
+			meta.appendChild(createDispatchOpenButton(item));
+		}
 		row.appendChild(bubble);
 		row.appendChild(meta);
+		if (item.resultText) {
+			row.appendChild(renderDispatchResult(item));
+		}
+		if (item.files && item.files.length) {
+			row.appendChild(renderDispatchFiles(item));
+		}
 		return row;
+	}
+
+	/** Click/tooltip/selected styling shared by build and in-place patch. */
+	function syncDispatchRowChrome(row, item, attach) {
+		const wantClickable = !!item.workerId;
+		const selected = !!(state && state.dispatchTarget && item.workerSessionId
+			&& state.dispatchTarget.workerSessionId === item.workerSessionId);
+		const nextClass = 'dispatch-row' + (wantClickable ? ' clickable' : '') + (selected ? ' selected' : '');
+		if (row.className !== nextClass) {
+			row.className = nextClass;
+		}
+		row.title = wantClickable
+			? (selected ? '已选中：输入框内容将派发给该 Worker（点击取消）' : '点击选中：输入框内容将派发给该 Worker')
+			: '';
+		if (attach && wantClickable) {
+			row.addEventListener('click', (e) => {
+				if (e.target.closest('.dispatch-open, .dispatch-result, .dispatch-files')) {
+					return;
+				}
+				const nowSelected = !(state && state.dispatchTarget && state.dispatchTarget.workerSessionId === item.workerSessionId);
+				vscode.postMessage({
+					type: 'setDispatchTarget',
+					target: nowSelected ? {
+						workerId: item.workerId,
+						workerSessionId: item.workerSessionId,
+						badge: item.badge,
+						accent: item.accent,
+					} : null,
+				});
+			});
+		}
+	}
+
+	function createDispatchOpenButton(item) {
+		const open = document.createElement('button');
+		open.type = 'button';
+		open.className = 'dispatch-open';
+		open.title = '打开 Worker 聊天流';
+		open.setAttribute('aria-label', '打开 Worker 聊天流');
+		open.textContent = '↗';
+		open.addEventListener('click', (e) => {
+			e.stopPropagation();
+			vscode.postMessage({ type: 'openDispatch', workerId: item.workerId });
+		});
+		return open;
+	}
+
+	/** Worker's final reply mirrored under the receipt — markdown, collapsible. */
+	function renderDispatchResult(item) {
+		const wrap = document.createElement('div');
+		wrap.className = 'dispatch-result';
+		const body = document.createElement('div');
+		body.className = 'dispatch-result-body';
+		body.innerHTML = renderMarkdown(item.resultText || '');
+		wrap.appendChild(body);
+		const long = (item.resultText || '').length > 260;
+		wrap.classList.toggle('long', long);
+		wrap.classList.toggle('expanded', expandedDispatchResults.has(item.id));
+		if (long) {
+			const toggle = document.createElement('button');
+			toggle.type = 'button';
+			toggle.className = 'dispatch-result-toggle';
+			toggle.textContent = expandedDispatchResults.has(item.id) ? '收起' : '展开';
+			toggle.addEventListener('click', (e) => {
+				e.stopPropagation();
+				const expanded = expandedDispatchResults.has(item.id);
+				if (expanded) {
+					expandedDispatchResults.delete(item.id);
+				} else {
+					expandedDispatchResults.add(item.id);
+				}
+				wrap.classList.toggle('expanded', !expanded);
+				toggle.textContent = !expanded ? '收起' : '展开';
+			});
+			wrap.appendChild(toggle);
+		}
+		return wrap;
+	}
+
+	/** Worker's working-set files mirrored under the receipt. */
+	function renderDispatchFiles(item) {
+		const box = document.createElement('div');
+		box.className = 'dispatch-files';
+		const list = document.createElement('ul');
+		list.className = 'dispatch-files-list';
+		for (const f of item.files || []) {
+			const li = document.createElement('li');
+			li.className = 'dispatch-files-row';
+			li.innerHTML = '<button type="button" class="file-label"></button>' +
+				'<span class="insertions-and-deletions"><span class="insertions"></span><span class="deletions"></span></span>';
+			li.querySelector('.file-label').textContent = f.relativePath || f.uri;
+			li.querySelector('.file-label').title = f.relativePath || f.uri;
+			li.querySelector('.insertions').textContent = `+${f.added || 0}`;
+			li.querySelector('.deletions').textContent = `-${f.removed || 0}`;
+			li.querySelector('.file-label').addEventListener('click', (e) => {
+				e.stopPropagation();
+				vscode.postMessage({ type: 'openFileChange', uri: f.uri, mode: 'file' });
+			});
+			list.appendChild(li);
+		}
+		box.appendChild(list);
+		return box;
 	}
 
 	let timelineContentKey = '';
@@ -2023,7 +2134,10 @@
 			}
 			if (item.kind === 'dispatch') {
 				// durationLabel ticks live via tryPatchElapsed — omit it from the key.
-				return `${item.id}|d|${item.text || ''}|${item.workerId || ''}|${item.badge || ''}|${item.accent || ''}|${item.receipt || ''}|${item.status || ''}|${item.startedAt || ''}|${item.durationMs || ''}`;
+				// resultText/files changes rebuild the card; keep the signature cheap.
+				const rt = item.resultText || '';
+				const fs = (item.files || []).map(f => `${f.relativePath}:${f.added}:${f.removed}`).join(',');
+				return `${item.id}|d|${item.text || ''}|${item.workerId || ''}|${item.badge || ''}|${item.accent || ''}|${item.receipt || ''}|${item.status || ''}|${item.startedAt || ''}|${item.durationMs || ''}|${rt.length}.${rt.slice(-24)}|${fs}`;
 			}
 			return `${item.id}|${item.kind}|${item.text || ''}|${item.status || ''}`;
 		}).join('\u0001');
@@ -2734,6 +2848,24 @@
 		});
 	}
 
+	/** Composer chip showing which worker the next send targets. */
+	function renderDispatchTarget(target, isRouter) {
+		const el = document.getElementById('dispatchTarget');
+		if (!el) {
+			return;
+		}
+		const badge = document.getElementById('dispatchTargetBadge');
+		const on = !!(isRouter && target && target.workerSessionId);
+		el.hidden = !on;
+		if (!on) {
+			return;
+		}
+		if (badge) {
+			badge.textContent = target.badge || 'Worker';
+			badge.title = target.badge || '';
+		}
+	}
+
 	function renderChips(attachments) {
 		chipsEl.innerHTML = '';
 		(attachments || []).forEach((a) => {
@@ -2928,7 +3060,9 @@
 		document.body.classList.toggle('router-session', !!next.isRouter);
 		if (inputEl) {
 			inputEl.placeholder = next.isRouter
-				? '描述要派发给 Worker 的任务'
+				? (next.dispatchTarget
+					? `发给 ${next.dispatchTarget.badge || 'Worker'}：输入跟进任务…`
+					: '描述要派发给 Worker 的任务')
 				: 'Plan, @ for context, / for commands, $ for skills';
 		}
 		renderTimeline(next.items || []);
@@ -2936,6 +3070,7 @@
 		renderWorkingSet(next.fileChanges || []);
 		renderHistory(next.sessions || []);
 		renderChips(next.attachments);
+		renderDispatchTarget(next.dispatchTarget, !!next.isRouter);
 		renderQueue(next.queue, !!next.queuePaused);
 		renderPlusMenu(next.plusSections);
 		renderContextUsage(next.contextUsage);
@@ -2950,6 +3085,13 @@
 			plusMenu.classList.add('open');
 			plusBtn.setAttribute('aria-expanded', 'true');
 		}
+	}
+
+	const dispatchTargetClearBtn = document.getElementById('dispatchTargetClear');
+	if (dispatchTargetClearBtn) {
+		dispatchTargetClearBtn.addEventListener('click', () => {
+			vscode.postMessage({ type: 'setDispatchTarget', target: null });
+		});
 	}
 
 	function send() {
@@ -3293,6 +3435,19 @@
 			setHistoryOpen(false);
 		}
 	});
+	// ⌘⌥J / Ctrl+Alt+J — "view pending worker" toast shortcut. Keydown inside a
+	// webview iframe never reaches the workbench keybinding service, so re-post
+	// the chord to the host, which runs the same command the global keybinding
+	// would. Works while typing in the composer (preventDefault keeps the
+	// chord from editing text).
+	document.addEventListener('keydown', (e) => {
+		if (e.code !== 'KeyJ' || !e.altKey || !(e.metaKey || e.ctrlKey)) {
+			return;
+		}
+		e.preventDefault();
+		e.stopPropagation();
+		vscode.postMessage({ type: 'viewPendingWorker' });
+	}, true);
 
 	// ---- Task-completion chime. Only fired by the host when a real agent turn
 	// finishes successfully; no other sounds exist in this view. The visible

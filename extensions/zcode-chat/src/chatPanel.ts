@@ -255,6 +255,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private billingSeq = 0;
 	/** Session id of the Super Agent Router dispatch surface (pinned Workers page). */
 	private routerSessionId: string | undefined;
+	/**
+	 * Composer follow-up target on the Router page: clicking a dispatch card
+	 * binds the next sends to that worker instead of spawning a new one.
+	 */
+	private dispatchTarget: { workerId: string; workerSessionId: string; badge?: string; accent?: string } | undefined;
 	/** Resolved once the initial session restore finishes (Router open must wait). */
 	private readonly bootstrapDone: Promise<void>;
 	private resolveBootstrapDone: (() => void) | undefined;
@@ -386,6 +391,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 		this.fileEdits.onDidChange(() => {
 			this.refreshFileChanges();
+			this.syncRouterDispatchFiles();
 			this.pushState();
 		});
 		try {
@@ -604,11 +610,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		sessionId: string;
 		dispatchItemId: string;
 		workerId: string;
+		workerSessionId?: string;
 		badge?: string;
 		accent?: string;
 		status?: DispatchStatus;
 	}): void {
-		const { sessionId, dispatchItemId, workerId, badge, accent, status } = opts;
+		const { sessionId, dispatchItemId, workerId, workerSessionId, badge, accent, status } = opts;
 		if (!sessionId || !dispatchItemId || !workerId) {
 			return;
 		}
@@ -618,6 +625,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				return;
 			}
 			item.workerId = workerId;
+			if (workerSessionId) {
+				item.workerSessionId = workerSessionId;
+			}
 			if (badge) {
 				item.badge = badge;
 			}
@@ -739,6 +749,145 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	getActiveSessionId(): string | undefined {
 		return this.sessionId;
+	}
+
+	/**
+	 * Dispatch target for the webview: refreshed badge/accent from the newest
+	 * router card so AI title updates reflect on the composer chip live.
+	 */
+	private buildDispatchTargetState(): { workerId: string; workerSessionId: string; badge?: string; accent?: string } | undefined {
+		const target = this.dispatchTarget;
+		const routerId = this.routerSessionId;
+		if (!target || !routerId) {
+			return undefined;
+		}
+		// Self-heal: drop the target once its worker session is gone (deleted).
+		const alive = target.workerSessionId === this.sessionId
+			|| this.parked.has(target.workerSessionId)
+			|| this.sessionList.some(s => s.id === target.workerSessionId);
+		if (!alive) {
+			this.dispatchTarget = undefined;
+			return undefined;
+		}
+		const chat = routerId === this.sessionId ? this.captureView() : this.parked.get(routerId);
+		for (let i = (chat?.items.length ?? 0) - 1; i >= 0; i--) {
+			const row = chat!.items[i];
+			if (row.kind === 'dispatch' && row.workerSessionId === target.workerSessionId) {
+				return {
+					workerId: target.workerId,
+					workerSessionId: target.workerSessionId,
+					badge: row.badge || target.badge,
+					accent: row.accent || target.accent,
+				};
+			}
+		}
+		return target;
+	}
+
+	/**
+	 * Mirrors a worker turn's final reply and working-set files onto its Router
+	 * dispatch receipt, so the Root page alone shows the full task outcome.
+	 */
+	private syncRouterDispatchResult(workerSessionId: string, opts?: { failed?: boolean; cancelled?: boolean }): void {
+		const routerId = this.routerSessionId;
+		if (!routerId || !workerSessionId || workerSessionId === routerId) {
+			return;
+		}
+		const workerChat = workerSessionId === this.sessionId
+			? this.captureView()
+			: this.parked.get(workerSessionId);
+		const lastReply = [...(workerChat?.items ?? [])]
+			.reverse()
+			.find(item => item.kind === 'assistant' && item.text.trim());
+		const resultText = opts?.cancelled || opts?.failed
+			? undefined
+			: lastReply && lastReply.kind === 'assistant' ? lastReply.text.trim() : undefined;
+		const files = this.fileEdits.listOwnedBy(workerSessionId).map(f => ({
+			uri: f.uri,
+			relativePath: f.relativePath,
+			added: f.added,
+			removed: f.removed,
+		}));
+		if (!resultText && !files.length) {
+			return;
+		}
+		let changed = false;
+		this.mutateChat(routerId, chat => {
+			// Stamp the latest still-active card for this worker; fall back to the
+			// latest card overall so a fast turn that already flipped terminal still
+			// gets its result. (Reassigning on every match used to leave `target`
+			// on the OLDEST card — results vanished into history.)
+			let target: Extract<ConversationItem, { kind: 'dispatch' }> | undefined;
+			let newest: Extract<ConversationItem, { kind: 'dispatch' }> | undefined;
+			for (let i = chat.items.length - 1; i >= 0; i--) {
+				const row = chat.items[i];
+				if (row.kind !== 'dispatch' || row.workerSessionId !== workerSessionId) {
+					continue;
+				}
+				newest ??= row;
+				if (!isDispatchStatusTerminal(row.status)) {
+					target = row;
+					break;
+				}
+			}
+			target ??= newest;
+			if (!target) {
+				return;
+			}
+			if (resultText && target.resultText !== resultText) {
+				target.resultText = resultText;
+				changed = true;
+			}
+			const nextJson = JSON.stringify(files);
+			if (JSON.stringify(target.files ?? []) !== nextJson) {
+				target.files = files;
+				changed = true;
+			}
+		});
+		if (!changed) {
+			return;
+		}
+		if (this.sessionId === routerId) {
+			this.pushState();
+		}
+		void this.persistSessionById(routerId);
+	}
+
+	/** Live-syncs working-set files onto still-active Router dispatch cards. */
+	private syncRouterDispatchFiles(): void {
+		const routerId = this.routerSessionId;
+		if (!routerId) {
+			return;
+		}
+		let changed = false;
+		this.mutateChat(routerId, chat => {
+			const byWorker = new Map<string, string>();
+			for (const row of chat.items) {
+				if (row.kind !== 'dispatch' || !row.workerSessionId || isDispatchStatusTerminal(row.status)) {
+					continue;
+				}
+				byWorker.set(row.workerSessionId, row.id);
+			}
+			for (const workerSessionId of byWorker.keys()) {
+				const files = this.fileEdits.listOwnedBy(workerSessionId).map(f => ({
+					uri: f.uri,
+					relativePath: f.relativePath,
+					added: f.added,
+					removed: f.removed,
+				}));
+				const item = chat.items.find(row => row.id === byWorker.get(workerSessionId));
+				if (!item || item.kind !== 'dispatch') {
+					continue;
+				}
+				if (JSON.stringify(item.files ?? []) !== JSON.stringify(files)) {
+					item.files = files;
+					changed = true;
+				}
+			}
+		});
+		if (changed && this.sessionId === routerId) {
+			this.pushState();
+		}
 	}
 
 	async openSessionFromTitle(sessionId: string): Promise<void> {
@@ -866,6 +1015,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			reason?: string;
 			planId?: string;
 			query?: string;
+			workerId?: string;
+			target?: unknown;
 		};
 
 		if (msg.type === 'ready') {
@@ -1054,6 +1205,32 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'openDispatch' && typeof msg.workerId === 'string' && msg.workerId) {
 			void vscode.commands.executeCommand('zcode.internal.superAgent.presentWorker', msg.workerId);
+			return;
+		}
+		if (msg.type === 'viewPendingWorker') {
+			// Chord pressed inside the webview (iframe keydown never reaches the
+			// workbench keybinding service) — re-dispatch to the same command the
+			// workbench ⌘⌥J/Ctrl+Alt+J keybinding runs.
+			void vscode.commands.executeCommand('workbench.action.chat.superAgent.viewPendingWorker');
+			return;
+		}
+		if (msg.type === 'setDispatchTarget') {
+			const body = msg.target && typeof msg.target === 'object' ? msg.target as {
+				workerId?: unknown; workerSessionId?: unknown; badge?: unknown; accent?: unknown;
+			} : undefined;
+			const workerId = typeof body?.workerId === 'string' ? body.workerId : '';
+			const workerSessionId = typeof body?.workerSessionId === 'string' ? body.workerSessionId : '';
+			if (!workerId || !workerSessionId) {
+				this.dispatchTarget = undefined;
+			} else {
+				this.dispatchTarget = {
+					workerId,
+					workerSessionId,
+					badge: typeof body?.badge === 'string' ? body.badge : undefined,
+					accent: typeof body?.accent === 'string' ? body.accent : undefined,
+				};
+			}
+			this.pushState();
 			return;
 		}
 		if (msg.type === 'closeTab' && typeof msg.sessionId === 'string') {
@@ -1817,6 +1994,42 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (this.sessionId === this.routerSessionId) {
 			const sessionId = this.sessionId;
 			const displayText = prepared.displayText;
+			const target = this.dispatchTarget;
+			if (target?.workerSessionId && target.workerSessionId !== sessionId) {
+				// Follow-up to a selected worker: bound dispatch card + turn on the
+				// worker session (queue it if that worker is still busy).
+				const dispatchItemId = newItemId('dispatch');
+				this.mutateChat(sessionId, chat => {
+					chat.items.push({
+						id: dispatchItemId,
+						kind: 'dispatch',
+						text: displayText,
+						workerId: target.workerId,
+						workerSessionId: target.workerSessionId,
+						badge: target.badge,
+						accent: target.accent,
+						receipt: dispatchStatusLabel('running'),
+						status: 'running',
+						startedAt: Date.now(),
+					});
+				});
+				this.startDispatchElapsedTimer();
+				this.pushState({ clearDraft: true });
+				void this.persistSessionById(sessionId);
+				if (this.runs.has(target.workerSessionId)) {
+					this.mutateChat(target.workerSessionId, chat => {
+						chat.queuePaused = false;
+						chat.queue.push({
+							id: newItemId('queue'),
+							text: displayText,
+							attachments: [],
+						});
+					});
+				} else {
+					void this.startTurn(target.workerSessionId, content, { text: displayText, attachments });
+				}
+				return;
+			}
 			const dispatchItemId = newItemId('dispatch');
 			this.mutateChat(sessionId, chat => {
 				chat.items.push({
@@ -2172,6 +2385,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.unreadDoneIds.delete(runSessionId);
 			}
 			await this.persistSessionById(runSessionId);
+			// Mirror the finished turn's reply + working set onto its Router
+			// dispatch card before the state push so Root shows the outcome at once.
+			this.syncRouterDispatchResult(runSessionId, { failed: turnFailed, cancelled });
 			this.pushState();
 
 			if (force) {
@@ -3137,6 +3353,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			// Session tabs retired under Router+Worker — Workers rail owns navigation.
 			tabs: [],
 			isRouter: !!this.routerSessionId && this.sessionId === this.routerSessionId,
+			dispatchTarget: this.buildDispatchTargetState(),
 			attachments: this.attachments.map(a => ({ id: a.id, name: a.name, title: a.detail ?? a.fsPath })),
 			queue: this.queue.map(item => ({ id: item.id, text: item.text })),
 			queuePaused: this.queuePaused,
@@ -3262,6 +3479,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			</div>
 		</div>
 		<ul class="chat-summary-list" id="workingSetList"></ul>
+	</div>
+	<div class="dispatch-target" id="dispatchTarget" hidden>
+		<span class="dispatch-target-label">发给</span>
+		<span class="dispatch-target-badge" id="dispatchTargetBadge"></span>
+		<button type="button" class="dispatch-target-clear" id="dispatchTargetClear" title="取消绑定，回到派发新任务">×</button>
 	</div>
 	<div class="chips" id="chips"></div>
 	<div class="queue-panel" id="queuePanel" hidden>

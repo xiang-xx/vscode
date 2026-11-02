@@ -353,6 +353,28 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 		this._fire(workerId, 'activity', detail);
 	}
 
+	/**
+	 * A deliberate follow-up dispatch makes a terminal worker live again.
+	 * `recordActivity` ignores Failed/Cancelled (its heartbeats can't distinguish
+	 * a new turn from teardown noise), so without an explicit revive the worker
+	 * rail and Router receipts stay stuck on "failed"/"cancelled" while the new
+	 * turn is actually running.
+	 */
+	reviveWorker(workerId: string, detail?: string): void {
+		const worker = this._workerById(workerId);
+		if (!worker) {
+			return;
+		}
+		const state = worker.state.get();
+		if (state !== SuperAgentWorkerState.Failed && state !== SuperAgentWorkerState.Cancelled) {
+			return;
+		}
+		worker.lastActivityAt.set(Date.now(), undefined);
+		worker.armWatchdog();
+		worker.setWorkerState(SuperAgentWorkerState.Running);
+		this._fire(workerId, 'stateChanged', detail ?? 'revived');
+	}
+
 	markIdle(workerId: string, detail?: string): void {
 		const worker = this._workerById(workerId);
 		if (!worker || !superAgentWorkerStateIsActive(worker.state.get())) {

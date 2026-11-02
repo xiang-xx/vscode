@@ -622,6 +622,150 @@ button {
 .dispatch-row.clickable:hover .dispatch-badge {
 	color: var(--vscode-foreground);
 }
+/* Selected follow-up target */
+.dispatch-row.selected .dispatch-bubble {
+	border-color: var(--vscode-focusBorder);
+	box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset;
+}
+.dispatch-row.selected .dispatch-badge {
+	color: var(--vscode-foreground);
+	font-weight: 600;
+}
+/* Small jump-into-worker button next to the receipt */
+.dispatch-open {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.28));
+	border-radius: 4px;
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	line-height: 1;
+	cursor: pointer;
+}
+.dispatch-open:hover {
+	color: var(--vscode-foreground);
+	border-color: var(--vscode-focusBorder);
+}
+/* Worker's final reply mirrored under the receipt (left-aligned) */
+.dispatch-result {
+	max-width: min(100%, 44rem);
+	margin-left: 0;
+	padding: 8px 12px;
+	border-radius: 2px 12px 12px 12px;
+	border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.28));
+	border-left: 2px solid var(--vscode-focusBorder, rgba(127,127,127,.4));
+	background: var(--vscode-editor-background);
+}
+.dispatch-result-body {
+	font-size: var(--zcode-chat-font-size);
+	line-height: var(--zcode-chat-line-height);
+	color: var(--vscode-foreground);
+	overflow-wrap: anywhere;
+}
+.dispatch-result-body :first-child { margin-top: 0; }
+.dispatch-result-body :last-child { margin-bottom: 0; }
+.dispatch-result.long:not(.expanded) .dispatch-result-body {
+	max-height: 8.5em;
+	overflow: hidden;
+	mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+	-webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+}
+.dispatch-result-toggle {
+	margin-top: 4px;
+	padding: 1px 8px;
+	border: none;
+	background: transparent;
+	color: var(--vscode-textLink-foreground);
+	font-size: 11px;
+	cursor: pointer;
+}
+.dispatch-result-toggle:hover {
+	text-decoration: underline;
+}
+/* Worker's working-set files mirrored under the receipt */
+.dispatch-files {
+	max-width: min(100%, 44rem);
+	margin-left: 0;
+	padding: 4px 10px;
+	border-radius: 10px;
+	border: 1px dashed var(--vscode-widget-border, rgba(127,127,127,.28));
+}
+.dispatch-files-list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	max-height: 168px;
+	overflow: auto;
+}
+.dispatch-files-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	padding: 2px 0;
+	font-size: var(--zcode-chat-font-size);
+	line-height: var(--zcode-chat-line-height);
+}
+.dispatch-files-row .file-label {
+	flex: 1;
+	min-width: 0;
+	padding: 0;
+	border: none;
+	background: transparent;
+	color: var(--vscode-textLink-foreground);
+	text-align: left;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	cursor: pointer;
+}
+.dispatch-files-row .file-label:hover {
+	text-decoration: underline;
+}
+.dispatch-files-row .insertions { color: var(--vscode-charts-green, #89d185); }
+.dispatch-files-row .deletions { color: var(--vscode-charts-red, #f14c4c); }
+/* Composer chip: next send targets this worker */
+.dispatch-target[hidden] { display: none !important; }
+.dispatch-target {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin: 0 0 6px;
+	padding: 3px 8px;
+	border-radius: 10px;
+	border: 1px solid var(--vscode-focusBorder);
+	background: color-mix(in srgb, var(--vscode-focusBorder) 12%, transparent);
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	width: fit-content;
+}
+.dispatch-target-badge {
+	max-width: 22em;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-weight: 600;
+	color: var(--vscode-foreground);
+}
+.dispatch-target-clear {
+	padding: 0 4px;
+	border: none;
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
+	font-size: 12px;
+	line-height: 1;
+	cursor: pointer;
+	border-radius: 4px;
+}
+.dispatch-target-clear:hover {
+	color: var(--vscode-foreground);
+	background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.15));
+}
 .user-bubble .user-text {
 	white-space: pre-wrap;
 }

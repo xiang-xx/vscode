@@ -17,7 +17,7 @@ import { ViewContainerLocation } from '../../../../common/views.js';
 import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
 import { IPaneCompositePartService } from '../../../../services/panecomposite/browser/panecomposite.js';
 import { mainWindow } from '../../../../../base/browser/window.js';
-import { IChatRouterService, ISuperAgentWorkerHandle, SuperAgentWorkerState, superAgentWorkerStateIsActive } from '../../common/superAgent/chatRouterService.js';
+import { IChatRouterService, ISuperAgentWorkerHandle, SuperAgentWorkerState } from '../../common/superAgent/chatRouterService.js';
 import { ISuperAgentPresentationQueue } from '../../common/superAgent/superAgentPresentationQueue.js';
 import { ZCODE_VIEW_CONTAINER_ID } from '../zcode/zcodeAuxiliaryBarChrome.js';
 import { registerSuperAgentActions, ZCODE_INTERNAL_SUPERAGENT_PRESENT_WORKER, ZCODE_INTERNAL_SUPERAGENT_SHOW_ROUTER, ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
@@ -136,8 +136,9 @@ export class SuperAgentChatPageContribution extends Disposable implements IWorkb
 			}
 		}
 
-		// Live badge on the pinned tab: worker count, warning tint when any
-		// worker needs the user (AwaitingUser / watchdog).
+		// Live state on the Workers chip: attention dot while any worker needs
+		// the user (AwaitingUser / watchdog); the running count only feeds the
+		// chip tooltip.
 		this._register(autorun(reader => {
 			const workers = this.routerService.workers.read(reader);
 			for (const worker of workers) {
@@ -172,7 +173,9 @@ export class SuperAgentChatPageContribution extends Disposable implements IWorkb
 		let badge = 0;
 		for (const worker of workers) {
 			const state = worker.state.get();
-			if (superAgentWorkerStateIsActive(state)) {
+			// Count only workers that are actually executing — Idle/Completed
+			// workers stay in the live list and must not inflate the number.
+			if (state === SuperAgentWorkerState.Starting || state === SuperAgentWorkerState.Running) {
 				badge++;
 			}
 			if (state === SuperAgentWorkerState.AwaitingUser || state === SuperAgentWorkerState.WatchdogTripped) {

@@ -145,10 +145,15 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 			if (!worker) {
 				return;
 			}
+			// A follow-up means this worker is live again. Failed/Cancelled are terminal
+			// states that heartbeats ignore — revive explicitly so `stateChanged` fires
+			// and the receipt + rail resync instead of staying stuck on "failed".
+			this.routerService.reviveWorker(worker.id, 'follow-up submitted');
 			void this.commandService.executeCommand('zcode.patchRouterDispatch', {
 				sessionId,
 				dispatchItemId,
 				workerId: worker.id,
+				workerSessionId,
 				badge: dispatchTitleBadge(worker.label),
 				accent: worker.accentColorId,
 				status: dispatchStatusForBind(worker.state.get()),
@@ -284,6 +289,7 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 				sessionId: opts.routerSessionId,
 				dispatchItemId: opts.dispatchItemId,
 				workerId: worker.id,
+				workerSessionId: sessionId,
 				badge: dispatchTitleBadge(worker.label),
 				accent: worker.accentColorId,
 				status: dispatchStatusForBind(worker.state.get()),

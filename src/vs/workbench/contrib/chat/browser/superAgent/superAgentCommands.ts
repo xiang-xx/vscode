@@ -48,7 +48,7 @@ export class ShowSuperAgentWorkersPageAction extends Action2 {
 	}
 
 	override run(accessor: ServicesAccessor): Promise<unknown> {
-		return accessor.get(ICommandService).executeCommand(ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS);
+		return accessor.get(ICommandService).executeCommand(ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS, true);
 	}
 }
 

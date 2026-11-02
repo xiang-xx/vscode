@@ -3,9 +3,9 @@
  *  Licensed under the MIT License.
  *--------------------------------------------------------------------------------------------*/
 
-import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
-import { $, addDisposableListener, append, isHTMLElement, prepend } from '../../../../../base/browser/dom.js';
-import { CommandsRegistry, ICommandService } from '../../../../../platform/commands/common/commands.js';
+import { Disposable } from '../../../../../base/common/lifecycle.js';
+import { $, append, isHTMLElement, prepend } from '../../../../../base/browser/dom.js';
+import { CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
@@ -21,9 +21,10 @@ export const ZCODE_CHAT_VIEW_ID = 'zcode.chatView';
 /**
  * When AI Chat owns the auxiliary bar:
  * - hide the "AI Chat" title / composite-bar label
- * - render the pinned Super Agent Workers tab (session tabs / New Chat /
+ * - render the passive Workers status chip (session tabs / New Chat /
  *   History drawer entry points are retired — everything lives in the
- *   Router + Workers page)
+ *   Router + Workers page, which is the chat surface itself and opens
+ *   automatically, so the chip is not a switch and has no click behavior)
  * - keep workbench title-actions (… / maximize / close) on the right
  */
 export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchContribution {
@@ -31,19 +32,19 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 
 	private tabsHost: HTMLElement | undefined;
 	/**
-	 * Pinned Super Agent Workers tab — the only title-row chat chrome.
+	 * Passive Workers status chip — the only title-row chat chrome.
 	 * The page itself (a layer above the chat webview) is owned by
-	 * `SuperAgentChatPageContribution`; this chrome only renders the tab and
-	 * reflects state pushed via `zcode.internal.setSuperAgentWorkersTab`.
+	 * `SuperAgentChatPageContribution`; this chrome only renders the chip and
+	 * reflects state pushed via `zcode.internal.setSuperAgentWorkersTab`:
+	 * no number bubble (per-state counts live in the strip header), just an
+	 * attention dot while some worker awaits the user.
 	 */
-	private workersTabEl: HTMLButtonElement | undefined;
+	private workersTabEl: HTMLElement | undefined;
 	private workersTab: { active: boolean; badge: number; attention: boolean; routerSession?: string; pulse?: boolean } = { active: false, badge: 0, attention: false };
-	private readonly pinnedListeners = this._register(new DisposableStore());
 
 	constructor(
 		@IPaneCompositePartService private readonly paneCompositeService: IPaneCompositePartService,
 		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
-		@ICommandService private readonly commandService: ICommandService,
 	) {
 		super();
 
@@ -102,72 +103,55 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 	}
 
 	/**
-	 * The pinned Workers tab. It lives alone in the title host — no session
-	 * tab strip, no New Chat / History chrome actions.
+	 * The Workers status chip. It lives alone in the title host — no session
+	 * tab strip, no New Chat / History chrome actions. It is *not* a button:
+	 * the Workers page is the single chat surface and opens on its own, so a
+	 * toggle here would only hide the page until the next worker event yanks
+	 * it back. The chip just labels the area and flags attention.
 	 */
 	private mountWorkersTab(): void {
 		if (!this.tabsHost) {
 			return;
 		}
-		const btn = append(this.tabsHost, $<HTMLButtonElement>('button.zcode-session-tab.zcode-tab-pinned', { type: 'button' }));
-		btn.setAttribute('role', 'tab');
-		btn.setAttribute('aria-selected', 'false');
-		btn.title = 'Super Agent Workers';
+		const chip = append(this.tabsHost, $('span.zcode-session-tab.zcode-tab-pinned'));
+		chip.setAttribute('role', 'status');
+		chip.title = 'Workers';
 
-		const icon = append(btn, $('span.zcode-tab-icon'));
+		const icon = append(chip, $('span.zcode-tab-icon'));
 		icon.classList.add(...ThemeIcon.asClassNameArray(Codicon.layers));
 
-		const label = append(btn, $('span.zcode-tab-title'));
+		const label = append(chip, $('span.zcode-tab-title'));
 		label.textContent = 'Workers';
 
-		append(btn, $('span.zcode-tab-badge'));
+		append(chip, $('span.zcode-tab-attention'));
 
-		const activate = (e: Event) => {
-			e.preventDefault();
-			e.stopPropagation();
-			(e as { stopImmediatePropagation?: () => void }).stopImmediatePropagation?.();
-			// Toggle semantics live in the page contribution, which pushes the
-			// authoritative active state back via zcode.internal.setSuperAgentWorkersTab.
-			void this.commandService.executeCommand('workbench.action.chat.superAgent.showWorkersPage');
-		};
-		this.pinnedListeners.add(addDisposableListener(btn, 'pointerdown', e => {
-			if (e.button === 0) {
-				activate(e);
-			}
-		}));
-		this.pinnedListeners.add(addDisposableListener(btn, 'click', e => {
-			e.preventDefault();
-			e.stopPropagation();
-		}));
-
-		this.workersTabEl = btn;
+		this.workersTabEl = chip;
 		this.updateWorkersTab();
 	}
 
 	private updateWorkersTab(): void {
-		const btn = this.workersTabEl;
-		if (!btn) {
+		const chip = this.workersTabEl;
+		if (!chip) {
 			return;
 		}
-		btn.classList.toggle('active', this.workersTab.active);
-		btn.setAttribute('aria-selected', this.workersTab.active ? 'true' : 'false');
-		btn.title = this.workersTab.attention ? 'Super Agent Workers — a worker needs you' : 'Super Agent Workers';
-		const badge = btn.querySelector('.zcode-tab-badge');
-		if (badge) {
-			badge.textContent = this.workersTab.badge > 0 ? String(this.workersTab.badge) : '';
-			badge.classList.toggle('hidden', this.workersTab.badge <= 0);
-			badge.classList.toggle('attention', this.workersTab.attention);
-			// One-shot attention pulse: retrigger the animation via reflow.
-			if (this.workersTab.pulse && isHTMLElement(badge)) {
-				badge.classList.remove('pulse');
-				void badge.offsetWidth;
-				badge.classList.add('pulse');
+		chip.classList.toggle('active', this.workersTab.active);
+		const running = this.workersTab.badge;
+		chip.title = this.workersTab.attention
+			? (running > 0 ? `Workers — ${running} 个任务进行中，有任务需要你处理` : 'Workers — 有任务需要你处理')
+			: (running > 0 ? `Workers — ${running} 个任务进行中` : 'Workers');
+		const dot = chip.querySelector('.zcode-tab-attention');
+		if (dot) {
+			dot.classList.toggle('hidden', !this.workersTab.attention);
+			// One-shot pulse when attention appears: retrigger via reflow.
+			if (this.workersTab.pulse && isHTMLElement(dot)) {
+				dot.classList.remove('pulse');
+				void dot.offsetWidth;
+				dot.classList.add('pulse');
 			}
 		}
 	}
 
 	private teardownChrome(): void {
-		this.pinnedListeners.clear();
 		this.tabsHost?.remove();
 		this.tabsHost = undefined;
 		this.workersTabEl = undefined;
