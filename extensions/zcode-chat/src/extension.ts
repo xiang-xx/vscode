@@ -137,6 +137,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			sessionId?: string;
 			dispatchItemId?: string;
 			workerId?: string;
+			workerSessionId?: string;
 			badge?: string;
 			accent?: string;
 			status?: string;
@@ -148,6 +149,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 				sessionId: opts.sessionId,
 				dispatchItemId: opts.dispatchItemId,
 				workerId: opts.workerId,
+				workerSessionId: typeof opts.workerSessionId === 'string' ? opts.workerSessionId : undefined,
 				badge: typeof opts.badge === 'string' ? opts.badge : undefined,
 				accent: typeof opts.accent === 'string' ? opts.accent : undefined,
 				status: isDispatchStatus(opts.status) ? opts.status : undefined,

@@ -21,11 +21,14 @@ export const ZCODE_INTERNAL_SUPERAGENT_WORKER_IDLE = 'zcode.internal.superAgent.
 export const ZCODE_INTERNAL_SUPERAGENT_WORKER_AWAITING = 'zcode.internal.superAgent.workerAwaitingUser';
 /** Fired by zcode-chat after AI title summarization for a worker session. */
 export const ZCODE_INTERNAL_SUPERAGENT_RENAME_WORKER = 'zcode.internal.superAgent.renameWorker';
+/** Fired by zcode-chat when the user force-deletes a worker card from the Router board. */
+export const ZCODE_INTERNAL_SUPERAGENT_FORCE_REMOVE_WORKER = 'zcode.internal.superAgent.forceRemoveWorker';
 
 interface IZcodeWorkerSignal {
 	readonly sessionId?: unknown;
 	readonly detail?: unknown;
 	readonly label?: unknown;
+	readonly workerId?: unknown;
 }
 
 function readSessionId(payload: unknown): string | undefined {
@@ -50,6 +53,14 @@ function readLabel(payload: unknown): string | undefined {
 	}
 	const label = (payload as IZcodeWorkerSignal).label;
 	return typeof label === 'string' && label.trim() ? label.trim() : undefined;
+}
+
+function readWorkerId(payload: unknown): string | undefined {
+	if (!payload || typeof payload !== 'object') {
+		return undefined;
+	}
+	const workerId = (payload as IZcodeWorkerSignal).workerId;
+	return typeof workerId === 'string' && workerId ? workerId : undefined;
 }
 
 /**
@@ -195,6 +206,12 @@ export class SuperAgentChatBridge extends Disposable implements IWorkbenchContri
 			const label = readLabel(payload);
 			if (worker && label) {
 				this.routerService.renameWorker(worker.id, label);
+			}
+		}));
+		this._register(CommandsRegistry.registerCommand(ZCODE_INTERNAL_SUPERAGENT_FORCE_REMOVE_WORKER, (_accessor, payload: unknown) => {
+			const workerId = readWorkerId(payload);
+			if (workerId) {
+				this.routerService.forceRemoveWorker(workerId);
 			}
 		}));
 	}

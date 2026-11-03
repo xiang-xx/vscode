@@ -44,16 +44,18 @@ function canArchiveWorker(state: SuperAgentWorkerState): boolean {
 		|| state === SuperAgentWorkerState.Cancelled;
 }
 
-/** Fixed row height used for content-hugging strip sizing (2-col grid). */
+/** Fixed row height used for content-hugging strip sizing (2-column grid). */
 const CELL_HEIGHT = 28;
 const EMPTY_HEIGHT = 48;
+/** Columns of the fixed bottom strip — matches the stylesheet's grid default. */
+const GRID_COLUMNS = 2;
 
 /**
  * The Workers hub — a fixed bottom strip with a 2-column grid of compact
  * worker cells. Design rules:
  *
  * - **Always open.** No expand/collapse; the strip hugs content height.
- * - **Two per row.** Each cell takes half the strip width.
+ * - **Two columns.** Fixed by the stylesheet; rows re-flow as workers come and go.
  * - **Status = dot + text.** No pill/chip chrome.
  * - **Focused highlights in place.** Selection lives on the cell; no dock bar.
  */
@@ -205,7 +207,7 @@ export class SuperAgentWorkersPanel extends Disposable {
 			}
 		}
 
-		const rows = ordered.length === 0 ? 1 : Math.ceil(ordered.length / 2);
+		const rows = ordered.length === 0 ? 1 : Math.ceil(ordered.length / GRID_COLUMNS);
 		this.lastDesiredHeight = ordered.length === 0 ? EMPTY_HEIGHT : rows * CELL_HEIGHT;
 		this._onDidChangeContent.fire();
 	}
@@ -235,7 +237,7 @@ export class SuperAgentWorkersPanel extends Disposable {
 			}));
 		}
 
-		const rows = history.length === 0 ? 1 : Math.ceil(history.length / 2);
+		const rows = history.length === 0 ? 1 : Math.ceil(history.length / GRID_COLUMNS);
 		this.lastDesiredHeight = history.length === 0 ? EMPTY_HEIGHT : rows * CELL_HEIGHT;
 		this._onDidChangeContent.fire();
 	}
@@ -286,7 +288,7 @@ export class SuperAgentWorkersPanel extends Disposable {
 			queuedChip.textContent = localize('queuedChip', "+{0}", queued);
 		}
 
-		// Inline decision only when the user must act — keeps the 2-col cell calm.
+		// Inline decision only when the user must act — keeps dense cells calm.
 		if (state === SuperAgentWorkerState.AwaitingUser) {
 			this.mountActionBtn(tail, localize('btn.answer', "去回答"), true, () => this.focusWorkerElement(worker));
 		} else if (state === SuperAgentWorkerState.WatchdogTripped) {
@@ -310,10 +312,16 @@ export class SuperAgentWorkersPanel extends Disposable {
 			}));
 			this.gridListeners.add(dom.addDisposableListener(closeBtn, dom.EventType.POINTER_DOWN, e => e.stopPropagation()));
 		} else {
-			closeBtn.classList.add('is-placeholder');
-			closeBtn.disabled = true;
-			closeBtn.tabIndex = -1;
-			closeBtn.setAttribute('aria-hidden', 'true');
+			// Active/stuck rows (Queued/Starting/Running/AwaitingUser/WatchdogTripped):
+			// force-delete the roster entry outright — the escape hatch for stale
+			// workers whose chat session is already gone (dirty data).
+			closeBtn.title = localize('btn.forceRemove', "强制删除该 Worker（不进历史）");
+			closeBtn.setAttribute('aria-label', localize('btn.forceRemove', "强制删除该 Worker（不进历史）"));
+			this.gridListeners.add(dom.addDisposableListener(closeBtn, dom.EventType.CLICK, e => {
+				e.stopPropagation();
+				this.routerService.forceRemoveWorker(worker.id);
+			}));
+			this.gridListeners.add(dom.addDisposableListener(closeBtn, dom.EventType.POINTER_DOWN, e => e.stopPropagation()));
 		}
 
 		this.gridListeners.add(dom.addDisposableListener(root, dom.EventType.CLICK, () => this.focusWorkerElement(worker)));
@@ -396,6 +404,7 @@ export class SuperAgentWorkersPanel extends Disposable {
 			new Separator(),
 			new Action('superAgent.cancel', localize('action.cancel', "取消任务"), undefined, isActive && !canArchive, () => { this.routerService.cancelWorker(worker.id, 'cancelled from workers hub'); return Promise.resolve(); }),
 			new Action('superAgent.remove', localize('action.remove', "关闭并归档到历史"), undefined, canArchive, () => { this.routerService.removeWorker(worker.id); return Promise.resolve(); }),
+			new Action('superAgent.forceRemove', localize('action.forceRemove', "强制删除（不进历史）"), undefined, true, () => { this.routerService.forceRemoveWorker(worker.id); return Promise.resolve(); }),
 		];
 		this.contextMenuService.showContextMenu({
 			getAnchor: () => anchor,

@@ -42,6 +42,21 @@
 	const brainCursor = document.getElementById('brainCursor');
 	const hintEl = document.getElementById('hint');
 	const scheduleTipEl = document.getElementById('scheduleTip');
+	// Footer: brain switch sits left, status hint (ZCode · root · model · …) right on the same row.
+	// Set via CSSOM (CSP blocks inline <style>; chatView.css is being edited in parallel — fold into it later).
+	if (brainZcode && hintEl) {
+		const brainBar = brainZcode.closest('.brain-bar');
+		if (brainBar) {
+			brainBar.style.justifyContent = 'space-between';
+			brainBar.style.gap = '8px';
+		}
+		hintEl.style.flex = '1';
+		hintEl.style.minWidth = '0';
+		hintEl.style.textAlign = 'right';
+		hintEl.style.whiteSpace = 'nowrap';
+		hintEl.style.overflow = 'hidden';
+		hintEl.style.textOverflow = 'ellipsis';
+	}
 	const plusMenu = document.getElementById('plusMenu');
 	const pickerMenu = document.getElementById('pickerMenu');
 	const composer = document.getElementById('composer');
@@ -1533,6 +1548,8 @@
 		} else if (badgeEl) {
 			badgeEl.remove();
 		}
+		syncDispatchPendingReply(el, item);
+		syncDispatchResultBlocks(el, item);
 		return true;
 	}
 
@@ -1965,14 +1982,16 @@
 
 	/** Dispatch results the user expanded (item ids); survives rebuilds. */
 	const expandedDispatchResults = new Set();
+	/** Older follow-up turns the user expanded on the Router board; survives rebuilds. */
+	const expandedWorkerHistory = new Set(); // legacy: kept for state restore, no longer toggled
 
-	function renderDispatchCard(item, mark) {
-		// Same right-aligned bubble shape as a user turn — Router is still a
-		// chat transcript; the Workers strip is the task board. Clicking the
-		// bubble binds the composer to this worker for follow-ups; the ↗ button
-		// still jumps into the worker stream.
+	function renderDispatchCard(item, mark, opts) {
+		// Exchange frame: my prompt + worker reply. On the Router board this sits
+		// inside a Worker card's follow-up chain; elsewhere it remains a turn.
+		// Click selects the worker as composer target unless skipClick (board
+		// handles selection on the card). ↗ still opens the worker stream.
 		const row = mark(document.createElement('div'), item.id);
-		syncDispatchRowChrome(row, item, true);
+		syncDispatchRowChrome(row, item, !(opts && opts.skipClick));
 		const bubble = document.createElement('div');
 		bubble.className = 'dispatch-bubble';
 		const text = document.createElement('div');
@@ -1996,6 +2015,7 @@
 		}
 		row.appendChild(bubble);
 		row.appendChild(meta);
+		syncDispatchPendingReply(row, item);
 		if (item.resultText) {
 			row.appendChild(renderDispatchResult(item));
 		}
@@ -2005,12 +2025,165 @@
 		return row;
 	}
 
+	/** Reply slot copy while a dispatched turn is still in flight. */
+	function dispatchPendingReplyText(item) {
+		if (item.status === 'queued') {
+			return '已排队，等当前任务完成后执行';
+		}
+		if (item.status === 'awaiting') {
+			return 'Worker 正在等你输入…';
+		}
+		if (item.status === 'stalled') {
+			return 'Worker 疑似卡死，可到 Workers 列表处理';
+		}
+		return 'Worker 正在回复…';
+	}
+
+	function dispatchWantsPendingReply(item) {
+		if (item.resultText) {
+			return false;
+		}
+		switch (item.status) {
+			case 'pending':
+			case 'queued':
+			case 'starting':
+			case 'running':
+			case 'awaiting':
+			case 'stalled':
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Keeps the "waiting for reply" slot in sync (build + in-place patch):
+	 * present exactly while the turn is live and no reply has landed yet.
+	 */
+	/**
+	 * Ephemeral live-output preview for a running worker, rendered inside its
+	 * newest running frame on the Router page: last few lines only, muted
+	 * monospace, replaced by the final reply when the turn completes.
+	 */
+	function applyDispatchLive(sessionId, text) {
+		if (!state || !state.items) {
+			return;
+		}
+		const runningIds = new Set();
+		for (const item of state.items) {
+			if (item && item.kind === 'dispatch' && item.workerSessionId === sessionId && item.status === 'running') {
+				runningIds.add(item.id);
+			}
+		}
+		if (!runningIds.size) {
+			return;
+		}
+		for (const row of document.querySelectorAll('.dispatch-row.exchange')) {
+			if (!runningIds.has(row.dataset.itemId)) {
+				continue;
+			}
+			let live = row.querySelector(':scope > .dispatch-live');
+			if (!text) {
+				if (live) {
+					live.remove();
+				}
+				continue;
+			}
+			if (!live) {
+				live = document.createElement('div');
+				live.className = 'dispatch-live';
+				const pending = row.querySelector(':scope > .dispatch-result.pending');
+				const result = row.querySelector(':scope > .dispatch-result:not(.pending)');
+				const files = row.querySelector(':scope > .dispatch-files');
+				const meta = row.querySelector(':scope > .dispatch-meta');
+				row.insertBefore(live, pending || result || files || (meta ? meta.nextSibling : null));
+			}
+			if (live.dataset.key !== text) {
+				live.dataset.key = text;
+				live.textContent = text;
+			}
+		}
+	}
+	function syncDispatchPendingReply(row, item) {
+		let pending = row.querySelector(':scope > .dispatch-result.pending');
+		const label = dispatchWantsPendingReply(item) ? dispatchPendingReplyText(item) : '';
+		if (!label) {
+			if (pending) {
+				pending.remove();
+			}
+			return;
+		}
+		if (!pending) {
+			pending = document.createElement('div');
+			pending.className = 'dispatch-result pending';
+			const body = document.createElement('div');
+			body.className = 'dispatch-result-body rendered-markdown';
+			pending.appendChild(body);
+			const meta = row.querySelector(':scope > .dispatch-meta');
+			row.insertBefore(pending, meta ? meta.nextSibling : null);
+		}
+		const body = pending.querySelector('.dispatch-result-body');
+		if (body.textContent !== label) {
+			body.textContent = label;
+		}
+	}
+
+	/**
+	 * In-place reconcile for the mirrored reply / working-set blocks — the
+	 * Router log receives resultText asynchronously (turn finish), so the
+	 * patch path must be able to add these elements, not just update them.
+	 */
+	function syncDispatchResultBlocks(row, item) {
+		const resultKey = item.resultText ? item.resultText : '';
+		if (resultKey) {
+			const staleLive = row.querySelector(':scope > .dispatch-live');
+			if (staleLive) {
+				staleLive.remove();
+			}
+		}
+		let resultEl = row.querySelector(':scope > .dispatch-result:not(.pending)');
+		if (!resultKey) {
+			if (resultEl) {
+				resultEl.remove();
+			}
+		} else if (!resultEl || resultEl.dataset.key !== resultKey) {
+			const fresh = renderDispatchResult(item);
+			fresh.dataset.key = resultKey;
+			if (resultEl) {
+				row.replaceChild(fresh, resultEl);
+			} else {
+				const files = row.querySelector(':scope > .dispatch-files');
+				row.insertBefore(fresh, files || null);
+			}
+		}
+		const filesKey = item.files && item.files.length ? JSON.stringify(item.files) : '';
+		let filesEl = row.querySelector(':scope > .dispatch-files');
+		if (!filesKey) {
+			if (filesEl) {
+				filesEl.remove();
+			}
+		} else if (!filesEl || filesEl.dataset.key !== filesKey) {
+			const fresh = renderDispatchFiles(item);
+			fresh.dataset.key = filesKey;
+			if (filesEl) {
+				row.replaceChild(fresh, filesEl);
+			} else {
+				row.appendChild(fresh);
+			}
+		}
+	}
+
 	/** Click/tooltip/selected styling shared by build and in-place patch. */
 	function syncDispatchRowChrome(row, item, attach) {
 		const wantClickable = !!item.workerId;
 		const selected = !!(state && state.dispatchTarget && item.workerSessionId
 			&& state.dispatchTarget.workerSessionId === item.workerSessionId);
-		const nextClass = 'dispatch-row' + (wantClickable ? ' clickable' : '') + (selected ? ' selected' : '');
+		// Bound exchanges (follow-ups + dispatched tasks) render as one framed
+		// box: my message on top, the worker's reply right below.
+		const nextClass = 'dispatch-row'
+			+ (item.workerSessionId ? ' exchange' : '')
+			+ (wantClickable ? ' clickable' : '')
+			+ (selected ? ' selected' : '');
 		if (row.className !== nextClass) {
 			row.className = nextClass;
 		}
@@ -2055,7 +2228,7 @@
 		const wrap = document.createElement('div');
 		wrap.className = 'dispatch-result';
 		const body = document.createElement('div');
-		body.className = 'dispatch-result-body';
+		body.className = 'dispatch-result-body rendered-markdown';
 		body.innerHTML = renderMarkdown(item.resultText || '');
 		wrap.appendChild(body);
 		const long = (item.resultText || '').length > 260;
@@ -2105,6 +2278,804 @@
 		}
 		box.appendChild(list);
 		return box;
+	}
+
+	// ── Router homepage board (task board + per-worker follow-up chain) ──
+
+	// One flat Workers panel: no 进行中/已完成/需要你 split, no re-ordering.
+	// Every worker card stays exactly where it was first dispatched — cards
+	// never jump between (or inside) sections when their status changes.
+	const BOARD_SECTIONS = [
+		{ id: 'all', title: 'Workers' },
+	];
+
+	function resolveAccentCss(accent) {
+		if (!accent || typeof accent !== 'string') {
+			return '';
+		}
+		if (accent.startsWith('#') || accent.startsWith('rgb') || accent.startsWith('hsl') || accent.startsWith('var(')) {
+			return accent;
+		}
+		return `var(--vscode-${accent.replace(/\./g, '-')})`;
+	}
+
+	function workerKeyForDispatch(item) {
+		if (item.workerSessionId) {
+			return 's:' + item.workerSessionId;
+		}
+		if (item.workerId) {
+			return 'w:' + item.workerId;
+		}
+		return 't:' + item.id;
+	}
+
+	/**
+	 * Flatten Router items into Worker groups.
+	 * Grouping is render-only (workerSessionId → workerId → item id).
+	 */
+	function buildRouterBoardModel(items) {
+		const groups = new Map();
+		let order = 0;
+		for (const item of items || []) {
+			if (!item || !item.id) {
+				continue;
+			}
+			if (item.kind !== 'dispatch') {
+				continue;
+			}
+			const key = workerKeyForDispatch(item);
+			let group = groups.get(key);
+			if (!group) {
+				group = {
+					workerKey: key,
+					workerId: item.workerId,
+					workerSessionId: item.workerSessionId,
+					badge: item.badge,
+					accent: item.accent,
+					turns: [],
+					_order: order++,
+				};
+				groups.set(key, group);
+			} else {
+				if (item.workerId) {
+					group.workerId = item.workerId;
+				}
+				if (item.workerSessionId) {
+					group.workerSessionId = item.workerSessionId;
+				}
+				if (item.badge) {
+					group.badge = item.badge;
+				}
+				if (item.accent) {
+					group.accent = item.accent;
+				}
+			}
+			group.turns.push(item);
+		}
+		const sections = { all: Array.from(groups.values()) };
+		// Stable creation order: new workers append at the bottom, existing
+		// cards never move — even when their status flips running → done.
+		sections.all.sort((a, b) => a._order - b._order);
+		return { sections };
+	}
+
+	function syncFollowupHistoryStrip(strip, group, olderCount) {
+		strip.textContent = `查看全部历史 · 共 ${olderCount + 1} 条派发 →`;
+		strip.setAttribute('aria-label', '打开该 Worker 详情页查看完整聊天流');
+	}
+
+	function createFollowupHistoryStrip(group) {
+		const strip = document.createElement('button');
+		strip.type = 'button';
+		strip.className = 'followup-turn-summary followup-history';
+		strip.title = '打开该 Worker 详情页，查看完整聊天流';
+		strip.addEventListener('click', (e) => {
+			e.stopPropagation();
+			if (!group.workerId) {
+				return;
+			}
+			const card = strip.closest('.worker-card');
+			if (card && card._boardGroup) {
+				markBoardWorkerRead(group, card);
+			}
+			vscode.postMessage({ type: 'openDispatch', workerId: group.workerId });
+		});
+		return strip;
+	}
+
+	function bindWorkerCardSelect(card) {
+		if (card._boardSelectBound) {
+			return;
+		}
+		card._boardSelectBound = true;
+		card.addEventListener('click', (e) => {
+			const group = card._boardGroup;
+			if (!group) {
+				return;
+			}
+			if (e.target.closest('.dispatch-open, .dispatch-result, .dispatch-files, .followup-history, .dispatch-result-toggle, .worker-card-remove')) {
+				return;
+			}
+			const sessionId = group.workerSessionId;
+			if (!sessionId || !group.workerId) {
+				return;
+			}
+			const nowSelected = !(state && state.dispatchTarget && state.dispatchTarget.workerSessionId === sessionId);
+			vscode.postMessage({
+				type: 'setDispatchTarget',
+				target: nowSelected ? {
+					workerId: group.workerId,
+					workerSessionId: sessionId,
+					badge: group.badge,
+					accent: group.accent,
+				} : null,
+			});
+			markBoardWorkerRead(group, card);
+		});
+	}
+
+	function createWorkerRemoveButton(group) {
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = 'worker-card-remove';
+		btn.textContent = '✕';
+		btn.title = '删除该 Worker（强制移除，不进历史）';
+		btn.setAttribute('aria-label', '删除该 Worker');
+		btn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			e.preventDefault();
+			if (!group.workerId) {
+				return;
+			}
+			vscode.postMessage({
+				type: 'removeWorkerCard',
+				workerId: group.workerId,
+				workerSessionId: group.workerSessionId || '',
+			});
+		});
+		return btn;
+	}
+
+	// 状态 → 颜色语义（颜色表达状态，不再表达 Worker 身份）。
+	// 进行中/启动中/处理中 → 蓝；需要你输入 → 黄；已完成 → 绿（文字弱化）；失败 → 红；
+	// 其余（排队中/已取消/疑似卡死/无状态）回退原身份色。
+	function workerStatusAccent(item) {
+		if (!item || !item.status) {
+			return '';
+		}
+		switch (item.status) {
+			case 'starting':
+			case 'running':
+			case 'pending':
+				return 'var(--vscode-charts-blue)';
+			case 'awaiting':
+				return 'var(--vscode-charts-yellow)';
+			case 'done':
+				return 'var(--vscode-charts-green)';
+			case 'failed':
+				return 'var(--vscode-charts-red, var(--vscode-errorForeground))';
+			default:
+				return '';
+		}
+	}
+
+	function workerStatusFg(item) {
+		const accent = workerStatusAccent(item);
+		if (!accent) {
+			return '';
+		}
+		if (item.status === 'done') {
+			return 'color-mix(in srgb, var(--vscode-charts-green) 65%, transparent)';
+		}
+		if (item.status === 'failed') {
+			return 'var(--vscode-errorForeground)';
+		}
+		return accent;
+	}
+
+	// 已读标记：已完成的 Worker 卡片被看过后整体置灰，不再抢视线。
+	// 看过 = 任意入口进入过该 Worker 的详情页（点卡片/Tab/⌘] 快捷键/派发呈现），
+	// 以 state.sessionId === workerSessionId 判定，状态文案同时回落为「空闲」。
+	let boardReadWorkers = new Set();
+	let boardReadLoaded = false;
+
+	function loadBoardReadWorkers() {
+		if (boardReadLoaded) {
+			return;
+		}
+		boardReadLoaded = true;
+		try {
+			const saved = vscode.getState() || {};
+			const list = Array.isArray(saved.boardReadWorkers) ? saved.boardReadWorkers : [];
+			boardReadWorkers = new Set(list.filter((k) => typeof k === 'string'));
+		} catch (err) {
+			boardReadWorkers = new Set();
+		}
+	}
+
+	function persistBoardReadWorkers() {
+		try {
+			const saved = vscode.getState() || {};
+			saved.boardReadWorkers = Array.from(boardReadWorkers);
+			vscode.setState(saved);
+		} catch (err) {
+			// webview state 不可用时静默放弃持久化。
+		}
+	}
+
+	function markBoardWorkerRead(group, card) {
+		if (!group || !group.workerKey) {
+			return;
+		}
+		const latest = group.turns && group.turns[group.turns.length - 1];
+		if (!latest || latest.status !== 'done') {
+			return;
+		}
+		loadBoardReadWorkers();
+		if (boardReadWorkers.has(group.workerKey)) {
+			return;
+		}
+		boardReadWorkers.add(group.workerKey);
+		persistBoardReadWorkers();
+		if (card) {
+			reconcileWorkerCard(card, group);
+		}
+	}
+
+	function syncWorkerCardChrome(card, group) {
+		const latest = group.turns[group.turns.length - 1];
+		loadBoardReadWorkers();
+		const doneStatus = !!(latest && latest.status === 'done');
+		// 详情视图正展示这个 Worker（无论从哪个入口进来的）→ 视为已读。
+		const viewing = !!(group.workerSessionId && state && state.sessionId === group.workerSessionId);
+		if (doneStatus && viewing && !boardReadWorkers.has(group.workerKey)) {
+			boardReadWorkers.add(group.workerKey);
+			persistBoardReadWorkers();
+		}
+		const read = doneStatus && boardReadWorkers.has(group.workerKey);
+		// 该 Worker 又跑了新一轮：撤销已读标记，等完成后再用颜色提示一次。
+		if (!doneStatus && boardReadWorkers.has(group.workerKey)) {
+			boardReadWorkers.delete(group.workerKey);
+			persistBoardReadWorkers();
+		}
+		const selected = !!(state && state.dispatchTarget && group.workerSessionId
+			&& state.dispatchTarget.workerSessionId === group.workerSessionId);
+		const nextClass = 'worker-card'
+			+ (selected ? ' selected' : '')
+			+ (group.workerId ? ' clickable' : '')
+			+ (read ? ' read' : '');
+		if (card.className !== nextClass) {
+			card.className = nextClass;
+		}
+		card.dataset.workerKey = group.workerKey;
+		if (group.workerSessionId) {
+			card.dataset.workerSessionId = group.workerSessionId;
+		} else {
+			delete card.dataset.workerSessionId;
+		}
+		if (group.workerId) {
+			card.dataset.workerId = group.workerId;
+		} else {
+			delete card.dataset.workerId;
+		}
+		const statusAccent = read
+			? 'color-mix(in srgb, var(--vscode-foreground) 32%, transparent)'
+			: workerStatusAccent(latest);
+		const accentCss = statusAccent || resolveAccentCss(group.accent);
+		if (accentCss) {
+			card.style.setProperty('--worker-accent', accentCss);
+		} else {
+			card.style.removeProperty('--worker-accent');
+		}
+		const statusFg = read
+			? 'color-mix(in srgb, var(--vscode-foreground) 58%, transparent)'
+			: workerStatusFg(latest);
+		if (statusFg) {
+			card.style.setProperty('--worker-status-fg', statusFg);
+		} else {
+			card.style.removeProperty('--worker-status-fg');
+		}
+		card.title = group.workerId
+			? (selected ? '已选中：输入框内容将派发给该 Worker（点击取消）' : '点击选中：输入框内容将派发给该 Worker')
+				+ (read ? ' · 已看过' : '')
+			: '';
+
+		const titleEl = card.querySelector(':scope > .worker-card-head .worker-card-title');
+		const statusEl = card.querySelector(':scope > .worker-card-head .worker-card-status');
+		const removeBtn = card.querySelector(':scope > .worker-card-head .worker-card-remove');
+		const title = group.badge || 'Worker';
+		if (titleEl && titleEl.textContent !== title) {
+			titleEl.textContent = title;
+			titleEl.title = title;
+		}
+		const statusText = latest ? (read && doneStatus ? '空闲' : dispatchStatusText(latest)) : '';
+		if (statusEl && statusEl.textContent !== statusText) {
+			statusEl.textContent = statusText;
+		}
+		if (group.workerId && !removeBtn) {
+			const head = card.querySelector(':scope > .worker-card-head');
+			if (head) {
+				head.appendChild(createWorkerRemoveButton(group));
+			}
+		} else if (!group.workerId && removeBtn) {
+			removeBtn.remove();
+		}
+	}
+
+	function ensureFollowupTurnBody(wrap, item) {
+		let body = wrap.querySelector(':scope > .followup-turn-body');
+		if (!body) {
+			body = document.createElement('div');
+			body.className = 'followup-turn-body';
+			wrap.appendChild(body);
+		}
+		let row = body.querySelector(':scope > .dispatch-row');
+		if (!row) {
+			const mark = (el, id) => {
+				el.setAttribute('data-item-id', id);
+				return el;
+			};
+			row = renderDispatchCard(item, mark, { skipClick: true });
+			body.replaceChildren(row);
+		} else if (!patchDispatchRow(row, item)) {
+			const mark = (el, id) => {
+				el.setAttribute('data-item-id', id);
+				return el;
+			};
+			const fresh = renderDispatchCard(item, mark, { skipClick: true });
+			row.replaceWith(fresh);
+		}
+		return body;
+	}
+
+	function renderFollowupTurn(item, index) {
+		const wrap = document.createElement('div');
+		wrap.className = 'followup-turn expanded';
+		wrap.dataset.itemId = item.id;
+		wrap.dataset.turnIndex = String(index);
+		ensureFollowupTurnBody(wrap, item);
+		return wrap;
+	}
+
+	// One chain per Worker card: only the latest turn is visible inline; the
+	// older ones live in the worker detail page ("查看全部历史" jumps there).
+	function syncFollowupChain(chain, group) {
+		const total = group.turns.length;
+		const showOlder = false;
+
+		let strip = chain.querySelector(':scope > .followup-history');
+		if (total > 1 && !strip) {
+			strip = createFollowupHistoryStrip(group);
+			chain.insertBefore(strip, chain.firstChild);
+		} else if (total <= 1 && strip) {
+			strip.remove();
+			strip = null;
+		}
+		if (strip) {
+			syncFollowupHistoryStrip(strip, group, total - 1);
+		}
+
+		const byId = new Map();
+		chain.querySelectorAll(':scope > .followup-turn[data-item-id]').forEach((el) => {
+			const id = el.getAttribute('data-item-id');
+			if (id) {
+				byId.set(id, el);
+			}
+		});
+
+		let prev = null;
+		const placed = new Set();
+		group.turns.forEach((item, index) => {
+			if (index !== total - 1 && !showOlder) {
+				return;
+			}
+			let wrap = byId.get(item.id);
+			if (!wrap) {
+				wrap = renderFollowupTurn(item, index);
+				byId.set(item.id, wrap);
+			} else {
+				wrap.dataset.turnIndex = String(index);
+				ensureFollowupTurnBody(wrap, item);
+			}
+			if (prev) {
+				if (prev.nextElementSibling !== wrap) {
+					prev.after(wrap);
+				}
+			} else {
+				const anchor = strip || chain.firstElementChild;
+				if (anchor !== wrap) {
+					chain.insertBefore(wrap, anchor);
+				}
+			}
+			prev = wrap;
+			placed.add(item.id);
+		});
+		byId.forEach((el, id) => {
+			if (!placed.has(id)) {
+				el.remove();
+			}
+		});
+	}
+
+	function createWorkerCard(group) {
+		const card = document.createElement('article');
+		card.className = 'worker-card';
+		card._boardGroup = group;
+		const head = document.createElement('header');
+		head.className = 'worker-card-head';
+		const accent = document.createElement('span');
+		accent.className = 'worker-card-accent';
+		accent.setAttribute('aria-hidden', 'true');
+		const title = document.createElement('span');
+		title.className = 'worker-card-title';
+		const status = document.createElement('span');
+		status.className = 'worker-card-status';
+		head.append(accent, title, status);
+		const chain = document.createElement('div');
+		chain.className = 'followup-chain';
+		card.append(head, chain);
+		bindWorkerCardSelect(card);
+		syncWorkerCardChrome(card, group);
+		syncFollowupChain(chain, group);
+		return card;
+	}
+
+	function reconcileWorkerCard(card, group) {
+		card._boardGroup = group;
+		bindWorkerCardSelect(card);
+		syncWorkerCardChrome(card, group);
+		const chain = card.querySelector(':scope > .followup-chain');
+		if (!chain) {
+			return false;
+		}
+		syncFollowupChain(chain, group);
+		return true;
+	}
+
+	function createBoardSection(sectionId, title) {
+		const section = document.createElement('section');
+		section.className = 'board-section';
+		section.dataset.section = sectionId;
+		const heading = document.createElement('div');
+		heading.className = 'board-section-title';
+		heading.innerHTML = `<span class="label"></span><span class="count"></span>`;
+		heading.querySelector('.label').textContent = title;
+		const cards = document.createElement('div');
+		cards.className = 'board-section-cards';
+		section.append(heading, cards);
+		return section;
+	}
+
+	function syncBoardSection(section, title, groups) {
+		const countEl = section.querySelector(':scope > .board-section-title .count');
+		const labelEl = section.querySelector(':scope > .board-section-title .label');
+		if (labelEl && labelEl.textContent !== title) {
+			labelEl.textContent = title;
+		}
+		if (countEl) {
+			const next = String(groups.length);
+			if (countEl.textContent !== next) {
+				countEl.textContent = next;
+			}
+		}
+		section.hidden = groups.length === 0;
+		const host = section.querySelector(':scope > .board-section-cards');
+		if (!host) {
+			return;
+		}
+		const byKey = new Map();
+		// 卡片可能被 applyBoardColumns 挪进列容器里，所以用后代选择器收集并按 key 去重。
+		host.querySelectorAll('.worker-card[data-worker-key]').forEach((el) => {
+			const key = el.getAttribute('data-worker-key');
+			if (key && !byKey.has(key)) {
+				byKey.set(key, el);
+			}
+		});
+		const placed = new Set();
+		for (const group of groups) {
+			let card = byKey.get(group.workerKey);
+			if (!card) {
+				card = createWorkerCard(group);
+				byKey.set(group.workerKey, card);
+			} else if (!reconcileWorkerCard(card, group)) {
+				const fresh = createWorkerCard(group);
+				card.replaceWith(fresh);
+				card = fresh;
+				byKey.set(group.workerKey, card);
+			}
+			// 先平铺挂回 host；列容器由 applyBoardColumns 统一重建。
+			host.appendChild(card);
+			placed.add(group.workerKey);
+		}
+		byKey.forEach((el, key) => {
+			if (!placed.has(key)) {
+				el.remove();
+			}
+		});
+		// 权威顺序：瀑布流按这个顺序轮流分发到各列。
+		host._orderedKeys = groups.map((group) => group.workerKey);
+		const board = section.parentElement;
+		if (board) {
+			ensureBoardColumnsControl(board);
+			updateBoardEdgeBreakout(board);
+			applyBoardColumns(board);
+		}
+	}
+
+	// --- Board multi-column layout (wide windows) ------------------------------
+	const BOARD_COLUMNS_ORDER = ['auto', '1', '2', '3', '4'];
+	// 卡片最小宽度对齐详情页内容宽（--chat-content-max-width: 820px），宽屏下每张卡都有接近详情页的阅读宽度。
+	const BOARD_CARD_MIN_WIDTH = 800;
+	const BOARD_MAX_AUTO_COLUMNS = 4;
+	let boardColumnsSetting;
+	let boardColumnsSettingLoaded = false;
+
+	function boardStateApi() {
+		return (typeof vscode !== 'undefined' && vscode && typeof vscode.getState === 'function') ? vscode : null;
+	}
+
+	function loadBoardColumnsSetting() {
+		if (boardColumnsSettingLoaded) {
+			return boardColumnsSetting;
+		}
+		boardColumnsSettingLoaded = true;
+		let saved = null;
+		try {
+			const api = boardStateApi();
+			saved = (api && api.getState()) || null;
+		} catch (err) {
+			saved = null;
+		}
+		const raw = saved ? String(saved.boardColumns || '') : '';
+		boardColumnsSetting = BOARD_COLUMNS_ORDER.indexOf(raw) >= 0 ? raw : 'auto';
+		return boardColumnsSetting;
+	}
+
+	function persistBoardColumnsSetting() {
+		try {
+			const api = boardStateApi();
+			if (api && typeof api.setState === 'function') {
+				api.setState(Object.assign({}, api.getState() || {}, { boardColumns: boardColumnsSetting }));
+			}
+		} catch (err) {
+			// Persistence is best-effort; layout still works this session.
+		}
+	}
+
+	function autoBoardColumnsFor(board) {
+		const width = (board && board.clientWidth) || 0;
+		const cols = Math.floor(width / BOARD_CARD_MIN_WIDTH);
+		return Math.max(1, Math.min(BOARD_MAX_AUTO_COLUMNS, cols));
+	}
+
+	function updateBoardColumnsButton(board, effectiveCols) {
+		const btn = board && board.querySelector(':scope > .board-columns-control');
+		if (!btn) {
+			return;
+		}
+		btn.textContent = boardColumnsSetting === 'auto'
+			? `列数：自动（当前 ${effectiveCols}）`
+			: `列数：${boardColumnsSetting}`;
+		btn.title = '宽屏时把首页任务卡片排成多列，单张卡宽约 800px（接近详情页阅读宽度）。点击切换：自动 → 1 → 2 → 3 → 4 列';
+	}
+
+	// Wide windows: chat turns stay centered at --chat-content-max-width, but the
+	// task board breaks out of those side gutters and spans the whole panel
+	// (minus an 8px inset) so cards can tile the full width — that is the
+	// whole point of going fullscreen. Measure the real scroller box and set an
+	// explicit inline width: negative margins alone are cancelled by width:100%
+	// rules (the board then just slides left, narrower). The width is capped at
+	// the scroller's client width and .timeline pins overflow-x:hidden, so the
+	// page can never scroll sideways — the board maxes out at the panel width.
+	function updateBoardEdgeBreakout(board) {
+		if (!board) {
+			return;
+		}
+		const host = board.closest('.timeline') || board.parentElement;
+		if (!host) {
+			return;
+		}
+		const inset = 8;
+		let cap = 820;
+		try {
+			const raw = getComputedStyle(host).getPropertyValue('--chat-content-max-width').trim();
+			const parsed = parseFloat(raw);
+			if (parsed > 0) {
+				cap = parsed;
+			}
+		} catch (err) {
+			// Fall back to the stylesheet default.
+		}
+		const hostW = host.clientWidth;
+		if (hostW - cap < inset * 2 + 24) {
+			// Narrow panel: stay inside the normal centered column.
+			board.style.removeProperty('width');
+			board.style.removeProperty('max-width');
+			board.style.removeProperty('margin-inline');
+			board.style.removeProperty('box-sizing');
+			return;
+		}
+		let padL = 0;
+		try {
+			padL = Math.max(0, parseFloat(getComputedStyle(host).paddingLeft) || 0);
+		} catch (err) {
+			padL = 0;
+		}
+		// Hard cap: the board's outer width can never exceed the scroller's own
+		// client width (page width minus its vertical scrollbar), so together
+		// with .timeline{overflow-x:hidden} there is nothing to scroll sideways.
+		board.style.boxSizing = 'border-box';
+		board.style.width = `${Math.floor(hostW - inset * 2)}px`;
+		board.style.maxWidth = 'none';
+		board.style.marginInline = `${(inset - padL).toFixed(1)}px 0px`;
+	}
+
+	function applyBoardColumns(board) {
+		if (!board) {
+			return;
+		}
+		loadBoardColumnsSetting();
+		const effective = boardColumnsSetting === 'auto'
+			? autoBoardColumnsFor(board)
+			: parseInt(boardColumnsSetting, 10);
+		const gap = 8;
+		const availW = board.clientWidth;
+		board.querySelectorAll('.board-section-cards').forEach((host) => {
+			const section = host.closest('.board-section');
+			// 收集现有卡片（可能还在旧列容器里），按权威顺序排好。
+			const byKey = new Map();
+			host.querySelectorAll('.worker-card[data-worker-key]').forEach((el) => {
+				const key = el.getAttribute('data-worker-key');
+				if (key && !byKey.has(key)) {
+					byKey.set(key, el);
+				}
+			});
+			const keys = [];
+			const known = Array.isArray(host._orderedKeys) ? host._orderedKeys : [];
+			for (const key of known) {
+				if (byKey.has(key)) {
+					keys.push(key);
+				}
+			}
+			byKey.forEach((el, key) => {
+				if (keys.indexOf(key) < 0) {
+					keys.push(key);
+				}
+			});
+			host._orderedKeys = keys;
+			const cards = keys.map((key) => byKey.get(key));
+			const cardCount = cards.length;
+			// 固定列宽（≤800px）+ 整组居中；卡片数不足时按实际数量收缩列数。
+			const effCols = Math.max(1, Math.min(effective, cardCount || 1));
+			const trackW = Math.min(BOARD_CARD_MIN_WIDTH, Math.floor((availW - (effCols - 1) * gap) / effCols));
+			// Feed/瀑布流：清掉旧的列容器和散卡，重建 N 个独立竖排列，第 i 张
+			// 卡进第 i%N 列。每列内部自己往下堆，任何一张长卡只会把它自己那一
+			// 列往下顶，不再像行式网格那样把下一行整行一起挤下去。
+			Array.from(host.children).forEach((child) => child.remove());
+			const colEls = [];
+			for (let c = 0; c < effCols; c++) {
+				const col = document.createElement('div');
+				col.className = 'board-col';
+				col.style.display = 'flex';
+				col.style.flexDirection = 'column';
+				col.style.gap = `${gap}px`;
+				col.style.width = `${trackW}px`;
+				col.style.minWidth = `${trackW}px`;
+				col.style.flex = '0 0 auto';
+				host.appendChild(col);
+				colEls.push(col);
+			}
+			cards.forEach((card, i) => {
+				colEls[i % effCols].appendChild(card);
+			});
+			const groupW = effCols * trackW + (effCols - 1) * gap;
+			host.dataset.cols = String(effCols);
+			host.style.setProperty('--board-cols', String(effCols));
+			host.style.display = 'flex';
+			host.style.justifyContent = 'center';
+			host.style.alignItems = 'flex-start';
+			host.style.gap = `${gap}px`;
+			host.style.removeProperty('grid-template-columns');
+			const title = section && section.querySelector(':scope > .board-section-title');
+			if (title) {
+				title.style.width = `${groupW}px`;
+				title.style.marginInline = 'auto';
+			}
+		});
+		updateBoardColumnsButton(board, effective);
+	}
+
+	function ensureBoardColumnsControl(board) {
+		if (!board) {
+			return;
+		}
+		if (!board._boardColumnsRO) {
+			board._boardColumnsRO = new ResizeObserver(() => {
+				updateBoardEdgeBreakout(board);
+				if (boardColumnsSetting === 'auto') {
+					applyBoardColumns(board);
+				}
+			});
+			board._boardColumnsRO.observe(board);
+			// Watch the scroller too: panel resizes must re-run the breakout even
+			// when the board's own size has not changed yet.
+			const host = board.closest('.timeline') || board.parentElement;
+			if (host) {
+				board._boardColumnsRO.observe(host);
+			}
+		}
+		if (board.querySelector(':scope > .board-columns-control')) {
+			return;
+		}
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = 'board-columns-control';
+		btn.textContent = '列数：自动';
+		btn.title = '宽屏时把首页任务卡片排成多列（Feed 瀑布流，每列独立竖排）。点击切换：自动 → 1 → 2 → 3 → 4 列';
+		btn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			loadBoardColumnsSetting();
+			const idx = BOARD_COLUMNS_ORDER.indexOf(String(boardColumnsSetting));
+			boardColumnsSetting = BOARD_COLUMNS_ORDER[(idx + 1) % BOARD_COLUMNS_ORDER.length];
+			persistBoardColumnsSetting();
+			applyBoardColumns(board);
+		});
+		board.prepend(btn);
+	}
+
+	function ensureRouterBoard() {
+		let board = timelineEl.querySelector(':scope > .router-board');
+		if (board) {
+			return board;
+		}
+		timelineEl.replaceChildren();
+		board = document.createElement('div');
+		board.className = 'router-board';
+		for (const spec of BOARD_SECTIONS) {
+			board.appendChild(createBoardSection(spec.id, spec.title));
+		}
+		timelineEl.appendChild(board);
+		return board;
+	}
+
+	function reconcileRouterBoard(items) {
+		if (!items || !items.length) {
+			return false;
+		}
+		timelineEl.querySelectorAll(':scope > .empty').forEach((el) => el.remove());
+		// Drop leftover transcript turns when switching into board mode.
+		timelineEl.querySelectorAll(':scope > .turn').forEach((el) => el.remove());
+		const model = buildRouterBoardModel(items);
+		const board = ensureRouterBoard();
+		for (const spec of BOARD_SECTIONS) {
+			const section = board.querySelector(`:scope > .board-section[data-section="${spec.id}"]`);
+			if (!section) {
+				continue;
+			}
+			syncBoardSection(section, spec.title, model.sections[spec.id] || []);
+		}
+		if (timelineStickBottom && !timelineHasSelection()) {
+			scrollTimelineToBottom();
+		}
+		timelineContentKey = timelineKey(items);
+		return true;
+	}
+
+	function renderRouterBoard(items) {
+		if (!items || !items.length) {
+			return;
+		}
+		const model = buildRouterBoardModel(items);
+		timelineEl.replaceChildren();
+		const board = document.createElement('div');
+		board.className = 'router-board';
+		for (const spec of BOARD_SECTIONS) {
+			const section = createBoardSection(spec.id, spec.title);
+			syncBoardSection(section, spec.title, model.sections[spec.id] || []);
+			board.appendChild(section);
+		}
+		timelineEl.appendChild(board);
+		timelineContentKey = timelineKey(items);
 	}
 
 	let timelineContentKey = '';
@@ -2176,6 +3147,13 @@
 	function tryPatchElapsed(items) {
 		if (!items || !items.length || timelineKey(items) !== timelineContentKey) {
 			return false;
+		}
+		if (state && state.isRouter) {
+			if (!timelineEl.querySelector(':scope > .router-board')) {
+				return false;
+			}
+			patchDispatchDurations(items);
+			return true;
 		}
 		const existingIds = [...timelineEl.querySelectorAll('[data-item-id]')].map((el) => el.getAttribute('data-item-id'));
 		const nextIds = items.map((i) => i.id);
@@ -2499,8 +3477,14 @@
 	}
 
 	function renderTimeline(items) {
-		if (tryPatchElapsed(items)) {
-			return;
+		try {
+			if (tryPatchElapsed(items)) {
+				return;
+			}
+		} catch (err) {
+			// A malformed item must never kill the whole render — fall through
+			// to a full board/transcript rebuild instead.
+			console.error('[zcode] tryPatchElapsed failed, forcing rebuild', err);
 		}
 		if (!items || !items.length) {
 			if (timelineEl.querySelector(':scope > .empty') && !timelineEl.querySelector('[data-item-id]')) {
@@ -2511,11 +3495,44 @@
 			const empty = document.createElement('div');
 			empty.className = 'empty';
 			empty.textContent = state && state.isRouter
-				? '描述要派发给 Worker 的任务。派发记录会出现在这里。'
+				? '描述任务并派发；任务会按 Worker 出现在上方看板。'
 				: 'Ask ZCode to edit, explain, or run something in this workspace.';
 			timelineEl.appendChild(empty);
 			timelineContentKey = '';
 			return;
+		}
+
+		if (state && state.isRouter) {
+			// Board reconcile is incremental; ANY exception in it must fall back
+			// to a full rebuild (renderRouterBoard) — otherwise a new dispatch
+			// card could silently never appear on the home page.
+			let reconciled = false;
+			try {
+				reconciled = reconcileRouterBoard(items);
+			} catch (err) {
+				console.error('[zcode] router board reconcile failed, rebuilding board', err);
+				reconciled = false;
+			}
+			if (reconciled) {
+				return;
+			}
+			const prevTop = timelineEl.scrollTop;
+			const hadSelection = timelineHasSelection();
+			renderRouterBoard(items);
+			requestAnimationFrame(() => {
+				if (timelineStickBottom && !hadSelection) {
+					scrollTimelineToBottom();
+				} else {
+					writeTimelineScrollTop(prevTop);
+				}
+			});
+			return;
+		}
+
+		// Leaving Router board → wipe so transcript reconcile starts clean.
+		if (timelineEl.querySelector(':scope > .router-board')) {
+			timelineEl.replaceChildren();
+			timelineContentKey = '';
 		}
 
 		// Prefer per-block reconcile so only changed rows rewrite their DOM.
@@ -3006,6 +4023,16 @@
 			inputEl.focus();
 		}
 
+		// Timeline renders FIRST and independently: a bad/missing chrome field
+		// below must never freeze the board (new dispatch cards stopped appearing
+		// whenever any earlier line threw).
+		try {
+			renderTimeline(next.items || []);
+		} catch (err) {
+			console.error('[zcode] renderTimeline failed', err);
+		}
+
+		try {
 		const brain = next.brain || 'zcode';
 		document.body.dataset.brain = brain;
 		if (timelineRoot) timelineRoot.dataset.brain = brain;
@@ -3042,6 +4069,7 @@
 				? [next.agentPaceLabel || next.agentPace, next.reasoningLabel || next.reasoningLevel].filter(Boolean).join(' · ')
 				: (next.cursorMode || 'agent'),
 		].filter(Boolean).join(' · ');
+		hintEl.title = hintEl.textContent;
 
 		if (scheduleTipEl) {
 			const tip = next.scheduleTip;
@@ -3065,7 +4093,6 @@
 					: '描述要派发给 Worker 的任务')
 				: 'Plan, @ for context, / for commands, $ for skills';
 		}
-		renderTimeline(next.items || []);
 		renderTodos(next.todos || []);
 		renderWorkingSet(next.fileChanges || []);
 		renderHistory(next.sessions || []);
@@ -3084,6 +4111,9 @@
 			openMenu = 'plus';
 			plusMenu.classList.add('open');
 			plusBtn.setAttribute('aria-expanded', 'true');
+		}
+		} catch (err) {
+			console.error('[zcode] render chrome failed', err);
 		}
 	}
 
@@ -3449,6 +4479,44 @@
 		vscode.postMessage({ type: 'viewPendingWorker' });
 	}, true);
 
+	// ---- "待查看" pill: floats above the composer's top-right corner once a
+	// turn finishes. The pill is a single <button>, so the whole thing is the
+	// click target; clicking jumps straight to that finished session. Replaces
+	// the old bottom-right editor notification. ----
+	let donePillSessionId = null;
+	function hideDonePill() {
+		donePillSessionId = null;
+		const pill = document.getElementById('donePill');
+		if (pill) pill.hidden = true;
+	}
+	function syncDonePill() {
+		// Already viewing the finished session → nothing left to "查看".
+		if (donePillSessionId && state && state.sessionId === donePillSessionId) hideDonePill();
+	}
+	function showDonePill(sessionId, title) {
+		if (!sessionId) return;
+		const composer = document.getElementById('composer');
+		if (!composer) return;
+		donePillSessionId = sessionId;
+		let pill = document.getElementById('donePill');
+		if (!pill) {
+			pill = document.createElement('button');
+			pill.id = 'donePill';
+			pill.type = 'button';
+			pill.className = 'done-pill';
+			pill.addEventListener('click', () => {
+				const sid = donePillSessionId;
+				hideDonePill();
+				if (sid) vscode.postMessage({ type: 'openSession', sessionId: sid });
+			});
+			composer.appendChild(pill);
+		}
+		const label = title && title !== '新对话' ? title : 'AI 任务已完成';
+		pill.textContent = `待查看 · ${label}`;
+		pill.title = `${label}（点击查看）`;
+		pill.hidden = false;
+	}
+
 	// ---- Task-completion chime. Only fired by the host when a real agent turn
 	// finishes successfully; no other sounds exist in this view. The visible
 	// reminder is the editor's system notification, not in-page UI. ----
@@ -3479,9 +4547,16 @@
 	window.addEventListener('message', (event) => {
 		const data = event.data;
 		if (!data) return;
-		if (data.type === 'state') render(data);
+		if (data.type === 'state') {
+			render(data);
+			syncDonePill();
+		}
 		if (data.type === 'contextUsage') renderContextUsage(data.contextUsage);
-		if (data.type === 'turnCompleted') playDoneChime();
+		if (data.type === 'turnCompleted') {
+			playDoneChime();
+			showDonePill(data.sessionId, data.title);
+		}
+		if (data.type === 'dispatchLive') applyDispatchLive(data.sessionId, data.text);
 		if (data.type === 'skillMatches') {
 			const query = currentSkillQuery();
 			if (!query || query.query !== (data.query || '')) return;

@@ -2,8 +2,8 @@
 	color-scheme: light dark;
 	--chat-input-radius: 12px;
 	--control-h: 28px;
-	/* Cursor-like density: stream chrome is tight and quiet. */
-	--conv-gap: 6px;
+	/* Cursor-like density: stream chrome is quiet, turns get a breath of air. */
+	--conv-gap: 10px;
 	--stream-row-gap: 1px;
 	/* Chat column is centered and width-capped so wide panels stay readable. */
 	--chat-content-max-width: 820px;
@@ -270,7 +270,10 @@ body[data-brain="cursor"] .chat-input-container {
 .timeline {
 	flex: 1;
 	min-height: 0;
-	overflow: auto;
+	/* Vertical-only scrolling: the wide task board may paint into the side
+	   gutters, and that must never turn into a sideways-scrollable page. */
+	overflow-y: auto;
+	overflow-x: hidden;
 	/* Block flow on purpose: Chromium paints drag-selection across children of
 	   a column-flex container starting at the container's top edge, so
 	   selecting text highlighted (and copied) everything from the page top.
@@ -464,7 +467,7 @@ button {
 .summary-row {
 	margin: 2px 0 8px;
 	padding: 10px 12px;
-	border-radius: 12px;
+	border-radius: 8px;
 	background: color-mix(in srgb, var(--vscode-foreground) 5%, transparent);
 }
 .summary-label {
@@ -482,7 +485,7 @@ button {
 .user-bubble {
 	max-width: min(100%, 36rem);
 	padding: 10px 14px;
-	border-radius: 12px 2px 12px 12px;
+	border-radius: 10px;
 	border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.28));
 	background: var(--vscode-editor-background);
 	white-space: pre-wrap;
@@ -498,10 +501,37 @@ button {
 }
 .dispatch-row > * { margin-left: auto; }
 .dispatch-row > * + * { margin-top: 4px; }
+/* Bound exchange = one full-width box: my message right, worker's reply left. */
+.dispatch-row.exchange {
+	max-width: 100%;
+	margin-left: 0;
+	margin-bottom: 2px;
+	padding: 10px 12px 8px;
+	border: 1px solid color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.3)) 75%, transparent);
+	border-radius: 8px;
+	transition: border-color 120ms ease, background-color 120ms ease;
+}
+.dispatch-row.exchange.clickable:hover {
+	border-color: var(--vscode-widget-border, rgba(127,127,127,.45));
+	background: color-mix(in srgb, var(--vscode-foreground) 2%, transparent);
+}
+/* My message keeps the full user-bubble look inside the frame, hugged to the right. */
+.dispatch-row.exchange .dispatch-bubble {
+	max-width: min(100%, 36rem);
+	margin-left: auto;
+}
+/* Receipt line sits right under my bubble — reads like a delivery tick. */
+.dispatch-row.exchange .dispatch-meta {
+	justify-content: flex-end;
+}
+.dispatch-row.exchange.clickable:hover,
+.dispatch-row.exchange.selected {
+	border-color: var(--vscode-focusBorder);
+}
 .dispatch-bubble {
 	max-width: min(100%, 36rem);
 	padding: 10px 14px;
-	border-radius: 12px 2px 12px 12px;
+	border-radius: 10px;
 	border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.28));
 	background: var(--vscode-editor-background);
 	white-space: pre-wrap;
@@ -627,6 +657,11 @@ button {
 	border-color: var(--vscode-focusBorder);
 	box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset;
 }
+/* Selection chrome lives on the frame; my bubble keeps its own border. */
+.dispatch-row.exchange.selected .dispatch-bubble {
+	border-color: var(--vscode-widget-border, rgba(127,127,127,.28));
+	box-shadow: none;
+}
 .dispatch-row.selected .dispatch-badge {
 	color: var(--vscode-foreground);
 	font-weight: 600;
@@ -669,6 +704,24 @@ button {
 }
 .dispatch-result-body :first-child { margin-top: 0; }
 .dispatch-result-body :last-child { margin-bottom: 0; }
+/* Waiting-for-reply slot inside the exchange box (turn still in flight) */
+.dispatch-result.pending {
+	border-left-color: var(--vscode-widget-border, rgba(127,127,127,.28));
+}
+.dispatch-result.pending .dispatch-result-body {
+	color: var(--vscode-descriptionForeground);
+}
+/* Inside the frame the reply is split off by a hairline divider —
+   one box, no nested chrome (border/accent belong to standalone results only). */
+.dispatch-row.exchange .dispatch-result {
+	border: none;
+	border-top: 1px solid color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.3)) 60%, transparent);
+	border-radius: 0;
+	background: transparent;
+	padding: 8px 2px 2px;
+	margin-top: 2px;
+	max-width: 100%;
+}
 .dispatch-result.long:not(.expanded) .dispatch-result-body {
 	max-height: 8.5em;
 	overflow: hidden;
@@ -692,8 +745,16 @@ button {
 	max-width: min(100%, 44rem);
 	margin-left: 0;
 	padding: 4px 10px;
-	border-radius: 10px;
-	border: 1px dashed var(--vscode-widget-border, rgba(127,127,127,.28));
+	border-radius: 8px;
+	border: 1px solid color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.28)) 65%, transparent);
+}
+/* Inside the exchange frame: divider, not another box. */
+.dispatch-row.exchange .dispatch-files {
+	border: none;
+	border-top: 1px solid color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.3)) 60%, transparent);
+	border-radius: 0;
+	padding: 4px 2px 2px;
+	max-width: 100%;
 }
 .dispatch-files-list {
 	list-style: none;
@@ -765,6 +826,215 @@ button {
 .dispatch-target-clear:hover {
 	color: var(--vscode-foreground);
 	background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.15));
+}
+
+/* Router homepage — task board (one card per Worker, follow-up chain inside) */
+.router-board {
+	display: block;
+	width: 100%;
+	padding: 2px 0 8px;
+}
+.router-board > * + * {
+	margin-top: 14px;
+}
+.board-section {
+	display: block;
+}
+.board-section[hidden] {
+	display: none;
+}
+.board-section-title {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	margin: 0 0 8px;
+	font-size: 11px;
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	text-transform: none;
+	color: var(--vscode-descriptionForeground);
+	user-select: none;
+}
+.board-section-title .count {
+	font-weight: 500;
+	font-variant-numeric: tabular-nums;
+	opacity: 0.85;
+}
+.board-section-title .count:not(:empty)::before {
+	content: '·';
+	margin-right: 8px;
+	opacity: 0.6;
+}
+.board-section-cards {
+	display: block;
+}
+.board-section-cards > * + * {
+	margin-top: 8px;
+}
+/* Wide-window multi-column: JS sets data-cols + --board-cols on the host. */
+.board-section-cards[data-cols] {
+	display: grid;
+	grid-template-columns: repeat(var(--board-cols, 2), minmax(0, 1fr));
+	gap: 8px;
+	align-items: start;
+}
+.board-section-cards[data-cols] > * + * {
+	margin-top: 0;
+}
+.board-columns-control {
+	display: inline-flex;
+	align-items: center;
+	margin: 0 0 10px;
+	padding: 2px 10px;
+	border: 1px dashed color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.28)) 70%, transparent);
+	border-radius: 999px;
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	line-height: 1.6;
+	cursor: pointer;
+	user-select: none;
+}
+.board-columns-control:hover {
+	color: var(--vscode-foreground);
+	border-color: var(--vscode-widget-border, rgba(127,127,127,.45));
+	background: color-mix(in srgb, var(--vscode-foreground) 3%, transparent);
+}
+.worker-card {
+	display: block;
+	padding: 10px 12px 8px;
+	border: 1px solid color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.3)) 80%, transparent);
+	border-left: 3px solid var(--worker-accent, var(--vscode-focusBorder, rgba(127,127,127,.45)));
+	border-radius: 8px;
+	background: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
+	transition: border-color 120ms ease, background-color 120ms ease;
+}
+.worker-card.clickable {
+	cursor: pointer;
+}
+.worker-card.clickable:hover {
+	border-color: var(--vscode-widget-border, rgba(127,127,127,.45));
+	border-left-color: var(--worker-accent, var(--vscode-widget-border, rgba(127,127,127,.45)));
+	background: color-mix(in srgb, var(--vscode-foreground) 2.5%, var(--vscode-editor-background));
+}
+.worker-card.selected {
+	border-color: var(--vscode-focusBorder);
+	border-left-color: var(--worker-accent, var(--vscode-focusBorder));
+	background: color-mix(in srgb, var(--vscode-focusBorder) 6%, var(--vscode-editor-background));
+}
+.worker-card.read .worker-card-accent {
+	opacity: 0.55;
+}
+
+.worker-card.read .worker-card-title {
+	color: color-mix(in srgb, var(--vscode-foreground) 72%, transparent);
+	font-weight: 400;
+}
+
+.worker-card-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-width: 0;
+	margin-bottom: 6px;
+}
+.worker-card-accent {
+	display: none;
+}
+.worker-card-title {
+	flex: 1;
+	min-width: 0;
+	/* 允许标题占两行，避免窄卡片/多列布局下一行就被截成十几个字 */
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow: hidden;
+	overflow-wrap: anywhere;
+	font-size: var(--zcode-chat-font-size);
+	font-weight: 600;
+	color: var(--vscode-foreground);
+}
+.worker-card-status {
+	/* 空间不够时状态徽标也参与收缩，把宽度让给标题 */
+	flex-shrink: 1;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 11px;
+	color: var(--worker-status-fg, var(--vscode-descriptionForeground));
+	font-variant-numeric: tabular-nums;
+}
+.worker-card-head .dispatch-open {
+	flex-shrink: 0;
+	margin-left: 2px;
+}
+.worker-card-head .worker-card-remove {
+	flex-shrink: 0;
+	appearance: none;
+	border: 0;
+	background: transparent;
+	color: var(--zcode-fg-subtlest);
+	cursor: pointer;
+	font-size: 12px;
+	line-height: 1;
+	padding: 4px 6px;
+	border-radius: 5px;
+}
+.worker-card-head .worker-card-remove:hover,
+.worker-card-head .worker-card-remove:focus-visible {
+	color: var(--vscode-errorForeground, #f66);
+	background: color-mix(in srgb, var(--vscode-errorForeground, #f66) 14%, transparent);
+	outline: none;
+}
+.followup-chain {
+	display: block;
+}
+.followup-chain > * + * {
+	margin-top: 6px;
+}
+.followup-history {
+	text-align: center;
+}
+.followup-turn-summary {
+	display: block;
+	width: 100%;
+	padding: 5px 8px;
+	border: 1px dashed color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.28)) 70%, transparent);
+	border-radius: 6px;
+	background: transparent;
+	color: var(--vscode-descriptionForeground);
+	font-size: 11px;
+	line-height: 1.4;
+	text-align: left;
+	cursor: pointer;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.followup-turn-summary:hover {
+	color: var(--vscode-foreground);
+	border-color: var(--vscode-widget-border, rgba(127,127,127,.45));
+	background: color-mix(in srgb, var(--vscode-foreground) 3%, transparent);
+}
+/* Inside a Worker card the exchange frame drops its own border — the card is the chrome. */
+.worker-card .dispatch-row.exchange {
+	margin-bottom: 0;
+	padding: 4px 0 2px;
+	border: none;
+	border-radius: 0;
+	background: transparent;
+}
+.worker-card .dispatch-row.exchange.clickable:hover,
+.worker-card .dispatch-row.exchange.selected {
+	border: none;
+	background: transparent;
+}
+.worker-card .dispatch-row.exchange .dispatch-bubble {
+	max-width: 100%;
+}
+.worker-card .dispatch-row.selected .dispatch-bubble {
+	box-shadow: none;
 }
 .user-bubble .user-text {
 	white-space: pre-wrap;
@@ -864,79 +1134,79 @@ button {
 }
 
 /* Copilot / workbench chat–like markdown */
-.assistant-body.rendered-markdown > :first-child { margin-top: 0; }
-.assistant-body.rendered-markdown > :last-child { margin-bottom: 0; }
-.assistant-body.rendered-markdown h1,
-.assistant-body.rendered-markdown h2,
-.assistant-body.rendered-markdown h3,
-.assistant-body.rendered-markdown h4,
-.assistant-body.rendered-markdown h5,
-.assistant-body.rendered-markdown h6 {
+.rendered-markdown > :first-child { margin-top: 0; }
+.rendered-markdown > :last-child { margin-bottom: 0; }
+.rendered-markdown h1,
+.rendered-markdown h2,
+.rendered-markdown h3,
+.rendered-markdown h4,
+.rendered-markdown h5,
+.rendered-markdown h6 {
 	line-height: 1.35;
 	font-weight: 600;
 	margin: 1em 0 0.45em;
 	color: var(--vscode-foreground);
 }
-.assistant-body.rendered-markdown h1 { font-size: 1.35em; }
-.assistant-body.rendered-markdown h2 { font-size: 1.2em; }
-.assistant-body.rendered-markdown h3 { font-size: 1.1em; }
-.assistant-body.rendered-markdown h4,
-.assistant-body.rendered-markdown h5,
-.assistant-body.rendered-markdown h6 { font-size: 1em; }
-.assistant-body.rendered-markdown p {
+.rendered-markdown h1 { font-size: 1.35em; }
+.rendered-markdown h2 { font-size: 1.2em; }
+.rendered-markdown h3 { font-size: 1.1em; }
+.rendered-markdown h4,
+.rendered-markdown h5,
+.rendered-markdown h6 { font-size: 1em; }
+.rendered-markdown p {
 	margin: 0.55em 0;
 }
-.assistant-body.rendered-markdown ul,
-.assistant-body.rendered-markdown ol {
+.rendered-markdown ul,
+.rendered-markdown ol {
 	margin: 0.45em 0;
 	padding-left: 1.4em;
 }
-.assistant-body.rendered-markdown li {
+.rendered-markdown li {
 	margin: 0.2em 0;
 }
-.assistant-body.rendered-markdown li > ul,
-.assistant-body.rendered-markdown li > ol {
+.rendered-markdown li > ul,
+.rendered-markdown li > ol {
 	margin: 0.15em 0;
 }
-.assistant-body.rendered-markdown .task-list-item {
+.rendered-markdown .task-list-item {
 	list-style: none;
 	margin-left: -1.15em;
 }
-.assistant-body.rendered-markdown .task-list-item-checkbox {
+.rendered-markdown .task-list-item-checkbox {
 	margin-right: 0.45em;
 	vertical-align: middle;
 	accent-color: var(--vscode-foreground);
 }
-.assistant-body.rendered-markdown blockquote {
+.rendered-markdown blockquote {
 	margin: 0.6em 0;
 	padding: 0 0 0 0.85em;
 	border-left: 3px solid var(--vscode-textBlockQuote-border, var(--vscode-widget-border, rgba(127,127,127,.45)));
 	color: var(--vscode-textBlockQuote-foreground, var(--vscode-descriptionForeground));
 }
-.assistant-body.rendered-markdown blockquote p {
+.rendered-markdown blockquote p {
 	margin: 0.35em 0;
 }
-.assistant-body.rendered-markdown hr {
+.rendered-markdown hr {
 	border: none;
 	border-top: 1px solid var(--vscode-widget-border, rgba(127,127,127,.35));
 	margin: 1em 0;
 }
-.assistant-body.rendered-markdown a {
+.rendered-markdown a {
 	color: var(--vscode-textLink-foreground);
 	text-decoration: none;
 }
-.assistant-body.rendered-markdown a:hover {
+.rendered-markdown a:hover {
 	color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
 	text-decoration: underline;
 }
-.assistant-body.rendered-markdown strong { font-weight: 650; }
-.assistant-body.rendered-markdown em { font-style: italic; }
-.assistant-body.rendered-markdown s,
-.assistant-body.rendered-markdown del {
+.rendered-markdown strong { font-weight: 650; }
+.rendered-markdown em { font-style: italic; }
+.rendered-markdown s,
+.rendered-markdown del {
 	text-decoration: line-through;
 	opacity: 0.85;
 }
-.assistant-body.rendered-markdown code {
+.rendered-markdown code {
 	font-family: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
 	font-size: 0.92em;
 	padding: 0.12em 0.4em;
@@ -944,14 +1214,14 @@ button {
 	background: var(--vscode-textPreformat-background, color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent));
 	color: var(--vscode-textPreformat-foreground, var(--vscode-foreground));
 }
-.assistant-body.rendered-markdown .codeblock {
+.rendered-markdown .codeblock {
 	margin: 0.7em 0;
 	border-radius: 12px;
 	overflow: hidden;
 	border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.28));
 	background: var(--vscode-editor-background);
 }
-.assistant-body.rendered-markdown .codeblock-header {
+.rendered-markdown .codeblock-header {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
@@ -962,7 +1232,7 @@ button {
 	border-bottom: 1px solid var(--vscode-widget-border, transparent);
 	background: color-mix(in srgb, var(--vscode-editor-foreground) 4%, transparent);
 }
-.assistant-body.rendered-markdown .codeblock-lang {
+.rendered-markdown .codeblock-lang {
 	font-family: var(--vscode-font-family);
 	text-transform: lowercase;
 	opacity: 0.9;
@@ -971,7 +1241,7 @@ button {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
-.assistant-body.rendered-markdown .codeblock-copy {
+.rendered-markdown .codeblock-copy {
 	appearance: none;
 	border: none;
 	background: transparent;
@@ -985,23 +1255,23 @@ button {
 	flex-shrink: 0;
 	opacity: 0.85;
 }
-.assistant-body.rendered-markdown .codeblock-copy:hover {
+.rendered-markdown .codeblock-copy:hover {
 	opacity: 1;
 	color: var(--vscode-foreground);
 	background: var(--vscode-toolbar-hoverBackground);
 }
-.assistant-body.rendered-markdown .codeblock-copy.copied {
+.rendered-markdown .codeblock-copy.copied {
 	color: var(--vscode-charts-green, #3fb950);
 	opacity: 1;
 }
-.assistant-body.rendered-markdown pre {
+.rendered-markdown pre {
 	margin: 0;
 	padding: 10px 12px;
 	overflow: auto;
 	background: transparent;
 	border: none;
 }
-.assistant-body.rendered-markdown pre code {
+.rendered-markdown pre code {
 	padding: 0;
 	background: transparent;
 	font-size: var(--zcode-chat-font-size-secondary);
@@ -1009,7 +1279,7 @@ button {
 	color: var(--vscode-editor-foreground);
 	white-space: pre;
 }
-.assistant-body.rendered-markdown table {
+.rendered-markdown table {
 	border-collapse: collapse;
 	margin: 0.7em 0;
 	width: auto;
@@ -1018,18 +1288,18 @@ button {
 	overflow-x: auto;
 	font-size: calc(var(--zcode-chat-font-size) - 1.5px);
 }
-.assistant-body.rendered-markdown th,
-.assistant-body.rendered-markdown td {
+.rendered-markdown th,
+.rendered-markdown td {
 	border: 1px solid var(--vscode-widget-border, rgba(127,127,127,.35));
 	padding: 6px 10px;
 	text-align: left;
 	vertical-align: top;
 }
-.assistant-body.rendered-markdown th {
+.rendered-markdown th {
 	font-weight: 600;
 	background: color-mix(in srgb, var(--vscode-editor-foreground) 6%, transparent);
 }
-.assistant-body.rendered-markdown tr:nth-child(even) td {
+.rendered-markdown tr:nth-child(even) td {
 	background: color-mix(in srgb, var(--vscode-editor-foreground) 3%, transparent);
 }
 
@@ -1871,6 +2141,36 @@ button {
 	border-color: var(--vscode-input-border, var(--vscode-widget-border, rgba(127,127,127,.35)));
 	box-shadow: 0 0 0 1px var(--vscode-widget-border, rgba(127,127,127,.22));
 }
+/* "待查看" pill — floats above the composer's top-right corner after a turn
+   finishes; the whole pill is one button, so all of it is clickable. */
+.done-pill {
+	position: absolute;
+	top: -32px;
+	right: 10px;
+	z-index: 30;
+	display: inline-block;
+	max-width: min(72%, 420px);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	padding: 5px 12px;
+	font-family: inherit;
+	font-size: 11.5px;
+	line-height: 1.4;
+	color: #ffffff;
+	background: #238636;
+	border: 1px solid rgba(255, 255, 255, 0.28);
+	border-radius: 999px;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+	cursor: pointer;
+}
+.done-pill:hover {
+	background: #2ea043;
+	border-color: rgba(255, 255, 255, 0.4);
+}
+.done-pill[hidden] {
+	display: none;
+}
 textarea {
 	width: 100%;
 	min-height: 56px;
@@ -2355,4 +2655,19 @@ textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 	color: var(--vscode-foreground);
 	font-size: 11px;
 	flex-shrink: 0;
+}
+/* Live output preview inside a running dispatch frame (ephemeral, muted). */
+.dispatch-row .dispatch-live {
+	font-family: var(--vscode-editor-font-family), var(--monaco-monospace-font), monospace;
+	font-size: 11px;
+	line-height: 1.55;
+	color: var(--vscode-descriptionForeground);
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 4.8em;
+	overflow: hidden;
+	opacity: .85;
+	margin: 2px 0 0;
+	padding: 2px 0 2px 10px;
+	border-left: 2px solid var(--vscode-widget-border);
 }

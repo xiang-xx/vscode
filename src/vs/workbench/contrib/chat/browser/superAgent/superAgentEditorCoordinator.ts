@@ -6,12 +6,14 @@
 import { Sequencer } from '../../../../../base/common/async.js';
 import { autorun, runOnChange } from '../../../../../base/common/observable.js';
 import { Emitter, Event } from '../../../../../base/common/event.js';
-import { Disposable } from '../../../../../base/common/lifecycle.js';
+import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { isEqual } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
+import { BrowserEditorInput } from '../../../browserView/common/browserEditorInput.js';
+import { EditorsOrder } from '../../../../common/editor.js';
 import { IDecorationData, IDecorationsProvider, IDecorationsService } from '../../../../services/decorations/common/decorations.js';
 import { IEditorGroupsService, IEditorWorkingSet } from '../../../../services/editor/common/editorGroupsService.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
@@ -98,6 +100,12 @@ class SuperAgentWorkerDecorationsProvider extends Disposable implements IDecorat
  * owner's set. Suggested-edits multi-diff is only forced open on a worker's
  * first visit with an empty set. Background workers surface through file
  * decorations instead of stealing tabs.
+ *
+ * Browser tabs survive the swap alive: while a working set is being applied,
+ * disposal of open `BrowserEditorInput`s is vetoed, so the live browser view
+ * is parked in memory with its owner. Restoring that owner's set resolves the
+ * same input instance (the browser view service dedupes by id) and reconnects
+ * to the still-live view instead of reloading the page by URL.
  */
 export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenchContribution {
 
@@ -108,6 +116,17 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 	private _applyGeneration = 0;
 	/** Skip the initial undefined→undefined observation; first real switch parks/applies. */
 	private _hasSeenOwner = false;
+
+	/**
+	 * Browser tabs whose disposal was vetoed during a working-set swap. Key is
+	 * the owner the tab was parked with; the live view is freed when that owner
+	 * (a worker) leaves the live list.
+	 */
+	private readonly _retainedBrowserInputs = new Map<BrowserEditorInput, string>();
+	private readonly _browserInputListeners = new Map<BrowserEditorInput, DisposableStore>();
+	/** True only while this coordinator applies a working set (the swap window). */
+	private _isSwappingEditorSets = false;
+	private _parkedOwnerKeyDuringSwap: string | undefined;
 
 	constructor(
 		@IChatRouterService private readonly _routerService: IChatRouterService,
@@ -142,13 +161,14 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 			}
 			this._hasSeenOwner = true;
 
-			void this._applyWorkingSetFor(nextKey, focusedId);
+			void this._applyWorkingSetFor(nextKey, focusedId, prevKey);
 		}));
 
 		// Drop parked editors when the worker leaves the live list.
 		this._register(this._routerService.onDidWorkerEvent(e => {
 			if (e.kind === 'workerRemoved') {
 				this._deleteWorkingSet(e.workerId);
+				this._disposeRetainedBrowserInputs(e.workerId);
 			}
 		}));
 	}
@@ -174,7 +194,7 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 		this._editorGroupsService.deleteWorkingSet(existing);
 	}
 
-	private async _applyWorkingSetFor(ownerId: string, focusedWorkerId: string | undefined): Promise<void> {
+	private async _applyWorkingSetFor(ownerId: string, focusedWorkerId: string | undefined, parkedOwnerKey: string): Promise<void> {
 		const generation = ++this._applyGeneration;
 		const workingSet: IEditorWorkingSet | 'empty' = this._workingSets.get(ownerId) ?? 'empty';
 		try {
@@ -182,7 +202,19 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 				if (generation !== this._applyGeneration) {
 					return;
 				}
-				const applied = await this._editorGroupsService.applyWorkingSet(workingSet, { preserveFocus: true });
+				// The swap window: browser tabs closed by the set replacement get
+				// their disposal vetoed so the live view is parked, not destroyed.
+				this._trackOpenBrowserInputs();
+				this._parkedOwnerKeyDuringSwap = parkedOwnerKey;
+				this._isSwappingEditorSets = true;
+				let applied = false;
+				try {
+					applied = await this._editorGroupsService.applyWorkingSet(workingSet, { preserveFocus: true });
+				} finally {
+					this._isSwappingEditorSets = false;
+					this._parkedOwnerKeyDuringSwap = undefined;
+					this._releaseRestoredBrowserInputs();
+				}
 				if (!applied || generation !== this._applyGeneration) {
 					return;
 				}
@@ -195,6 +227,67 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 		} catch (err) {
 			this._logService.error('[superAgent] failed to apply editor working set for focused owner', err);
 		}
+	}
+
+	/** Watch every open browser tab so the swap window can veto its disposal. */
+	private _trackOpenBrowserInputs(): void {
+		for (const { editor } of this._editorService.getEditors(EditorsOrder.MOST_RECENTLY_ACTIVE)) {
+			if (editor instanceof BrowserEditorInput) {
+				this._trackBrowserInput(editor);
+			}
+		}
+	}
+
+	private _trackBrowserInput(input: BrowserEditorInput): void {
+		if (this._browserInputListeners.has(input)) {
+			return;
+		}
+		const store = new DisposableStore();
+		this._browserInputListeners.set(input, store);
+		store.add(input.onBeforeDispose(e => {
+			if (!this._isSwappingEditorSets) {
+				return; // genuine close (user action, shutdown): allow disposal
+			}
+			// Park with the outgoing owner; restoring its set reconnects to the
+			// same live instance (the browser view service dedupes by input id).
+			e.veto();
+			this._retainedBrowserInputs.set(input, this._parkedOwnerKeyDuringSwap ?? ROOT_OWNER_KEY);
+		}));
+		Event.once(input.onWillDispose)(() => {
+			store.dispose();
+			this._browserInputListeners.delete(input);
+			this._retainedBrowserInputs.delete(input);
+		});
+	}
+
+	/** Tabs that the applied set brought back are no longer parked. */
+	private _releaseRestoredBrowserInputs(): void {
+		if (this._retainedBrowserInputs.size === 0) {
+			return;
+		}
+		const open = new Set(this._editorService.getEditors(EditorsOrder.MOST_RECENTLY_ACTIVE).map(({ editor }) => editor));
+		for (const input of [...this._retainedBrowserInputs.keys()]) {
+			if (open.has(input)) {
+				this._retainedBrowserInputs.delete(input);
+			}
+		}
+	}
+
+	/** Frees live browser views parked with an owner that left the live list. */
+	private _disposeRetainedBrowserInputs(ownerKey: string): void {
+		for (const [input, parkedWith] of [...this._retainedBrowserInputs]) {
+			if (parkedWith === ownerKey) {
+				input.dispose(true); // force: bypass the veto, frees the live view
+			}
+		}
+	}
+
+	public override dispose(): void {
+		for (const store of this._browserInputListeners.values()) {
+			store.dispose();
+		}
+		this._browserInputListeners.clear();
+		super.dispose();
 	}
 
 	private async _showSuggestedEdits(workerId: string): Promise<void> {

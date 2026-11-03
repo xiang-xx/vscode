@@ -17,6 +17,7 @@ import { IChatRouterService } from '../common/superAgent/chatRouterService.js';
 import { ISuperAgentPresentationQueue } from '../common/superAgent/superAgentPresentationQueue.js';
 import { ChatRouterService } from './superAgent/chatRouterServiceImpl.js';
 import { SuperAgentChatBridge } from './superAgent/superAgentChatBridge.js';
+import { SuperAgentDockNotifier } from './superAgent/superAgentDockNotifier.js';
 import { SuperAgentEditorCoordinator } from './superAgent/superAgentEditorCoordinator.js';
 import { SuperAgentChatPageContribution } from './superAgent/superAgentChatPage.js';
 import { SuperAgentPresentationQueue } from './superAgent/superAgentPresentationQueueImpl.js';
@@ -37,4 +38,5 @@ registerWorkbenchContribution2(SuperAgentRouterDispatcher.ID, SuperAgentRouterDi
 registerWorkbenchContribution2(SuperAgentChatPageContribution.ID, SuperAgentChatPageContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(SuperAgentPresentationUiContribution.ID, SuperAgentPresentationUiContribution, WorkbenchPhase.AfterRestored);
 registerWorkbenchContribution2(SuperAgentChatBridge.ID, SuperAgentChatBridge, WorkbenchPhase.AfterRestored);
+registerWorkbenchContribution2(SuperAgentDockNotifier.ID, SuperAgentDockNotifier, WorkbenchPhase.AfterRestored);
 

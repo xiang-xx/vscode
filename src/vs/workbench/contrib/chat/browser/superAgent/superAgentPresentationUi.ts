@@ -3,27 +3,25 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as dom from '../../../../../base/browser/dom.js';
-import { Disposable, DisposableStore } from '../../../../../base/common/lifecycle.js';
+import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../base/common/observable.js';
-import { localize } from '../../../../../nls.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
-import { IKeybindingService } from '../../../../../platform/keybinding/common/keybinding.js';
+import { IContextKey, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
 import { ViewContainerLocation } from '../../../../common/views.js';
-import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
 import { IPaneCompositePartService } from '../../../../services/panecomposite/browser/panecomposite.js';
-import { mainWindow } from '../../../../../base/browser/window.js';
 import { IChatRouterService } from '../../common/superAgent/chatRouterService.js';
 import { ISuperAgentPresentationQueue } from '../../common/superAgent/superAgentPresentationQueue.js';
 import { ZCODE_VIEW_CONTAINER_ID } from '../zcode/zcodeAuxiliaryBarChrome.js';
-import { ViewPendingSuperAgentWorkerAction, ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
+import { SuperAgentWorkerDetailOpen, SuperAgentWorkerViewable, ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
 
 /**
  * Single-page presentation chrome (§5.5):
- * - bottom-right toast while more workers wait in the queue.
+ * - ⌘]/⌘[ context-key gates and Workers-page upkeep while workers wait.
  *
- * Selection state lives in the Workers list itself — no page-bottom dock.
+ * Selection state lives in the Workers list itself — no page-bottom dock and
+ * no bottom-right toast: completed workers are surfaced by the chat page's
+ * "待查看" pill above the composer.
  * Timeline content under the Workers strip is owned by
  * SuperAgentChatPageContribution — this contribution never opens session tabs.
  */
@@ -31,20 +29,23 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 
 	static readonly ID = 'workbench.contrib.chat.superAgentPresentationUi';
 
-	private toastEl: HTMLElement | undefined;
-	private readonly toastListeners = this._register(new DisposableStore());
 	/** Last presented id we forced the Workers page open for (avoid re-entry on state ticks). */
 	private lastPresentedForPage: string | undefined;
+	/** ⌘] gate — see {@link SuperAgentWorkerViewable}. */
+	private readonly workerViewable: IContextKey<boolean>;
+	/** ⌘[ gate — see {@link SuperAgentWorkerDetailOpen}. */
+	private readonly workerDetailOpen: IContextKey<boolean>;
 
 	constructor(
 		@ISuperAgentPresentationQueue private readonly presentationQueue: ISuperAgentPresentationQueue,
 		@IChatRouterService private readonly routerService: IChatRouterService,
-		@IWorkbenchLayoutService private readonly layoutService: IWorkbenchLayoutService,
 		@IPaneCompositePartService private readonly paneCompositeService: IPaneCompositePartService,
 		@ICommandService private readonly commandService: ICommandService,
-		@IKeybindingService private readonly keybindingService: IKeybindingService,
+		@IContextKeyService contextKeyService: IContextKeyService,
 	) {
 		super();
+		this.workerViewable = SuperAgentWorkerViewable.bindTo(contextKeyService);
+		this.workerDetailOpen = SuperAgentWorkerDetailOpen.bindTo(contextKeyService);
 
 		this._register(this.paneCompositeService.onDidPaneCompositeOpen(e => {
 			if (e.viewContainerLocation === ViewContainerLocation.AuxiliaryBar) {
@@ -78,9 +79,16 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 	private syncChrome(presentedId: string | undefined, toastWorkerId: string | undefined, pendingCount: number): void {
 		const onChat = this.paneCompositeService.getActivePaneComposite(ViewContainerLocation.AuxiliaryBar)?.getId() === ZCODE_VIEW_CONTAINER_ID;
 		if (!onChat) {
-			this.teardown();
+			this.workerViewable.set(false);
+			this.workerDetailOpen.set(false);
 			return;
 		}
+
+		// The ⌘] / ⌘[ chords (superAgentCommands.ts) only own the bracket keys
+		// while there is something to enter / exit; text editors keep their
+		// default indent / outdent the rest of the time.
+		this.workerViewable.set(!!toastWorkerId || pendingCount > 0);
+		this.workerDetailOpen.set(!!presentedId);
 
 		// Keep the Workers page up so the timeline renders under the strip.
 		if (presentedId && presentedId !== this.lastPresentedForPage) {
@@ -89,59 +97,5 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 		} else if (!presentedId) {
 			this.lastPresentedForPage = undefined;
 		}
-
-		this.renderToast(toastWorkerId, pendingCount);
-	}
-
-	private renderToast(toastWorkerId: string | undefined, pendingCount: number): void {
-		this.toastListeners.clear();
-		const container = this.layoutService.getContainer(mainWindow, Parts.AUXILIARYBAR_PART);
-		if (!container || !toastWorkerId || pendingCount <= 0) {
-			this.toastEl?.remove();
-			this.toastEl = undefined;
-			return;
-		}
-		const worker = this.routerService.getWorker(toastWorkerId);
-		if (!worker) {
-			this.toastEl?.remove();
-			this.toastEl = undefined;
-			return;
-		}
-
-		if (!this.toastEl || !this.toastEl.isConnected) {
-			this.toastEl?.remove();
-			this.toastEl = dom.append(container, dom.$('.zcode-superagent-toast'));
-		}
-		dom.clearNode(this.toastEl);
-
-		const label = dom.append(this.toastEl, dom.$('span.zcode-superagent-toast-label'));
-		if (pendingCount > 1) {
-			label.textContent = localize('toast.many', "{0} 等 {1} 个待查看", worker.label, pendingCount);
-		} else {
-			label.textContent = localize('toast.one', "{0}", worker.label);
-		}
-
-		const view = dom.append(this.toastEl, dom.$<HTMLButtonElement>('button.zcode-superagent-toast-btn', { type: 'button' }));
-		const kb = this.keybindingService.lookupKeybinding(ViewPendingSuperAgentWorkerAction.ID)?.getLabel();
-		view.textContent = kb
-			? localize('toast.viewWithKb', "查看 ({0})", kb)
-			: localize('toast.view', "查看");
-		view.title = kb
-			? localize('toast.viewTitleWithKb', "查看该 Worker（{0}）", kb)
-			: localize('toast.viewTitle', "查看该 Worker");
-		this.toastListeners.add(dom.addDisposableListener(view, dom.EventType.CLICK, () => {
-			void this.commandService.executeCommand(ViewPendingSuperAgentWorkerAction.ID);
-		}));
-	}
-
-	private teardown(): void {
-		this.toastListeners.clear();
-		this.toastEl?.remove();
-		this.toastEl = undefined;
-	}
-
-	override dispose(): void {
-		this.teardown();
-		super.dispose();
 	}
 }

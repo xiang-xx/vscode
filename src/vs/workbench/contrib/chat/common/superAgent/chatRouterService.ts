@@ -209,6 +209,14 @@ export interface IChatRouterService {
 	 */
 	removeWorker(workerId: string): void;
 	/**
+	 * Force-removes a worker from the live list regardless of state — nothing
+	 * is archived into {@link history}, and any history rows sharing the
+	 * worker's id or chat session are dropped as well so the entry cannot be
+	 * restored later. Escape hatch for stale roster entries (e.g. the chat
+	 * session was already deleted). Does not delete the chat session itself.
+	 */
+	forceRemoveWorker(workerId: string): void;
+	/**
 	 * Re-opens a closed worker from {@link history} into the live list (Idle).
 	 * Returns undefined if the history entry is missing.
 	 */

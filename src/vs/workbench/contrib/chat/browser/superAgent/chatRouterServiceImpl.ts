@@ -208,6 +208,42 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 		this._persist();
 	}
 
+	/**
+	 * Force-remove: no state gate, no archive step. Any history rows pointing
+	 * at the same chat session are purged too, so dirty roster entries (chat
+	 * session already deleted) cannot come back via 恢复.
+	 */
+	forceRemoveWorker(workerId: string): void {
+		const worker = this._workersObs.get().find(w => w.id === workerId);
+		if (!worker) {
+			// Not live anymore — at least purge a matching history row.
+			this.deleteHistoryEntry(workerId);
+			return;
+		}
+		worker.watchdog.cancel();
+		const session = worker.chatSessionResource.toString();
+		transaction(tx => {
+			this._workersObs.set(this._workersObs.get().filter(w => w.id !== workerId), tx);
+			this._historyObs.set(
+				this._historyObs.get().filter(h => h.id !== workerId && h.chatSessionResource.toString() !== session),
+				tx,
+			);
+		});
+		worker.dispose();
+		this._fire(workerId, 'workerRemoved', `force-removed:${worker.label}`);
+
+		if (this._focusedWorkerIdObs.get() === workerId) {
+			const next = this._workersObs.get()[0];
+			if (next) {
+				this.focusWorker(next.id);
+			} else {
+				this.clearFocusedWorker();
+			}
+		}
+		this._maybePromoteQueued();
+		this._persist();
+	}
+
 	restoreWorker(workerId: string): ISuperAgentWorkerHandle | undefined {
 		const entry = this._historyObs.get().find(h => h.id === workerId);
 		if (!entry) {

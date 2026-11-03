@@ -422,6 +422,23 @@ export class FileEditSession {
 		await this.syncToChatEditing(sessionId);
 	}
 
+	/**
+	 * Accept every pending edit owned by a chat session (disk stays as written).
+	 * Used when a Worker picks up a new task so File Changed does not accumulate
+	 * across rounds — prior-turn snapshots on completed dispatch cards are unchanged.
+	 */
+	async acceptOwned(sessionId: string): Promise<number> {
+		if (!sessionId) {
+			return 0;
+		}
+		const uris = this.listOwnedBy(sessionId).map(f => f.uri);
+		if (!uris.length) {
+			return 0;
+		}
+		await this.keep(uris, sessionId);
+		return uris.length;
+	}
+
 	async undo(uris?: string[], sessionId?: string): Promise<void> {
 		const keys = (uris?.length ? uris : [...this.entries.keys()]).filter(key => {
 			const entry = this.entries.get(key);

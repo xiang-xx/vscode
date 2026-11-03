@@ -195,6 +195,7 @@ Router 可以按任务特征自动选档:小修 L1、重构 L2、实验/夜间�
 - 本页的主舞台。输入**永远发给 Router**(派发新任务 / 问进度 / 叫停某个 Worker);
 - 派发路径不变:`SuperAgentRouterDispatcher` 拦截 Router 会话提交 → 建 Worker → 任务进 Worker 会话执行;
 - Router 自己不写代码、不应答长 transcript;它负责编排与告知。
+- Router 主舞台 = 按 Worker 分区的任务板(需要你 / 进行中 / 已完成)+ 卡内追问链,不再是派发气泡时间线。
 
 ### 5.4 ③ 交互承接区 —— 跑完的 Worker 从这里露脸
 - **正常路径**:Worker 进入「需要人」(跑完要确认 / `AwaitingUser` / `WatchdogTripped`)时,若③空闲 → **自动把该 Worker 的交互内容展到页底**,用户就地继续聊、Review、合并;

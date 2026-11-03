@@ -66,6 +66,9 @@ export const ZCODE_INTERNAL_SUPERAGENT_ROUTER_SUBMIT = 'zcode.internal.superAgen
 /** Bind worker identity onto a Router follow-up dispatch card. */
 export const ZCODE_INTERNAL_SUPERAGENT_BIND_ROUTER_DISPATCH = 'zcode.internal.superAgent.bindRouterDispatch';
 
+/** Asks the router service whether a zcode chat session belongs to a worker. */
+export const ZCODE_INTERNAL_SUPERAGENT_IS_WORKER_CHAT_SESSION = 'zcode.internal.superAgent.isWorkerChatSession';
+
 interface IRouterSubmitPayload {
 	readonly text?: string;
 	readonly sessionId?: string;
@@ -159,10 +162,20 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 				status: dispatchStatusForBind(worker.state.get()),
 			}).catch(() => { });
 		}));
+		this._register(CommandsRegistry.registerCommand(ZCODE_INTERNAL_SUPERAGENT_IS_WORKER_CHAT_SESSION, (_accessor, sessionId: unknown) => {
+			// Authoritative worker↔session lookup — lets zcode-chat recognize
+			// restored worker sessions without depending on dispatch-card data.
+			return typeof sessionId === 'string'
+				&& !!this.routerService.getWorkerForChatSession(zcodeSessionResource(sessionId));
+		}));
 		// Title + live turn status → keep Router receipts in sync with the worker rail.
 		this._register(this.routerService.onDidWorkerEvent(e => {
 			if (e.kind === 'labelChanged' && e.detail) {
 				this.syncDispatchTitle(e.workerId, e.detail);
+				return;
+			}
+			if (e.kind === 'workerRemoved') {
+				this.removeWorkerDispatches(e.workerId);
 				return;
 			}
 			if (e.kind === 'stateChanged' || e.kind === 'watchdogTripped' || e.kind === 'workerCreated') {
@@ -237,6 +250,21 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 		for (const worker of this.routerService.workers.get()) {
 			this.syncDispatchStatus(worker.id);
 		}
+	}
+
+	/**
+	 * Dropping a worker from the rail also clears its dispatch bubbles from the
+	 * Router transcript, so the main list doesn't accumulate deleted tasks.
+	 */
+	private removeWorkerDispatches(workerId: string): void {
+		const sessionId = this.routerSessionId();
+		if (!sessionId || !workerId) {
+			return;
+		}
+		void this.commandService.executeCommand('zcode.removeWorkerDispatches', {
+			sessionId,
+			workerId,
+		}).catch(() => { });
 	}
 
 	private markDispatchFailed(opts?: { routerSessionId?: string; dispatchItemId?: string }): void {

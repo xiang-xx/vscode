@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<meta name="zcode-chat-ui" content="compact-v2" />
+	<title>ZCode</title>
+	<link rel="stylesheet" href="../media/chatView.css" />
+	<link rel="stylesheet" href="../media/highlight-vscode.css" />
+<script>window.acquireVsCodeApi = function () { return { postMessage: function (m) { console.log('postMessage', m && m.type); }, getState: function () { return {}; }, setState: function () {} }; };</script>
+</head>
+<body class="zcode-compact">
+	<div class="history-drawer" id="historyDrawer" hidden>
+		<div class="history-header">
+			<div class="history-header-text">
+				<span class="history-title">历史会话</span>
+				<span class="history-hint">ZCode 与 Cursor 共用</span>
+			</div>
+			<button class="icon-btn" id="historyClose" type="button" title="关闭" aria-label="关闭">×</button>
+		</div>
+		<ul class="history-list" id="historyList"></ul>
+	</div>
+	<div class="timeline" id="timeline" data-brain="zcode">
+		<div class="empty">Ask ZCode or Cursor to edit, explain, or run something in this workspace.</div>
+	</div>
+	<div class="todo-panel" id="todoPanel" hidden>
+		<div class="todo-header">
+			<span class="todo-title">Tasks</span>
+			<span class="todo-count" id="todoCount"></span>
+		</div>
+		<ul class="todo-list" id="todoList"></ul>
+	</div>
+	<div class="chat-session-working-set" id="workingSet" hidden>
+		<div class="working-set-overview">
+			<button type="button" class="working-set-collapse" id="workingSetCollapse" aria-expanded="true" title="Collapse">
+				<span class="chev">▾</span>
+				<span class="working-set-title" id="workingSetTitle">0 files changed</span>
+				<span class="insertions-and-deletions" id="workingSetTotals"><span class="insertions"></span><span class="deletions"></span></span>
+			</button>
+			<div class="working-set-actions">
+				<button type="button" class="monaco-text-button secondary icon" id="viewAllBtn" title="View All Edits" aria-label="View All Edits">⧉</button>
+			</div>
+		</div>
+		<ul class="chat-summary-list" id="workingSetList"></ul>
+	</div>
+	<div class="dispatch-target" id="dispatchTarget" hidden>
+		<span class="dispatch-target-label">发给</span>
+		<span class="dispatch-target-badge" id="dispatchTargetBadge"></span>
+		<button type="button" class="dispatch-target-clear" id="dispatchTargetClear" title="取消绑定，回到派发新任务">×</button>
+	</div>
+	<div class="chips" id="chips"></div>
+	<div class="queue-panel" id="queuePanel" hidden>
+		<div class="queue-paused" id="queuePausedBanner" hidden>
+			<span class="queue-paused-text" id="queuePausedText">队列已暂停</span>
+			<button type="button" class="queue-resume" id="queueResume">继续</button>
+		</div>
+		<ul class="queue-list" id="queueList"></ul>
+	</div>
+	<div class="quota-notice" id="quotaNotice" hidden>
+		<span id="quotaNoticeText"></span>
+		<button type="button" id="quotaNoticeClose" aria-label="关闭">×</button>
+	</div>
+	<div class="claim-banner" id="claimBanner" hidden>
+		<div class="claim-copy">
+			<div class="claim-title" id="claimTitle"></div>
+			<div class="claim-meta" id="claimMeta"></div>
+			<div class="claim-error" id="claimError" hidden></div>
+		</div>
+		<button type="button" class="monaco-text-button" id="claimBtn">领取</button>
+	</div>
+	<div class="chat-input-container" id="composer">
+		<div class="menu" id="plusMenu" role="menu"></div>
+		<div class="menu" id="pickerMenu" role="listbox"></div>
+		<textarea id="input" rows="2" placeholder="Plan, @ for context, / for commands, $ for skills"></textarea>
+		<div class="chat-input-toolbars" id="composerToolbar">
+			<div class="toolbar-left">
+				<button class="icon-btn" id="plus" type="button" title="Add" aria-label="Add">+</button>
+				<span id="zcodePills" data-brain-chrome="zcode">
+					<button class="pill" id="providerBtn" type="button" title="Provider"><span class="label" id="providerLabel">Start Plan</span><span class="chev">▾</span></button>
+					<button class="pill" id="modelBtn" type="button" title="Model"><span class="label" id="modelLabel">Model</span><span class="chev">▾</span></button>
+					<button class="pill" id="paceBtn" type="button" title="Agent pace"><span class="label" id="paceLabel">快速</span><span class="chev">▾</span></button>
+					<button class="pill thought" id="thoughtBtn" type="button" title="Thinking intensity"><span class="brain">◎</span><span class="label" id="thoughtLabel">Low</span><span class="chev">▾</span></button>
+				</span>
+				<span id="cursorPills" data-brain-chrome="cursor" hidden>
+					<button class="pill" id="cursorModeBtn" type="button" title="Cursor mode"><span class="label" id="cursorModeLabel">Agent</span><span class="chev">▾</span></button>
+					<button class="pill" id="cursorModelBtn" type="button" title="Cursor model"><span class="label" id="cursorModelLabel">Default</span><span class="chev">▾</span></button>
+				</span>
+			</div>
+			<div class="toolbar-right">
+				<span class="quota-chip" id="quotaChip" hidden title="Start Plan 剩余额度"></span>
+				<button class="context-usage" id="contextUsageBtn" type="button" title="上下文容量" aria-label="上下文容量" aria-expanded="false" hidden>
+					<svg class="context-ring" viewBox="0 0 24 24" aria-hidden="true">
+						<circle class="ring-bg" cx="12" cy="12" r="10"></circle>
+						<circle class="ring-arc" cx="12" cy="12" r="10"></circle>
+					</svg>
+					<span class="context-pct" id="contextUsagePct"></span>
+				</button>
+				<div class="context-panel" id="contextPanel" hidden>
+					<div class="context-panel-head">
+						<span class="context-panel-title">上下文容量</span>
+						<span class="context-panel-summary" id="contextPanelSummary"></span>
+					</div>
+					<div class="context-panel-bar"><div class="context-panel-fill" id="contextPanelFill"></div></div>
+					<p class="context-panel-desc">提示词、工具调用和回复都会共享上下文窗口。</p>
+					<ul class="context-breakdown" id="contextBreakdown"></ul>
+					<p class="context-panel-note" id="contextPanelNote"></p>
+				</div>
+				<button class="send-btn" id="send" type="button" title="Send (Enter)" aria-label="Send">↑</button>
+			</div>
+		</div>
+	</div>
+	<div class="brain-bar">
+		<div class="brain-switch" id="brainSwitch" role="tablist" aria-label="AI brain">
+			<button type="button" class="brain-tab" data-brain="zcode" id="brainZcode">ZCode</button>
+			<button type="button" class="brain-tab" data-brain="cursor" id="brainCursor">Cursor</button>
+		</div>
+		<div class="hint" id="hint"></div>
+	</div>
+	<div class="schedule-tip" id="scheduleTip" hidden role="status"></div>
+	<script src="../media/markdown-it.min.js"></script>
+	<script src="../media/highlight.min.js"></script>
+	<script src="../media/markdown.js"></script>
+	<script src="../media/chatView.js"></script>
+
+<script>
+window.addEventListener('load', function () {
+	setTimeout(function () {
+		window.dispatchEvent(new MessageEvent('message', { data: {
+			type: 'state',
+			isRouter: true,
+			busy: false,
+			items: [
+				{ id: 'd-old', kind: 'dispatch', text: '旧任务：修复登录页样式', workerId: 'w1', workerSessionId: 's1', badge: '登录页修复', accent: 'charts.green', status: 'done', receipt: '已完成', startedAt: Date.now() - 60000, durationMs: 5000, resultText: '已完成，改了两个文件。' },
+				{ id: 'd-new', kind: 'dispatch', text: '新任务：全新 Worker 冒烟测试', receipt: '处理中', status: 'pending', startedAt: Date.now() }
+			]
+		} }));
+		setTimeout(function () {
+			var cards = document.querySelectorAll('.worker-card');
+			console.log('HARNESS worker-card count =', cards.length);
+			for (var i = 0; i < cards.length; i++) {
+				console.log('HARNESS card', i, cards[i].getAttribute('data-worker-key'), '|', cards[i].querySelector('.worker-card-title') && cards[i].querySelector('.worker-card-title').textContent);
+			}
+		}, 100);
+	}, 50);
+});
+</script>
+</body>
+</html>

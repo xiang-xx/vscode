@@ -280,6 +280,13 @@ export class SuperAgentChatPageContribution extends Disposable implements IWorkb
 		if (!this.titleEl) {
 			return;
 		}
+		// The back arrow only exists off the main (Router) surface: while a
+		// worker timeline or the history list is shown.
+		const offMain = !!worker || !!this.panel?.historyMode;
+		const back = this.headerEl?.querySelector<HTMLButtonElement>('.zcode-superagent-back');
+		if (back) {
+			back.style.display = offMain ? '' : 'none';
+		}
 		if (this.panel?.historyMode) {
 			this.titleEl.textContent = localize('superAgentHistoryTitle', "History");
 			return;
@@ -330,6 +337,18 @@ export class SuperAgentChatPageContribution extends Disposable implements IWorkb
 		this.titleEl = dom.append(header, dom.$('span.zcode-superagent-page-title'));
 		this.titleEl.textContent = localize('superAgentPageTitle', "Workers");
 
+		const back = dom.append(header, dom.$<HTMLButtonElement>('button.zcode-chrome-action.zcode-superagent-back', {
+			type: 'button',
+			title: localize('backToRouterChat', "Back to main chat"),
+			'aria-label': localize('backToRouterChat', "Back to main chat"),
+		}));
+		back.classList.add(...ThemeIcon.asClassNameArray(Codicon.arrowLeft));
+		back.style.display = 'none';
+		this._register(dom.addDisposableListener(back, dom.EventType.CLICK, () => {
+			this.panel?.setHistoryMode(false);
+			this.showRouterOnPage();
+		}));
+
 		const newTask = dom.append(header, dom.$<HTMLButtonElement>('button.zcode-chrome-action', { type: 'button', title: localize('newTaskInRouter', "New task — type it in the Router chat above") }));
 		newTask.classList.add(...ThemeIcon.asClassNameArray(Codicon.plus));
 		this._register(dom.addDisposableListener(newTask, dom.EventType.CLICK, () => {
@@ -338,6 +357,18 @@ export class SuperAgentChatPageContribution extends Disposable implements IWorkb
 		}));
 
 		this.summaryEl = dom.append(header, dom.$('span.zcode-superagent-page-summary'));
+
+		// Always-visible home sits left of history (bottom-right of the strip).
+		const homeBtn = dom.append(header, dom.$<HTMLButtonElement>('button.zcode-chrome-action', {
+			type: 'button',
+			title: localize('superAgentHome', "首页"),
+			'aria-label': localize('superAgentHome', "首页"),
+		}));
+		homeBtn.classList.add(...ThemeIcon.asClassNameArray(Codicon.home));
+		this._register(dom.addDisposableListener(homeBtn, dom.EventType.CLICK, () => {
+			this.panel?.setHistoryMode(false);
+			this.showRouterOnPage();
+		}));
 
 		const historyBtn = dom.append(header, dom.$<HTMLButtonElement>('button.zcode-chrome-action', {
 			type: 'button',
@@ -415,7 +446,7 @@ export class SuperAgentChatPageContribution extends Disposable implements IWorkb
 	}
 
 	/**
-	 * Heights live inline. The strip hugs the worker list (2-col grid) and
+	 * Heights live inline. The strip hugs the worker list (multi-column grid) and
 	 * still leaves ~160px of chat above. After sizing, push chat up by the
 	 * same amount so the list occupies chat space instead of covering it.
 	 */
