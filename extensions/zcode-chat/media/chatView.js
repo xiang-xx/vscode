@@ -2034,7 +2034,7 @@
 			return 'Worker 正在等你输入…';
 		}
 		if (item.status === 'stalled') {
-			return 'Worker 疑似卡死，可到 Workers 列表处理';
+			return 'Worker 疑似卡死，可到主页 Workers 面板处理';
 		}
 		return 'Worker 正在回复…';
 	}
@@ -2419,18 +2419,26 @@
 		btn.type = 'button';
 		btn.className = 'worker-card-remove';
 		btn.textContent = '✕';
-		btn.title = '删除该 Worker（强制移除，不进历史）';
+		btn.title = '移除该 Worker（进入历史，可从历史菜单恢复）';
 		btn.setAttribute('aria-label', '删除该 Worker');
 		btn.addEventListener('click', (e) => {
 			e.stopPropagation();
 			e.preventDefault();
-			if (!group.workerId) {
+			// Legacy dirty cards (rebuilt by the old reconcile code) can lack
+			// workerId entirely — the click used to be swallowed right here and
+			// the card became undeletable. Send whatever keys exist; the
+			// extension matches by any of them. Rebuilt card ids encode the
+			// session id (`dispatch-rebuilt-<sessionId>`), so cardId alone is
+			// enough for suppression too.
+			const cardId = (group.turns && group.turns[0] && group.turns[0].id) || '';
+			if (!group.workerId && !group.workerSessionId && !cardId) {
 				return;
 			}
 			vscode.postMessage({
 				type: 'removeWorkerCard',
-				workerId: group.workerId,
+				workerId: group.workerId || '',
 				workerSessionId: group.workerSessionId || '',
+				cardId,
 			});
 		});
 		return btn;
@@ -2920,6 +2928,11 @@
 			: parseInt(boardColumnsSetting, 10);
 		const gap = 8;
 		const availW = board.clientWidth;
+		if (!(availW > 0)) {
+			// Hidden or mid-transition (0×0) board: keep the last good layout
+			// instead of collapsing every card to zero width.
+			return;
+		}
 		board.querySelectorAll('.board-section-cards').forEach((host) => {
 			const section = host.closest('.board-section');
 			// 收集现有卡片（可能还在旧列容器里），按权威顺序排好。
@@ -2991,18 +3004,43 @@
 		}
 		if (!board._boardColumnsRO) {
 			board._boardColumnsRO = new ResizeObserver(() => {
-				updateBoardEdgeBreakout(board);
-				if (boardColumnsSetting === 'auto') {
-					applyBoardColumns(board);
+				if (!board.isConnected) {
+					return;
 				}
+				updateBoardEdgeBreakout(board);
+				// Re-run for explicit column counts too: the count stays fixed but
+				// the per-column track width must follow the panel width, otherwise
+				// maximizing the panel leaves the cards at the old narrow width.
+				applyBoardColumns(board);
 			});
 			board._boardColumnsRO.observe(board);
 			// Watch the scroller too: panel resizes must re-run the breakout even
-			// when the board's own size has not changed yet.
-			const host = board.closest('.timeline') || board.parentElement;
+			// when the board's own size has not changed yet. Re-resolve the host in
+			// case the board was still detached when this observer was created.
+			const host = (board.isConnected ? board.closest('.timeline') : null) || board.parentElement || timelineEl;
 			if (host) {
 				board._boardColumnsRO.observe(host);
 			}
+		}
+		// Belt and braces: resizing the webview itself (panel maximize, window
+		// resize) must re-run the layout even when element observers miss it —
+		// the board can keep a pinned inline width from the previous breakout
+		// while only the scroller around it changed size.
+		if (!board._boardColumnsWinResize) {
+			board._boardColumnsWinResize = () => {
+				if (!board.isConnected || board._boardColumnsWinRAF) {
+					return;
+				}
+				board._boardColumnsWinRAF = requestAnimationFrame(() => {
+					board._boardColumnsWinRAF = 0;
+					if (!board.isConnected) {
+						return;
+					}
+					updateBoardEdgeBreakout(board);
+					applyBoardColumns(board);
+				});
+			};
+			window.addEventListener('resize', board._boardColumnsWinResize);
 		}
 		if (board.querySelector(':scope > .board-columns-control')) {
 			return;
@@ -4425,6 +4463,19 @@
 	}
 
 	document.addEventListener('click', (e) => {
+		const fileLink = e.target && e.target.closest ? e.target.closest('a.zcode-file-link') : null;
+		if (fileLink) {
+			e.preventDefault();
+			e.stopPropagation();
+			vscode.postMessage({
+				type: 'openChatFileLink',
+				path: fileLink.getAttribute('data-path') || (fileLink.textContent || '').trim(),
+				line: Number(fileLink.getAttribute('data-line')) || undefined,
+				endLine: Number(fileLink.getAttribute('data-end-line')) || undefined,
+				col: Number(fileLink.getAttribute('data-col')) || undefined,
+			});
+			return;
+		}
 		const copyBtn = e.target && e.target.closest && e.target.closest('.codeblock-copy');
 		if (copyBtn) {
 			e.preventDefault();
@@ -4512,7 +4563,12 @@
 			composer.appendChild(pill);
 		}
 		const label = title && title !== '新对话' ? title : 'AI 任务已完成';
-		pill.textContent = `待查看 · ${label}`;
+		const dot = document.createElement('span');
+		dot.className = 'done-pill-dot';
+		const text = document.createElement('span');
+		text.className = 'done-pill-text';
+		text.textContent = `待查看 · ${label}`;
+		pill.replaceChildren(dot, text);
 		pill.title = `${label}（点击查看）`;
 		pill.hidden = false;
 	}

@@ -268,6 +268,11 @@ class ToggleMaximizedAuxiliaryBar extends Action2 {
 			tooltip: localize('maximizeAuxiliaryBarTooltip2', "Maximize Secondary Side Bar"),
 			f1: true,
 			category: Categories.View,
+			keybinding: {
+				weight: KeybindingWeight.WorkbenchContrib,
+				primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyM,
+				mac: { primary: KeyMod.CtrlCmd | KeyCode.KeyM },
+			},
 			icon: maximizeIcon,
 			toggled: {
 				condition: AuxiliaryBarMaximizedContext,

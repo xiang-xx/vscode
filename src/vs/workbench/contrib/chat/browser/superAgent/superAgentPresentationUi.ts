@@ -5,6 +5,7 @@
 
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../base/common/observable.js';
+import { addDisposableListener, EventType } from '../../../../../base/browser/dom.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IContextKey, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
@@ -13,7 +14,7 @@ import { IPaneCompositePartService } from '../../../../services/panecomposite/br
 import { IChatRouterService } from '../../common/superAgent/chatRouterService.js';
 import { ISuperAgentPresentationQueue } from '../../common/superAgent/superAgentPresentationQueue.js';
 import { ZCODE_VIEW_CONTAINER_ID } from '../zcode/zcodeAuxiliaryBarChrome.js';
-import { SuperAgentWorkerDetailOpen, SuperAgentWorkerViewable, ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
+import { BackToSuperAgentRouterAction, SuperAgentWorkerDetailOpen, SuperAgentWorkerViewable, ViewPendingSuperAgentWorkerAction, ZCODE_INTERNAL_TOGGLE_SUPERAGENT_WORKERS } from './superAgentCommands.js';
 
 /**
  * Single-page presentation chrome (§5.5):
@@ -66,6 +67,24 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 				this.routerService.getWorker(presentedId)?.state.read(reader);
 			}
 			this.syncChrome(presentedId, toastItem?.workerId, pending.length);
+		}));
+
+		// Mouse back / forward side buttons (Chromium buttons 3 / 4) mirror the
+		// ⌘[ / ⌘] chords from anywhere in the workbench window — same gates as
+		// the keybindings (back needs an open worker detail, forward something
+		// viewable). Clicks landing inside the webview iframe are handled
+		// webview-side instead (superAgentKeys.js) and never reach this
+		// listener. XButtons only deliver mouseup, so that is the event to own.
+		this._register(addDisposableListener(window, EventType.MOUSE_UP, e => {
+			if (e.button === 3 /* back */) {
+				if (this.workerDetailOpen.get()) {
+					void this.commandService.executeCommand(BackToSuperAgentRouterAction.ID);
+				}
+			} else if (e.button === 4 /* forward */) {
+				if (this.workerViewable.get()) {
+					void this.commandService.executeCommand(ViewPendingSuperAgentWorkerAction.ID);
+				}
+			}
 		}));
 	}
 

@@ -44,6 +44,8 @@ export interface AcpClientOptions {
 	model?: string;
 	/** Injected into session/new so Cursor can use IDE browser MCP tools. */
 	mcpServers?: AcpMcpServerConfig[];
+	/** Full environment for the agent child. Defaults to `process.env`. */
+	env?: NodeJS.ProcessEnv;
 	onUpdate?: (update: AcpSessionUpdate) => void;
 	onPermission?: (params: unknown) => AcpPermissionOutcome | Promise<AcpPermissionOutcome>;
 	onCursorNotification?: (method: string, params: unknown) => void | Promise<void>;
@@ -65,17 +67,72 @@ const PROMPT_IDLE_TIMEOUT_MS = 10 * 60_000;
 /** Absolute ceiling so a wedged prompt cannot hang forever. */
 const PROMPT_MAX_TIMEOUT_MS = 60 * 60_000;
 
+/**
+ * Transport failures the Cursor CLI labels RetriableError.
+ * ACP runs with enableAgentRetries off, so these arrive here on the first drop:
+ * "Stream ended without turnEnded", "Connection stalled" (30s inbound watchdog),
+ * HTTP/2 CANCEL, stalled PINGs, and DNS blips.
+ */
+const TRANSPORT_DROP_RE = /RetriableError|ConnectError|Stream ended without turnEnded|Connection stalled|PING timed out|http\/2 stream closed|bidi_append_deadline_exceeded|ECONNRESET|socket hang up|EAI_AGAIN|ETIMEDOUT|ENOTFOUND|\[unavailable\]|\[deadline_exceeded\]|\[aborted\]/i;
+
+export function isCursorTransportDrop(message: string): boolean {
+	const text = message.trim();
+	if (!text) {
+		return false;
+	}
+	const head = text.split(/\r?\n/, 1)[0];
+	return TRANSPORT_DROP_RE.test(head) || TRANSPORT_DROP_RE.test(text.slice(0, 500));
+}
+
+/** Assistant text that is only a leaked transport dump, not a real answer. */
+export function isCursorTransportDump(text: string): boolean {
+	const trimmed = text.trim();
+	if (!trimmed || trimmed.length > 400 || trimmed.includes('```')) {
+		return false;
+	}
+	if (/unauthorized|payment|subscription|not logged in|rate limit/i.test(trimmed)) {
+		return false;
+	}
+	return /^(?:Error:\s*)?(?:RetriableError|ConnectError)\b/i.test(trimmed)
+		|| /^Stream ended without turnEnded/i.test(trimmed)
+		|| /^Connection stalled\b/i.test(trimmed);
+}
+
+/**
+ * Shown after retries are exhausted. Must not contain "cancel" or "abort":
+ * the chat panel treats those substrings as a user stop.
+ */
+export function formatCursorTransportFailure(attempts: number, last: string): string {
+	const first = last.split(/\r?\n/, 1)[0].trim();
+	const safe = first
+		.replace(/\[canceled\]/gi, '[stream closed]')
+		.replace(/cancel(?:led|ed|lation)?/gi, 'dropped')
+		.replace(/abort(?:ed)?/gi, 'dropped');
+	return `Cursor Agent connection dropped after ${attempts} attempts. ${safe}`;
+}
+
 export class CursorAcpClient {
 	private child?: ChildProcessWithoutNullStreams;
 	private nextId = 1;
 	private readonly pending = new Map<number, Pending>();
 	private sessionId?: string;
 	private closed = false;
+	/** Ignore session/update replay while session/load is in flight. */
+	private suppressUpdates = 0;
 
 	constructor(private readonly options: AcpClientOptions) { }
 
 	get activeSessionId(): string | undefined {
 		return this.sessionId;
+	}
+
+	get isRunning(): boolean {
+		return !!this.child && !this.closed && !this.child.killed && this.child.exitCode === null;
+	}
+
+	/** Process exited or dispose() ran. A new client is required. */
+	get isClosed(): boolean {
+		return this.closed;
 	}
 
 	async start(): Promise<void> {
@@ -110,7 +167,7 @@ export class CursorAcpClient {
 		try {
 			this.child = spawn(bin, spawnArgs, {
 				cwd,
-				env: { ...process.env },
+				env: this.options.env ? { ...this.options.env } : { ...process.env },
 				stdio: ['pipe', 'pipe', 'pipe'],
 			});
 		} catch (err) {
@@ -160,6 +217,29 @@ export class CursorAcpClient {
 		return result.sessionId;
 	}
 
+	/**
+	 * Resume a Cursor chat created earlier in this turn.
+	 * History replay notifications are swallowed so the timeline is not duplicated.
+	 * Cursor sometimes returns "Session not found" for a live id; callers should
+	 * fall back to session/new.
+	 */
+	async loadSession(sessionId: string): Promise<string> {
+		const cwd = await assertDirectory(this.options.cwd, 'Cursor ACP cwd');
+		const mcpServers = (this.options.mcpServers ?? []).map(normalizeAcpMcpServer);
+		this.suppressUpdates++;
+		try {
+			const result = await this.request('session/load', {
+				sessionId,
+				cwd,
+				mcpServers,
+			}, 30_000) as { sessionId?: string };
+			this.sessionId = result?.sessionId || sessionId;
+			return this.sessionId;
+		} finally {
+			this.suppressUpdates--;
+		}
+	}
+
 	async prompt(text: string): Promise<{ stopReason?: string }> {
 		if (!this.sessionId) {
 			await this.newSession();
@@ -174,12 +254,12 @@ export class CursorAcpClient {
 		return result ?? {};
 	}
 
-	async cancel(): Promise<void> {
+	async cancel(timeoutMs = 120_000): Promise<void> {
 		if (!this.sessionId || this.closed) {
 			return;
 		}
 		try {
-			await this.request('session/cancel', { sessionId: this.sessionId });
+			await this.request('session/cancel', { sessionId: this.sessionId }, timeoutMs);
 		} catch {
 			// ignore
 		}
@@ -319,6 +399,9 @@ export class CursorAcpClient {
 		}
 
 		if (msg.method === 'session/update') {
+			if (this.suppressUpdates > 0) {
+				return;
+			}
 			this.bumpIdleTimers();
 			const params = msg.params as { update?: Record<string, unknown> } | undefined;
 			const update = params?.update ?? {};
@@ -357,6 +440,9 @@ export class CursorAcpClient {
 		}
 
 		if (msg.method?.startsWith('cursor/')) {
+			if (this.suppressUpdates > 0) {
+				return;
+			}
 			this.bumpIdleTimers();
 			void this.options.onCursorNotification?.(msg.method, msg.params);
 		}

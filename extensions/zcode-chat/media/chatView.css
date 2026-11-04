@@ -553,10 +553,12 @@ button {
 	line-height: 1.4;
 	color: var(--vscode-descriptionForeground);
 }
-/* Short worker title — plain muted label, no colored chip. */
+/* Worker title under the receipt. Width follows the text up to the row. */
 .dispatch-badge {
 	display: inline-block;
-	max-width: 12em;
+	flex: 0 1 auto;
+	min-width: 0;
+	max-width: min(100%, 36rem);
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -806,7 +808,7 @@ button {
 	width: fit-content;
 }
 .dispatch-target-badge {
-	max-width: 22em;
+	max-width: min(100%, 36rem);
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -942,14 +944,15 @@ button {
 	display: none;
 }
 .worker-card-title {
-	flex: 1;
+	/* 宽度跟着卡片走：文字多长就占多宽，只有超出卡片才省略 */
+	flex: 1 1 auto;
 	min-width: 0;
-	/* 允许标题占两行，避免窄卡片/多列布局下一行就被截成十几个字 */
+	max-width: 100%;
 	display: -webkit-box;
 	-webkit-box-orient: vertical;
 	-webkit-line-clamp: 2;
 	overflow: hidden;
-	overflow-wrap: anywhere;
+	overflow-wrap: break-word;
 	font-size: var(--zcode-chat-font-size);
 	font-weight: 600;
 	color: var(--vscode-foreground);
@@ -2142,31 +2145,47 @@ button {
 	box-shadow: 0 0 0 1px var(--vscode-widget-border, rgba(127,127,127,.22));
 }
 /* "待查看" pill — floats above the composer's top-right corner after a turn
-   finishes; the whole pill is one button, so all of it is clickable. */
+   finishes; the whole pill is one button, so all of it is clickable.
+   Flat VS Code style: editor-widget surface, hairline border, no shadow; a
+   small green status dot carries the "finished" accent. */
 .done-pill {
 	position: absolute;
-	top: -32px;
+	top: -30px;
 	right: 10px;
 	z-index: 30;
-	display: inline-block;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
 	max-width: min(72%, 420px);
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-	padding: 5px 12px;
+	padding: 3px 10px;
 	font-family: inherit;
 	font-size: 11.5px;
 	line-height: 1.4;
-	color: #ffffff;
-	background: #238636;
-	border: 1px solid rgba(255, 255, 255, 0.28);
-	border-radius: 999px;
-	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+	color: var(--vscode-editorWidget-foreground, #cccccc);
+	background: var(--vscode-editorWidget-background, #26292c);
+	border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.35));
+	border-radius: 6px;
 	cursor: pointer;
 }
 .done-pill:hover {
-	background: #2ea043;
-	border-color: rgba(255, 255, 255, 0.4);
+	background: var(--vscode-list-hoverBackground, rgba(88, 96, 108, 0.25));
+	border-color: var(--vscode-input-border, rgba(127, 127, 127, 0.5));
+}
+.done-pill:focus-visible {
+	outline: 1px solid var(--vscode-focusBorder, #007fd4);
+	outline-offset: 1px;
+}
+.done-pill-dot {
+	flex: none;
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--vscode-charts-green, #3fb950);
+}
+.done-pill-text {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
 }
 .done-pill[hidden] {
 	display: none;
@@ -2656,6 +2675,36 @@ textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 	font-size: 11px;
 	flex-shrink: 0;
 }
+
+/* Full-row hit target for stream expand/collapse headers (tool / reasoning / activity groups):
+   the whole line toggles, not just the small chevron. Keeps left alignment unchanged
+   (no left padding / negative margin) so nothing shifts and nothing overflows horizontally. */
+.tool-header,
+.reasoning-header,
+.activity-header {
+	display: flex;
+	width: 100%;
+	box-sizing: border-box;
+	min-height: 26px;
+	align-items: center;
+	padding-right: 8px;
+	border-radius: 4px;
+}
+.reasoning-header .stream-line,
+.tool-header .summary {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+.tool-header:hover,
+.tool-row.expandable .tool-header:hover,
+.reasoning-header:hover,
+.activity-header:hover,
+.tool-header:focus-visible,
+.tool-row.expandable .tool-header:focus-visible,
+.reasoning-header:focus-visible,
+.activity-header:focus-visible {
+	background: color-mix(in srgb, var(--vscode-foreground, currentColor) 7%, transparent);
+}
 /* Live output preview inside a running dispatch frame (ephemeral, muted). */
 .dispatch-row .dispatch-live {
 	font-family: var(--vscode-editor-font-family), var(--monaco-monospace-font), monospace;
@@ -2670,4 +2719,21 @@ textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 	margin: 2px 0 0;
 	padding: 2px 0 2px 10px;
 	border-left: 2px solid var(--vscode-widget-border);
+}
+
+/* Clickable file references injected by media/markdown.js */
+.zcode-file-link {
+	color: var(--vscode-textLink-foreground);
+	text-decoration: none;
+	border-bottom: 1px dashed var(--vscode-textLink-foreground);
+	cursor: pointer;
+}
+.zcode-file-link:hover,
+.zcode-file-link:focus {
+	color: var(--vscode-textLink-activeForeground);
+	border-bottom-style: solid;
+}
+a.zcode-file-link,
+a.zcode-file-link:visited {
+	color: var(--vscode-textLink-foreground);
 }

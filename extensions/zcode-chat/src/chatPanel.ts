@@ -86,6 +86,7 @@ import {
 	IDE_CHAT_SOURCE_ZCODE,
 	IdeChatStore,
 	isProvisionalSessionTitle,
+	sameWorkspaceRoot,
 	titleFromMessages,
 	type IdeChatSessionMeta,
 } from './ideChatStore';
@@ -409,11 +410,87 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		vscode.commands.registerCommand('zcode.removeWorkerDispatches', (opts?: {
 			sessionId?: string;
 			workerId?: string;
+			workerSessionId?: string;
 		}) => {
-			if (!opts || typeof opts.sessionId !== 'string' || typeof opts.workerId !== 'string') {
+			if (!opts || typeof opts.workerId !== 'string' || !opts.workerId) {
 				return;
 			}
-			this.removeWorkerDispatches({ sessionId: opts.sessionId, workerId: opts.workerId });
+			const workerId = opts.workerId;
+			// The workbench's workerRemoved event now forwards the worker chat
+			// session id — after a history-menu delete the roster row is already
+			// gone, so this is the only source for the second suppression key.
+			const payloadSessionId = typeof opts.workerSessionId === 'string' ? opts.workerSessionId : '';
+			// The board owner is the panel's Router binding; the workbench
+			// payload may be stale or missing the id.
+			const routerId = this.routerSessionId
+				?? (typeof opts.sessionId === 'string' && opts.sessionId ? opts.sessionId : undefined);
+			if (!routerId) {
+				return;
+			}
+			// This command is also the workbench's channel for rail closes and
+			// history-menu deletes (workerRemoved event) — record durable
+			// suppression keys for those too, completing the sessionId from
+			// the board card or the workbench roster, or the kind:'worker'
+			// rehydration scan resurrects the worker on the next board open.
+			const collectKeys = async (): Promise<string[]> => {
+				if (payloadSessionId) {
+					return [workerId, payloadSessionId];
+				}
+				const chat = routerId === this.sessionId ? this.captureView() : this.parked.get(routerId);
+				const cardSessionId = chat?.items
+					.find((row): row is Extract<ConversationItem, { kind: 'dispatch' }> => row?.kind === 'dispatch' && row.workerId === workerId)
+					?.workerSessionId;
+				if (cardSessionId) {
+					return [workerId, cardSessionId];
+				}
+				try {
+					const rows = await vscode.commands.executeCommand<{ sessionId?: string; workerId?: string }[]>('zcode.internal.superAgent.listWorkerChatSessions');
+					const hit = Array.isArray(rows) ? rows.find(row => row?.workerId === workerId) : undefined;
+					return [workerId, hit?.sessionId].filter((key): key is string => !!key);
+				} catch {
+					return [workerId];
+				}
+			};
+			this.removeWorkerDispatches({ sessionId: routerId, workerId, workerSessionId: payloadSessionId || undefined });
+			void collectKeys().then(keys => this.ideChat.addRemovedWorkers(routerId, keys, this.sessionListScope())).catch(() => undefined);
+		});
+		// History-menu delete terminal flow: dropping a closed worker from the
+		// workbench history must also delete its chat session file — the
+		// `kind: 'worker'` tag on that file is what rehydration scans, and a
+		// leftover file resurrected the worker as an unclickable zombie card.
+		vscode.commands.registerCommand('zcode.deleteChatSession', async (sessionId?: unknown) => {
+			if (typeof sessionId !== 'string' || !sessionId) {
+				return;
+			}
+			if (sessionId === this.routerSessionId) {
+				return; // never delete the Router through this side channel
+			}
+			await this.deleteSession(sessionId).catch(() => undefined);
+		});
+		// Restore-from-history flow: re-run board rehydration immediately so the
+		// restored worker's card comes back (and its ✕ suppression lifts)
+		// without waiting for the next window reload.
+		vscode.commands.registerCommand('zcode.reconcileWorkerBoard', (opts?: {
+			// History-menu restore: lift the durable ✕ for these worker keys
+			// BEFORE rehydrating — rehydration now honors suppression for live
+			// rows too, so an unlifed key would keep the restored worker off
+			// the board forever.
+			lift?: { workerId?: string; workerSessionId?: string }[];
+		}) => {
+			const run = async (): Promise<void> => {
+				const routerId = this.routerSessionId;
+				if (!routerId) {
+					return;
+				}
+				const keys = (opts?.lift ?? [])
+					.flatMap(entry => [entry?.workerId, entry?.workerSessionId])
+					.filter((key): key is string => typeof key === 'string' && !!key);
+				if (keys.length) {
+					await this.ideChat.clearRemovedWorkers(routerId, keys, this.sessionListScope()).catch(() => undefined);
+				}
+				await this.reconcileWorkerBoard(routerId);
+			};
+			void run();
 		});
 	}
 
@@ -474,6 +551,48 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
+	 * Ranks Router-session candidates: dispatch-card count wins — an empty
+	 * shell (including a freshly minted one) must never outrank the Router
+	 * that actually holds the dispatch history; latest activity breaks ties.
+	 * Reads sessions defensively — unreadable candidates score 0.
+	 */
+	private async pickRouterCandidate(candidates: { id: string }[], preferredId?: string, workspaceRoot?: string): Promise<{ id: string } | undefined> {
+		let best: { id: string; cards: number; score: number } | undefined;
+		for (const candidate of candidates) {
+			let updatedAt = 0;
+			let cards = 0;
+			let readable = false;
+			try {
+				const session = await this.ideChat.getSession(candidate.id) as { updatedAt?: number; createdAt?: number; timeline?: { kind?: string }[]; workspaceRoot?: string } | undefined;
+				if (session) {
+					// Defense in depth: never bind this window to a Router that
+					// was created under a different folder — following the
+					// editor's opened directory is the whole contract here.
+					if (workspaceRoot && !sameWorkspaceRoot(session.workspaceRoot, workspaceRoot)) {
+						continue;
+					}
+					readable = true;
+					updatedAt = Number(session.updatedAt ?? session.createdAt ?? 0) || 0;
+					cards = (session.timeline ?? []).filter(row => row?.kind === 'dispatch').length;
+				}
+			} catch {
+				// Unreadable session — score 0.
+			}
+			if (!readable) {
+				continue; // deleted or corrupt — never bind to it
+			}
+			// Preferred (previously bound) id wins exact ties so we stay
+			// stable across activations instead of flip-flopping between
+			// equally-empty shells.
+			const score = updatedAt + (candidate.id === preferredId ? 1 : 0);
+			if (!best || cards > best.cards || (cards === best.cards && score > best.score)) {
+				best = { id: candidate.id, cards, score };
+			}
+		}
+		return best ? { id: best.id } : undefined;
+	}
+
+	/**
 	 * Ensures a dedicated "Router" chat session exists and is focused.
 	 * The Workers rail docks above this session — its composer is the
 	 * Super Agent dispatch box (messages spawn workers instead of answering).
@@ -489,24 +608,60 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 		const reuse = async (id: string): Promise<string> => {
 			this.routerSessionId = id;
+			if (this.sessionId === id) {
+				void this.reconcileWorkerBoard(id); // already displaying it — nothing to reopen
+				return id;
+			}
 			await this.openSession(id);
+			void this.reconcileWorkerBoard(id);
 			return id;
 		};
 
-		if (this.routerSessionId) {
-			const id = this.routerSessionId;
-			const alive = id === this.sessionId
-				|| this.openTabIds.includes(id)
-				|| this.parked.has(id)
-				|| this.sessionList.some(s => s.id === id);
-			if (alive) {
-				return reuse(id);
+		// Router selection is STRICTLY scoped to the folder this window has
+		// open. A Router and its workers belong to the workspace root they
+		// were created under; adopting another folder's Router makes the next
+		// save re-tag it, which is how windows used to "steal" each other's
+		// worker boards. Candidates therefore come only from this root: the
+		// cached id (verified against the store), this window's tabs and
+		// session list (already root-scoped), and a root-scoped store query.
+		// Rank by dispatch-card count so an empty Router shell never
+		// outranks the Router that holds the dispatch history; mint a fresh
+		// Router only when no same-root candidate is readable.
+		const scope = this.sessionListScope();
+		const seen = new Set<string>();
+		const candidates: { id: string }[] = [];
+		const push = (id: string | undefined) => {
+			if (id && !seen.has(id)) {
+				seen.add(id);
+				candidates.push({ id });
 			}
-			this.routerSessionId = undefined;
+		};
+		if (this.routerSessionId) {
+			// A cached binding minted by an older (cross-root) run may point
+			// at another folder's Router — verify before trusting it.
+			const cached = await this.ideChat.getSession(this.routerSessionId).catch(() => undefined);
+			if (cached && (!scope || sameWorkspaceRoot(cached.workspaceRoot, scope.workspaceRoot))) {
+				push(this.routerSessionId);
+			} else {
+				this.routerSessionId = undefined;
+			}
 		}
-
-		const titled = this.buildTitleTabs().find(t => t.title === 'Router')
-			?? this.sessionList.find(s => s.title === 'Router');
+		for (const candidate of [
+			...this.buildTitleTabs().filter(t => t.title === 'Router'),
+			...this.sessionList.filter(s => s.title === 'Router'),
+		]) {
+			push(candidate.id);
+		}
+		try {
+			for (const meta of await this.ideChat.listSessions({ ...scope, limit: 500 })) {
+				if (meta.title === 'Router') {
+					push(meta.id);
+				}
+			}
+		} catch {
+			// Store unreadable — cached/tab candidates above still apply.
+		}
+		const titled = await this.pickRouterCandidate(candidates, this.routerSessionId, scope?.workspaceRoot);
 		if (titled) {
 			return reuse(titled.id);
 		}
@@ -521,6 +676,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const session = await this.ideChat.createSession({
 			...this.draftSessionOptions(),
 			title: 'Router',
+			kind: 'router',
 		});
 		this.applySession(session.id, [], [], true);
 		// Router+Worker mode: no session tab strip. Keep the Router as the
@@ -542,6 +698,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const session = await this.ideChat.createSession({
 			...this.draftSessionOptions(),
 			title,
+			kind: 'worker',
 		});
 		this.workerSessionIds.add(session.id);
 		this.parked.set(session.id, {
@@ -564,6 +721,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		return session.id;
 	}
+
+	/** Dispatch card ids this window has loaded or merged — protects cross-window saves. */
+	private knownDispatchIds = new Set<string>();
 
 	/**
 	 * Is this chat session a Super Agent worker (not the Router, not a plain
@@ -717,6 +877,100 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			dispatchItemId,
 			workerSessionId,
 		});
+	}
+
+	/**
+	 * Ground truth for the Worker board: while a worker turn is executing, the
+	 * newest Router dispatch card for that worker must read "running". Covers
+	 * submits that bypassed mirrorWorkerFollowUpToRouter (router binding not
+	 * restored yet) and queued cards that were never promoted — creating the
+	 * receipt card from the submitted text when the mirror missed entirely.
+	 */
+	private markRouterDispatchRunning(workerSessionId: string, text?: string): void {
+		const routerId = this.routerSessionId;
+		if (!routerId || workerSessionId === routerId) {
+			return;
+		}
+		let changed = false;
+		const applied = this.mutateChat(routerId, chat => {
+			for (let i = chat.items.length - 1; i >= 0; i--) {
+				const row = chat.items[i];
+				if (row.kind !== 'dispatch' || row.workerSessionId !== workerSessionId) {
+					continue;
+				}
+				if (row.status !== 'running') {
+					row.status = 'running';
+					row.receipt = dispatchStatusLabel('running');
+					row.startedAt = row.startedAt ?? Date.now();
+					changed = true;
+				}
+				return;
+			}
+			if (text && text.trim()) {
+				chat.items.push({
+					id: newItemId('dispatch'),
+					kind: 'dispatch',
+					text: text.trim(),
+					workerSessionId,
+					receipt: dispatchStatusLabel('running'),
+					status: 'running',
+					startedAt: Date.now(),
+				});
+				changed = true;
+			}
+		});
+		if (!applied || !changed) {
+			return;
+		}
+		if (this.sessionId === routerId) {
+			this.startDispatchElapsedTimer();
+			this.pushState();
+		}
+		void this.persistSessionById(routerId);
+	}
+
+	/**
+	 * Reconcile dispatch card statuses against live runs every time a chat
+	 * (re)loads — returning to the home board, switching tabs, webview reload.
+	 * A worker session still present in this.runs forces its card back to
+	 * "running" (a stale parked snapshot must not wipe 进行中 on the way home),
+	 * while cards claiming running/queued with no live run settle to "done".
+	 */
+	private syncDispatchRunState(chatId: string): void {
+		if (!chatId) {
+			return;
+		}
+		let changed = false;
+		let anyRunning = false;
+		const applied = this.mutateChat(chatId, chat => {
+			for (const row of chat.items) {
+				if (row.kind !== 'dispatch' || !row.workerSessionId) {
+					continue;
+				}
+				const live = this.runs.has(row.workerSessionId);
+				const st = row.status as string | undefined;
+				if (live && (!st || st === 'queued' || st === 'pending' || st === 'starting')) {
+					row.status = 'running';
+					row.receipt = dispatchStatusLabel('running');
+					row.startedAt = row.startedAt ?? Date.now();
+					changed = true;
+				} else if (!live && (st === 'running' || st === 'starting' || st === 'queued' || st === 'pending')) {
+					row.status = 'done';
+					row.receipt = dispatchStatusLabel('done');
+					changed = true;
+				}
+				if (row.status === 'running') {
+					anyRunning = true;
+				}
+			}
+		});
+		if (!applied || !changed) {
+			return;
+		}
+		if (this.sessionId === chatId && anyRunning) {
+			this.startDispatchElapsedTimer();
+		}
+		void this.persistSessionById(chatId);
 	}
 
 	/**
@@ -890,15 +1144,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	/**
 	 * Removing a worker from the Workers rail also drops its dispatch bubbles
 	 * from the Router transcript, so the main list doesn't pile up dead tasks.
+	 * Matches by workerId OR workerSessionId OR cardId: cards rebuilt from bare
+	 * kind:'worker' sessions carry no workerId, and legacy dirty cards can
+	 * carry neither key — they used to be undeletable (immortal zombie cards
+	 * on the home board).
 	 */
-	removeWorkerDispatches(opts: { sessionId: string; workerId: string }): void {
-		const { sessionId, workerId } = opts;
-		if (!sessionId || !workerId) {
+	removeWorkerDispatches(opts: { sessionId: string; workerId?: string; workerSessionId?: string; cardId?: string }): void {
+		const { sessionId, workerId, workerSessionId, cardId } = opts;
+		if (!sessionId || (!workerId && !workerSessionId && !cardId)) {
 			return;
 		}
 		let changed = false;
 		this.mutateChat(sessionId, chat => {
-			const next = chat.items.filter(row => !(row.kind === 'dispatch' && row.workerId === workerId));
+			const next = chat.items.filter(row => !(row.kind === 'dispatch'
+				&& ((!!workerId && row.workerId === workerId) || (!!workerSessionId && row.workerSessionId === workerSessionId) || (!!cardId && row.id === cardId))));
 			if (next.length !== chat.items.length) {
 				chat.items = next;
 				changed = true;
@@ -908,7 +1167,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		// The composer can't target a worker that no longer exists.
-		if (this.dispatchTarget && this.dispatchTarget.workerId === workerId) {
+		if (workerId && this.dispatchTarget && this.dispatchTarget.workerId === workerId) {
 			this.dispatchTarget = undefined;
 		}
 		if (this.sessionId === sessionId) {
@@ -939,13 +1198,23 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			alive.add(id);
 		}
 		const orphanWorkers = new Set<string>();
+		const orphanSessions = new Set<string>();
 		for (const row of chat.items) {
-			if (row.kind === 'dispatch' && row.workerSessionId && row.workerId && !alive.has(row.workerSessionId)) {
-				orphanWorkers.add(row.workerId);
+			if (row.kind === 'dispatch' && row.workerSessionId && !alive.has(row.workerSessionId)) {
+				// Cards without workerId (rebuilt from kind:'worker' sessions)
+				// must prune by sessionId — they used to linger forever.
+				if (row.workerId) {
+					orphanWorkers.add(row.workerId);
+				} else {
+					orphanSessions.add(row.workerSessionId);
+				}
 			}
 		}
 		for (const workerId of orphanWorkers) {
 			this.removeWorkerDispatches({ sessionId: routerId, workerId });
+		}
+		for (const workerSessionId of orphanSessions) {
+			this.removeWorkerDispatches({ sessionId: routerId, workerSessionId });
 		}
 	}
 
@@ -1207,6 +1476,80 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState();
 	}
 
+	/**
+	 * Opens a file reference clicked in chat markdown (anchors injected by
+	 * media/markdown.js). Relative paths resolve against the folder this
+	 * window has open first — the chat follows the editor's workspace root —
+	 * then fall back to a workspace-wide search. Jumps to the referenced
+	 * line/range when the link carries one.
+	 */
+	private async openChatFileLink(rawPath: string, loc?: { line?: number; endLine?: number; col?: number }): Promise<void> {
+		const ref = String(rawPath || '').trim();
+		if (!ref) {
+			return;
+		}
+		const candidates: vscode.Uri[] = [];
+		const push = (p: string) => {
+			if (!p) {
+				return;
+			}
+			const uri = vscode.Uri.file(p);
+			if (!candidates.some(c => c.fsPath === uri.fsPath)) {
+				candidates.push(uri);
+			}
+		};
+		if (ref.startsWith('~/') && process.env.HOME) {
+			push(process.env.HOME + ref.slice(1));
+		} else if (ref.startsWith('/')) {
+			push(ref);
+		} else {
+			const roots: string[] = [];
+			const scope = this.sessionListScope();
+			if (scope?.workspaceRoot) {
+				roots.push(scope.workspaceRoot);
+			}
+			for (const folder of vscode.workspace.workspaceFolders ?? []) {
+				if (!roots.includes(folder.uri.fsPath)) {
+					roots.push(folder.uri.fsPath);
+				}
+			}
+			for (const root of roots) {
+				push(vscode.Uri.joinPath(vscode.Uri.file(root), ref.replace(/^\.\//, '')).fsPath);
+			}
+		}
+		let target: vscode.Uri | undefined;
+		for (const uri of candidates) {
+			try {
+				await vscode.workspace.fs.stat(uri);
+				target = uri;
+				break;
+			} catch {
+				// not there — try the next candidate
+			}
+		}
+		if (!target && !ref.startsWith('/') && !ref.startsWith('~/')) {
+			try {
+				const found = await vscode.workspace.findFiles('**/' + ref.replace(/^\.\//, ''), undefined, 1);
+				if (found.length > 0) {
+					target = found[0];
+				}
+			} catch {
+				// glob-invalid reference — leave unlinked
+			}
+		}
+		if (!target) {
+			void vscode.window.showWarningMessage(`ZCode Chat：未找到文件 ${ref}`);
+			return;
+		}
+		const line = Math.max(0, (loc?.line ?? 1) - 1);
+		const endLine = loc?.endLine && loc.endLine > (loc.line ?? 1) ? loc.endLine - 1 : line;
+		const col = Math.max(0, (loc?.col ?? 1) - 1);
+		await vscode.window.showTextDocument(target, {
+			selection: new vscode.Range(line, col, endLine, col),
+			preview: true,
+		});
+	}
+
 	private async onMessage(message: unknown): Promise<void> {
 		if (!message || typeof message !== 'object') {
 			return;
@@ -1229,6 +1572,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			attachmentId?: string;
 			path?: string;
 			open?: boolean;
+			line?: number;
+			endLine?: number;
+			col?: number;
 			answers?: AskUserAnswer[];
 			reason?: string;
 			planId?: string;
@@ -1421,19 +1767,93 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			await this.openSession(msg.sessionId);
 			return;
 		}
-		if (msg.type === 'openDispatch' && typeof msg.workerId === 'string' && msg.workerId) {
-			void vscode.commands.executeCommand('zcode.internal.superAgent.presentWorker', msg.workerId);
+		if (msg.type === 'openDispatch') {
+			const workerId = typeof msg.workerId === 'string' ? msg.workerId : '';
+			const workerSessionId = typeof (msg as { workerSessionId?: unknown }).workerSessionId === 'string'
+				? (msg as { workerSessionId?: unknown }).workerSessionId as string
+				: '';
+			if (workerId) {
+				void vscode.commands.executeCommand('zcode.internal.superAgent.presentWorker', workerId);
+			} else if (workerSessionId) {
+				// Card without workerId (rebuilt from a bare kind:'worker'
+				// session): reverse-lookup the roster so the worker timeline
+				// still opens instead of the click silently doing nothing.
+				void Promise.resolve(vscode.commands.executeCommand<{ sessionId?: string; workerId?: string }[]>('zcode.internal.superAgent.listWorkerChatSessions'))
+					.then(rows => {
+						const hit = Array.isArray(rows) ? rows.find(row => row?.sessionId === workerSessionId) : undefined;
+						if (hit?.workerId) {
+							void vscode.commands.executeCommand('zcode.internal.superAgent.presentWorker', hit.workerId);
+						}
+					})
+					.catch(() => undefined);
+			}
 			return;
 		}
-		if (msg.type === 'removeWorkerCard' && typeof msg.workerId === 'string' && msg.workerId) {
-			// Homepage board "✕": force-remove the worker from the router roster
-			// (no archive, also purges matching history rows) and drop its card /
-			// dispatch bubbles from this board right away.
-			void vscode.commands.executeCommand('zcode.internal.superAgent.forceRemoveWorker', { workerId: msg.workerId });
-			const routerId = this.routerSessionId;
-			if (routerId) {
-				this.removeWorkerDispatches({ sessionId: routerId, workerId: msg.workerId });
+		if (msg.type === 'removeWorkerCard') {
+			// Homepage board "✕": the workbench archives the worker into its
+			// history menu (restorable from there) and the card / dispatch
+			// bubbles leave this board right away. Record the removal durably
+			// (user-global store) so board rehydration — roster history rows or
+			// kind:'worker' session tags — cannot resurrect the card on the
+			// next window open in ANY editor sharing ~/.zcode.
+			//
+			// A card may carry only one of the two keys (older webviews omit
+			// workerSessionId; cards rebuilt from bare kind:'worker' sessions
+			// have no workerId) — accept either key, then complete the pair
+			// from the live Router card BEFORE removal. Suppression must cover
+			// both keys, or the kind:'worker' rehydration scan resurrects the
+			// worker as an unclickable, unremovable zombie card.
+			const workerId = typeof msg.workerId === 'string' ? msg.workerId : '';
+			let workerSessionId = typeof (msg as { workerSessionId?: unknown }).workerSessionId === 'string'
+				? (msg as { workerSessionId?: unknown }).workerSessionId as string
+				: '';
+			// Legacy dirty cards may carry NEITHER key — the webview then sends
+			// the card id. `dispatch-rebuilt-<sessionId>` ids still encode the
+			// session id, so recover it for durable suppression.
+			const cardId = typeof (msg as { cardId?: unknown }).cardId === 'string'
+				? (msg as { cardId?: unknown }).cardId as string
+				: '';
+			if (cardId.startsWith('dispatch-rebuilt-')) {
+				workerSessionId = workerSessionId || cardId.slice('dispatch-rebuilt-'.length);
 			}
+			if (!workerId && !workerSessionId && !cardId) {
+				return;
+			}
+			if (workerId) {
+				void vscode.commands.executeCommand('zcode.internal.superAgent.forceRemoveWorker', { workerId });
+			}
+			const routerId = this.routerSessionId;
+			if (!routerId) {
+				return;
+			}
+			if (!workerId || !workerSessionId) {
+				const chat = routerId === this.sessionId ? this.captureView() : this.parked.get(routerId);
+				const card = chat?.items.find((row): row is Extract<ConversationItem, { kind: 'dispatch' }> =>
+					row?.kind === 'dispatch'
+					&& ((!!workerId && row.workerId === workerId) || (!!workerSessionId && row.workerSessionId === workerSessionId) || (!!cardId && row.id === cardId)));
+				if (card) {
+					workerSessionId = workerSessionId || card.workerSessionId || '';
+				}
+			}
+			if (!workerId && workerSessionId) {
+				// Legacy card without workerId: reverse-lookup the roster so the
+				// workbench still archives the worker into its history menu.
+				void Promise.resolve(vscode.commands.executeCommand<{ sessionId?: string; workerId?: string }[]>('zcode.internal.superAgent.listWorkerChatSessions'))
+					.then(rows => {
+						const hit = Array.isArray(rows) ? rows.find(row => row?.sessionId === workerSessionId) : undefined;
+						if (hit?.workerId) {
+							return vscode.commands.executeCommand('zcode.internal.superAgent.forceRemoveWorker', { workerId: hit.workerId });
+						}
+						return undefined;
+					})
+					.catch(() => undefined);
+			}
+			this.removeWorkerDispatches({ sessionId: routerId, workerId: workerId || undefined, workerSessionId: workerSessionId || undefined, cardId: cardId || undefined });
+			const keys = [workerId, workerSessionId].filter((key): key is string => !!key);
+			// Workspace-scoped: the Router binding can change between launches
+			// (another Router outranks it, a second editor app binds its own) —
+			// pinning the suppression to one router id let the card resurrect.
+			void this.ideChat.addRemovedWorkers(routerId, keys, this.sessionListScope()).catch(() => undefined);
 			return;
 		}
 		if (msg.type === 'viewPendingWorker') {
@@ -1525,6 +1945,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'manageAccount') {
 			await vscode.commands.executeCommand('zcode.manageAccount');
+			return;
+		}
+		if (msg.type === 'openChatFileLink' && typeof msg.path === 'string') {
+			await this.openChatFileLink(msg.path, {
+				line: typeof msg.line === 'number' ? msg.line : undefined,
+				endLine: typeof msg.endLine === 'number' ? msg.endLine : undefined,
+				col: typeof msg.col === 'number' ? msg.col : undefined,
+			});
 			return;
 		}
 		if (msg.type === 'openAttachment' && typeof msg.path === 'string') {
@@ -2581,6 +3009,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// createWorkerSession stay off this path — Router already has the
 		// initial dispatch card from handleSend.
 		this.notifyRouterWorkerActivity(runSessionId, 'turn started', { force: true });
+		this.markRouterDispatchRunning(runSessionId, content);
 		this.startRouterTurnKeepalive(runSessionId);
 		let cancelled = false;
 		let turnFailed = false;
@@ -2792,6 +3221,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			return item;
 		});
+		// Remember which dispatch cards this window has seen: a later save that
+		// drops one of them is a deliberate removal, while disk-only cards this
+		// window never loaded must survive the save (see preserveForeignDispatchCards).
+		for (const item of items) {
+			if (item?.kind === 'dispatch') {
+				this.knownDispatchIds.add(item.id);
+			}
+		}
 		this.todos = todos;
 		this.attachments = [];
 		this.applySelectionQueue();
@@ -2805,6 +3242,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.activeWorkId = undefined;
 			this.turnStartedAt = undefined;
 		}
+		// Board self-heal on every load: dispatch card statuses must match the
+		// set of live runs, or a stale snapshot wipes "进行中" on the way home.
+		this.syncDispatchRunState(id);
 	}
 
 	private async startNewSession(opts?: { force?: boolean }): Promise<void> {
@@ -2854,6 +3294,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			if (this.runs.has(sessionId)) {
 				this.startElapsedTimer();
 			}
+			this.syncDispatchRunState(sessionId);
 			await this.ideChat.setActiveSession(sessionId).catch(() => undefined);
 			await this.refreshSessionList();
 			this.pushAfterSessionSwitch();
@@ -3011,6 +3452,201 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.openTabIds = next;
 	}
 
+	/**
+	 * Cross-window wipe protection for the Router board. `chat` may be a stale
+	 * snapshot: another window can have appended dispatch cards this one never
+	 * loaded, and saving the snapshot wholesale would delete them (that lost
+	 * update is how whole worker boards vanished). Disk cards that are absent
+	 * here AND were never seen by this window are re-attached before the
+	 * save; ids this window has seen but dropped stay dropped — that is a
+	 * deliberate removal (worker removal filters its cards out).
+	 */
+	private async preserveForeignDispatchCards(sessionId: string, chat: MutableChat): Promise<void> {
+		try {
+			const disk = await this.ideChat.getSession(sessionId);
+			if (!disk) {
+				return;
+			}
+			// Durable board removals apply in both directions: cards this window
+			// still holds in memory for a worker ✕'d off the board (possibly in
+			// ANOTHER window) must not be written back, and foreign disk cards
+			// for removed workers must not be re-attached either.
+			const removedKeys = new Set(await this.ideChat.getRemovedWorkers(sessionId, { workspaceRoot: disk.workspaceRoot }));
+			if (removedKeys.size) {
+				chat.items = chat.items.filter(item => {
+					if (item?.kind !== 'dispatch') {
+						return true;
+					}
+					const dispatch = item as Extract<ConversationItem, { kind: 'dispatch' }>;
+					return !(removedKeys.has(dispatch.workerSessionId ?? '') || (dispatch.workerId ? removedKeys.has(dispatch.workerId) : false));
+				});
+			}
+			const incoming = new Set(
+				chat.items
+					.filter(item => item?.kind === 'dispatch')
+					.map(item => (item as Extract<ConversationItem, { kind: 'dispatch' }>).id),
+			);
+			const foreign: ConversationItem[] = [];
+			for (const item of disk.timeline ?? []) {
+				if (item?.kind !== 'dispatch') {
+					continue;
+				}
+				if (removedKeys.size) {
+					const dispatch = item as Extract<ConversationItem, { kind: 'dispatch' }>;
+					if (removedKeys.has(dispatch.workerSessionId ?? '') || (dispatch.workerId ? removedKeys.has(dispatch.workerId) : false)) {
+						continue;
+					}
+				}
+				if (!incoming.has(item.id) && !this.knownDispatchIds.has(item.id)) {
+					foreign.push(item);
+					this.knownDispatchIds.add(item.id);
+				}
+			}
+			if (foreign.length) {
+				chat.items.push(...foreign);
+			}
+		} catch {
+			// Best effort — a failed check must not block the save.
+		}
+	}
+
+	/**
+	 * Rehydrates Router dispatch cards for workers whose cards are missing.
+	 * Worker transcripts live in their own session files, but the Workers
+	 * board renders the Router's dispatch cards — once those were wiped
+	 * (stale cross-window saves emptied the Router timeline) every worker
+	 * turned invisible even though its session was intact. Cards are rebuilt
+	 * from durable sources: the workbench router roster (live workers plus
+	 * history — covers workers created before sessions carried a kind tag)
+	 * and `kind: 'worker'` session tags. Idempotent: workers already bound
+	 * to a card are skipped, rebuilt cards use stable ids.
+	 */
+	private async reconcileWorkerBoard(routerId: string): Promise<void> {
+		try {
+			// Suppression is authoritative over the shared session file: another
+			// window (older build, or one whose roster still holds the worker as
+			// live) can re-write a ✕'d card into the timeline after the removal.
+			// Prune those FIRST so `bound` below reflects the cleaned board.
+			const pruned = await this.ideChat.pruneSuppressedDispatchCards(routerId);
+			const router = await this.ideChat.getSession(routerId);
+			if (!router) {
+				return;
+			}
+			const bound = new Set(
+				(router.timeline ?? [])
+					.filter((row): row is Extract<ConversationItem, { kind: 'dispatch' }> => row?.kind === 'dispatch')
+					.map(card => card.workerSessionId)
+					.filter((id): id is string => !!id),
+			);
+			// Keys the user explicitly ✕'d off this board. Live roster workers
+			// honor them too now — restores lift the key BEFORE rehydrating (see
+			// the zcode.reconcileWorkerBoard lift arg), so a remaining key for a
+			// live row means another window's roster never saw the ✕ and must
+			// not resurrect the card into the shared Router session file.
+			const removed = new Set(await this.ideChat.getRemovedWorkers(routerId, { workspaceRoot: router.workspaceRoot }));
+			const liveWorkers = new Set<string>();
+			const candidates = new Set<string>();
+			const rosterInfo = new Map<string, { workerId?: string; label?: string }>();
+			const add = (id: unknown, info?: { workerId?: string; label?: string }, live = false): void => {
+				if (typeof id !== 'string' || !id || id === routerId || bound.has(id)) {
+					return;
+				}
+				if (live) {
+					liveWorkers.add(id);
+				}
+				if (removed.has(id) || (info?.workerId ? removed.has(info.workerId) : false)) {
+					return; // ✕'d off this board and never restored — the history menu owns it
+				}
+				candidates.add(id);
+				if (info?.workerId || info?.label) {
+					rosterInfo.set(id, info);
+				}
+			};
+			try {
+				const roster = await vscode.commands.executeCommand<unknown>('zcode.internal.superAgent.listWorkerChatSessions');
+				for (const row of Array.isArray(roster) ? roster : []) {
+					if (typeof row === 'string') {
+						add(row);
+					} else if (row && typeof row === 'object' && typeof (row as { sessionId?: unknown }).sessionId === 'string') {
+						const typed = row as { sessionId: string; workerId?: unknown; label?: unknown; live?: unknown };
+						add(typed.sessionId, {
+							workerId: typeof typed.workerId === 'string' ? typed.workerId : undefined,
+							label: typeof typed.label === 'string' ? typed.label : undefined,
+						}, typed.live === true);
+					}
+				}
+			} catch {
+				// Older workbench without the command — the kind-tag scan below still applies.
+			}
+			try {
+				const metas = await this.ideChat.listSessions({ workspaceRoot: router.workspaceRoot, limit: 500 });
+				for (const meta of metas) {
+					if (meta.kind === 'worker') {
+						add(meta.id);
+					}
+				}
+			} catch {
+				// Index unreadable — roster candidates still apply.
+			}
+			if (!candidates.size) {
+				return;
+			}
+			const cards: Extract<ConversationItem, { kind: 'dispatch' }>[] = [];
+			for (const workerId of candidates) {
+				const session = await this.ideChat.getSession(workerId);
+				if (!session || !session.messages?.length) {
+					continue; // deleted or never-used worker
+				}
+				const info = rosterInfo.get(workerId);
+				const title = info?.label?.trim() || session.title?.trim() || 'Worker';
+				const firstUser = session.messages.find(m => m.role === 'user' && m.content.trim());
+				const lastAssistant = [...session.messages].reverse().find(m => m.role === 'assistant' && m.content.trim());
+				const card: Extract<ConversationItem, { kind: 'dispatch' }> = {
+					id: `dispatch-rebuilt-${workerId}`,
+					kind: 'dispatch',
+					text: ((firstUser?.content ?? title).replace(/\s+/g, ' ').trim()).slice(0, 200) || title,
+					workerId: info?.workerId,
+					workerSessionId: workerId,
+					badge: title,
+					status: 'done',
+					startedAt: session.createdAt,
+					durationMs: Math.max(0, (session.updatedAt ?? session.createdAt) - session.createdAt),
+				};
+				const resultText = lastAssistant?.content.trim();
+				if (resultText) {
+					card.resultText = resultText.length > 600 ? `…${resultText.slice(-600)}` : resultText;
+				}
+				cards.push(card);
+			}
+			if (!cards.length) {
+				return;
+			}
+			cards.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
+			await this.ideChat.upsertDispatchCards(routerId, cards);
+			// A rebuilt card for a LIVE roster worker means the user restored it
+			// from the history menu (restoreWorker → workerCreated): lift the
+			// old ✕ removal so future rehydration keeps it on the board.
+			const lifted = cards
+				.filter(card => liveWorkers.has(card.workerSessionId ?? ''))
+				.flatMap(card => [card.workerSessionId, card.workerId])
+				.filter((key): key is string => !!key && removed.has(key));
+			if (lifted.length) {
+				await this.ideChat.clearRemovedWorkers(routerId, lifted, { workspaceRoot: router.workspaceRoot }).catch(() => undefined);
+			}
+			if (this.sessionId === routerId && (cards.length || pruned)) {
+				// Re-apply from disk so the rebuilt (or just pruned) board is
+				// visible immediately.
+				const fresh = await this.ideChat.getSession(routerId);
+				if (fresh) {
+					this.applySession(routerId, fresh.timeline ?? [], fresh.todos ?? [], true);
+					this.pushState();
+				}
+			}
+		} catch {
+			// Rehydration is best-effort — it must never block opening the Router.
+		}
+	}
+
 	private async persistSession(_immediate = true): Promise<void> {
 		if (!this.sessionId) {
 			return;
@@ -3033,6 +3669,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean; titleOverride?: string }): Promise<void> {
+		if (sessionId === this.routerSessionId) {
+			await this.preserveForeignDispatchCards(sessionId, chat);
+		}
 		const messages = IdeChatStore.messagesFromTimeline(chat.items);
 		if (messages.length === 0) {
 			// Never garbage-collect the Super Agent Router while it is still empty.
@@ -3131,8 +3770,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				messages: [{
 					role: 'user',
 					content: [
-						'根据下面的对话生成一个简短的会话标题，要求：',
-						'- 不超过 16 个字',
+						'根据下面的对话生成一个会话标题，要求：',
+						'- 用一句完整的话概括核心任务，控制在 40 个字以内',
+						'- 不要只写几个字，也不要截成半句话',
 						'- 概括用户的核心诉求或任务主题',
 						'- 不要引号、标点结尾、序号或前缀，直接输出标题本身',
 						'',
@@ -3148,7 +3788,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				promptPreamble: buildPromptPreamble(workspaceRoot()),
 			}, cancel.token);
 			const raw = result.content.split('\n').map(l => l.trim()).filter(Boolean)[0] ?? '';
-			const title = raw.replace(/^["'「」『』【】\s]+/, '').replace(/["'「」『』【】。.!！？?\s]+$/, '').slice(0, 30).trim();
+			const title = raw.replace(/^["'「」『』【】\s]+/, '').replace(/["'「」『』【】。.!！？?\s]+$/, '').slice(0, 80).trim();
 			if (!title) {
 				return;
 			}

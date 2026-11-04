@@ -235,6 +235,12 @@
         "icon": "$(history)"
       },
       {
+        "command": "zcode.searchHistory",
+        "title": "%command.searchHistory%",
+        "category": "%command.category%",
+        "icon": "$(search)"
+      },
+      {
         "command": "zcode.closeActiveTab",
         "title": "%command.closeActiveTab%",
         "category": "%command.category%"
@@ -300,6 +306,9 @@
         },
         {
           "command": "zcode.toggleHistory"
+        },
+        {
+          "command": "zcode.searchHistory"
         },
         {
           "command": "zcode.closeActiveTab"

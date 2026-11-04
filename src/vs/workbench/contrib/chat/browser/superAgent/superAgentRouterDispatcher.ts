@@ -69,6 +69,9 @@ export const ZCODE_INTERNAL_SUPERAGENT_BIND_ROUTER_DISPATCH = 'zcode.internal.su
 /** Asks the router service whether a zcode chat session belongs to a worker. */
 export const ZCODE_INTERNAL_SUPERAGENT_IS_WORKER_CHAT_SESSION = 'zcode.internal.superAgent.isWorkerChatSession';
 
+/** All chat-session ids the router service knows (live workers + history). */
+export const ZCODE_INTERNAL_SUPERAGENT_LIST_WORKER_SESSIONS = 'zcode.internal.superAgent.listWorkerChatSessions';
+
 interface IRouterSubmitPayload {
 	readonly text?: string;
 	readonly sessionId?: string;
@@ -81,13 +84,19 @@ interface IBindRouterDispatchPayload {
 	readonly workerSessionId?: string;
 }
 
-/** Compact chip text under a Router dispatch receipt (not the slot number). */
+/**
+ * Worker title shown on the Router board. Keep the label intact — the card
+ * sizes it to the available width and ellipsizes only when the panel is narrower.
+ */
 function dispatchTitleBadge(label: string): string {
-	const trimmed = label.trim().replace(/\s+/g, ' ');
-	if (!trimmed) {
-		return '';
-	}
-	return trimmed.length > 16 ? `${trimmed.slice(0, 14)}…` : trimmed;
+	return label.trim().replace(/\s+/g, ' ');
+}
+
+/** Provisional card title until the first turn's AI title lands. */
+function provisionalWorkerLabel(task: string): string {
+	const collapsed = task.trim().replace(/\s+/g, ' ');
+	const max = 120;
+	return collapsed.length > max ? `${collapsed.slice(0, max)}…` : collapsed;
 }
 
 /**
@@ -168,6 +177,29 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 			return typeof sessionId === 'string'
 				&& !!this.routerService.getWorkerForChatSession(zcodeSessionResource(sessionId));
 		}));
+		this._register(CommandsRegistry.registerCommand(ZCODE_INTERNAL_SUPERAGENT_LIST_WORKER_SESSIONS, () => {
+			// Durable worker roster for Router-board rehydration in zcode-chat:
+			// live workers plus closed-worker history. Dispatch cards are the
+			// only board renderer, and they used to be lost to cross-window
+			// saves — this roster survives in workspace storage and lets the
+			// board be rebuilt from it, including workerId for card clicks.
+			const rows: { sessionId: string; workerId: string; label: string; live: boolean }[] = [];
+			const push = (workerId: string, label: string, resource: URI, live: boolean): void => {
+				const sessionId = parseZcodeSessionId(resource);
+				if (sessionId && !rows.some(row => row.sessionId === sessionId)) {
+					rows.push({ sessionId, workerId, label, live });
+				}
+			};
+			// Live first: a worker that is both live and archived reports live,
+			// so board rehydration re-boards it instead of honoring a stale ✕.
+			for (const worker of this.routerService.workers.get()) {
+				push(worker.id, worker.label, worker.chatSessionResource, true);
+			}
+			for (const entry of this.routerService.history.get()) {
+				push(entry.id, entry.label, entry.chatSessionResource, false);
+			}
+			return rows;
+		}));
 		// Title + live turn status → keep Router receipts in sync with the worker rail.
 		this._register(this.routerService.onDidWorkerEvent(e => {
 			if (e.kind === 'labelChanged' && e.detail) {
@@ -175,11 +207,22 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 				return;
 			}
 			if (e.kind === 'workerRemoved') {
-				this.removeWorkerDispatches(e.workerId);
+				this.removeWorkerDispatches(e.workerId, e.workerSessionId, e.detail);
 				return;
 			}
 			if (e.kind === 'stateChanged' || e.kind === 'watchdogTripped' || e.kind === 'workerCreated') {
 				this.syncDispatchStatus(e.workerId);
+				// A worker restored from the history menu is live again — re-run
+				// board rehydration right away so its dispatch card returns
+				// without a window reload. Rehydration honors the durable ✕ for
+				// live rows too now, so the restore must lift it first: pass
+				// both worker keys and let zcode-chat clear them pre-reconcile.
+				if (e.kind === 'workerCreated' && e.detail?.startsWith('restored:')) {
+					const worker = this.routerService.workers.get().find(w => w.id === e.workerId);
+					void this.commandService.executeCommand('zcode.reconcileWorkerBoard', worker ? {
+						lift: [{ workerId: e.workerId, workerSessionId: parseZcodeSessionId(worker.chatSessionResource) }]
+					} : undefined).catch(() => { });
+				}
 			}
 		}));
 	}
@@ -255,8 +298,11 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 	/**
 	 * Dropping a worker from the rail also clears its dispatch bubbles from the
 	 * Router transcript, so the main list doesn't accumulate deleted tasks.
+	 * The worker chat session id rides along (when known) so the extension can
+	 * record BOTH suppression keys; `detail` distinguishes an archive (✕ keeps
+	 * the transcript restorable) from a history-menu delete (transcript goes).
 	 */
-	private removeWorkerDispatches(workerId: string): void {
+	private removeWorkerDispatches(workerId: string, workerSessionId?: string, detail?: string): void {
 		const sessionId = this.routerSessionId();
 		if (!sessionId || !workerId) {
 			return;
@@ -264,7 +310,11 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 		void this.commandService.executeCommand('zcode.removeWorkerDispatches', {
 			sessionId,
 			workerId,
+			workerSessionId,
 		}).catch(() => { });
+		if ((detail === 'history-deleted' || detail === 'history-cleared') && workerSessionId) {
+			void this.commandService.executeCommand('zcode.deleteChatSession', workerSessionId).catch(() => { });
+		}
 	}
 
 	private markDispatchFailed(opts?: { routerSessionId?: string; dispatchItemId?: string }): void {
@@ -287,8 +337,8 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 			return;
 		}
 
-		// Provisional rail label until the first turn's AI title lands.
-		const label = task.length > 24 ? `${task.slice(0, 21)}…` : task;
+		// Provisional card title until the first turn's AI title lands.
+		const label = provisionalWorkerLabel(task);
 		let sessionId: string | undefined;
 		try {
 			// Do not stamp the full task as the session title — createWorkerSession

@@ -47,6 +47,8 @@ export interface IdeChatSessionMeta {
 	createdAt: number;
 	updatedAt: number;
 	source: IdeChatSource;
+	/** Session role on the Super Agent board: Router shell vs spawned worker. */
+	kind?: 'router' | 'worker';
 	workspaceRoot?: string;
 	provider?: string;
 	model?: string;
@@ -115,15 +117,15 @@ export function isProvisionalSessionTitle(title: string | undefined, messages: I
 		return true;
 	}
 	// createWorkerSession / router dispatch used to stamp message.slice(0, N)
-	// (sometimes with a trailing …). AI titles are capped ~30 chars, so longer
-	// prefixes of the first user message are still provisional.
+	// (sometimes with a trailing …). AI titles are capped at 80 chars, so only
+	// longer prefixes of the first user message are still provisional.
 	if (title.endsWith('…')) {
 		const stem = title.slice(0, -1);
 		if (stem && oneLine.startsWith(stem)) {
 			return true;
 		}
 	}
-	if (title.length > 30 && oneLine.startsWith(title)) {
+	if (title.length > 80 && oneLine.startsWith(title)) {
 		return true;
 	}
 	return false;
@@ -136,6 +138,7 @@ function toMeta(session: IdeChatSession): IdeChatSessionMeta {
 		createdAt: session.createdAt,
 		updatedAt: session.updatedAt,
 		source: session.source,
+		kind: session.kind,
 		workspaceRoot: session.workspaceRoot,
 		provider: session.provider,
 		model: session.model,
@@ -213,8 +216,53 @@ export class IdeChatStore {
 	}
 
 	private enqueue(op: () => Promise<void>): Promise<void> {
-		this.writeChain = this.writeChain.then(op, op);
+		// Serialize within this process AND across windows: the chain keeps
+		// one extension host ordered, the lock file keeps concurrent ext
+		// hosts (Code - OSS + ZCode.app windows sharing ~/.zcode) from
+		// read-modify-writing the index over each other — a lost update is
+		// how worker sessions used to vanish from the list.
+		const run = () => this.withIndexLock(op);
+		this.writeChain = this.writeChain.then(run, run);
 		return this.writeChain;
+	}
+
+	/**
+	 * Cross-process mutex around index mutations. O_EXCL create + steal on
+	 * staleness; on timeout we proceed unlocked (best effort) so a wedged
+	 * lock can never block the chat UI forever.
+	 */
+	private async withIndexLock<T>(fn: () => Promise<T>): Promise<T> {
+		await this.ensureDirs();
+		const lockPath = path.join(this.rootDir, 'index.lock');
+		const deadline = Date.now() + 10_000;
+		let locked = false;
+		while (!locked && Date.now() < deadline) {
+			try {
+				await fs.writeFile(lockPath, String(process.pid), { flag: 'wx' });
+				locked = true;
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException | undefined)?.code !== 'EEXIST') {
+					throw err;
+				}
+				try {
+					const st = await fs.stat(lockPath);
+					// Crashed window left the lock behind — steal it.
+					if (Date.now() - st.mtimeMs > 5_000) {
+						await fs.unlink(lockPath).catch(() => undefined);
+					}
+				} catch {
+					// Lock vanished between create-fail and stat — retry now.
+				}
+				await new Promise(resolve => setTimeout(resolve, 25 + Math.random() * 25));
+			}
+		}
+		try {
+			return await fn();
+		} finally {
+			if (locked) {
+				await fs.unlink(lockPath).catch(() => undefined);
+			}
+		}
 	}
 
 	private async ensureDirs(): Promise<void> {
@@ -243,9 +291,7 @@ export class IdeChatStore {
 
 	private async writeIndex(index: IdeChatIndex): Promise<void> {
 		await this.ensureDirs();
-		const tmp = `${this.indexPath}.tmp`;
-		await fs.writeFile(tmp, JSON.stringify(index, null, 2), 'utf8');
-		await fs.rename(tmp, this.indexPath);
+		await this.atomicWrite(this.indexPath, JSON.stringify(index, null, 2));
 	}
 
 	private sessionPath(id: string): string {
@@ -301,7 +347,7 @@ export class IdeChatStore {
 	}
 
 	/** In-memory draft only — not written to history until the first real message. */
-	createDraftSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title'>>): IdeChatSession {
+	createDraftSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title' | 'kind'>>): IdeChatSession {
 		const now = Date.now();
 		return {
 			id: newId(),
@@ -309,6 +355,7 @@ export class IdeChatStore {
 			createdAt: now,
 			updatedAt: now,
 			source: partial?.source ?? IDE_CHAT_SOURCE_ZCODE,
+			kind: partial?.kind,
 			workspaceRoot: partial?.workspaceRoot,
 			provider: partial?.provider,
 			model: partial?.model,
@@ -318,7 +365,7 @@ export class IdeChatStore {
 		};
 	}
 
-	async createSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title'>>): Promise<IdeChatSession> {
+	async createSession(partial?: Partial<Pick<IdeChatSession, 'source' | 'workspaceRoot' | 'provider' | 'model' | 'title' | 'kind'>>): Promise<IdeChatSession> {
 		const session = this.createDraftSession(partial);
 		await this.enqueue(async () => {
 			await this.ensureDirs();
@@ -396,6 +443,15 @@ export class IdeChatStore {
 		};
 		await this.enqueue(async () => {
 			await this.ensureDirs();
+			// A session belongs to the folder it was created in: once it has a
+			// workspaceRoot, a save issued from a window whose folder differs
+			// must not re-tag it (re-tagging is how windows used to "steal"
+			// each other's Router/worker boards). Sessions saved before roots
+			// were tracked (undefined) still adopt the current folder.
+			const existing = await this.getSession(next.id);
+			if (existing?.workspaceRoot && !sameWorkspaceRoot(existing.workspaceRoot, next.workspaceRoot)) {
+				next.workspaceRoot = existing.workspaceRoot;
+			}
 			await this.writeSessionFile(next);
 			const index = await this.readIndex();
 			const meta = toMeta(next);
@@ -405,6 +461,53 @@ export class IdeChatStore {
 				index.openTabIds = ensureTabPresent(index.openTabIds, next.id, 'end');
 			}
 			await this.writeIndex(index);
+		});
+	}
+
+	/**
+	 * Merge dispatch cards into a session's timeline without rewriting the
+	 * rest of it. Used by Router-board rehydration: a whole-session save from
+	 * a window that never loaded the cards used to wipe them (lost update),
+	 * so card recovery must be a targeted, idempotent read-merge-write that
+	 * leaves every other timeline item untouched.
+	 */
+	async upsertDispatchCards(sessionId: string, cards: ConversationItem[]): Promise<void> {
+		const incoming = new Map(cards.map(card => [card.id, card]));
+		if (!incoming.size) {
+			return;
+		}
+		await this.enqueue(async () => {
+			const session = await this.getSession(sessionId);
+			if (!session) {
+				return;
+			}
+			const timeline: ConversationItem[] = [];
+			let changed = false;
+			for (const item of session.timeline ?? []) {
+				if (item?.kind === 'dispatch' && incoming.has(item.id)) {
+					timeline.push(incoming.get(item.id)!);
+					incoming.delete(item.id);
+					changed = true;
+				} else {
+					timeline.push(item);
+				}
+			}
+			for (const card of incoming.values()) {
+				timeline.push(card);
+				changed = true;
+			}
+			if (!changed) {
+				return;
+			}
+			session.timeline = timeline;
+			session.updatedAt = Date.now();
+			await this.writeSessionFile(session);
+			const index = await this.readIndex();
+			const meta = index.sessions.find(s => s.id === sessionId);
+			if (meta && meta.updatedAt !== session.updatedAt) {
+				meta.updatedAt = session.updatedAt;
+				await this.writeIndex(index);
+			}
 		});
 	}
 
@@ -459,7 +562,216 @@ export class IdeChatStore {
 				index.activeSessionId = nextOpenTabId(index, removed?.workspaceRoot);
 			}
 			await this.writeIndex(index);
+			// Board-removal registry hygiene: deleting a Router drops its whole
+			// suppression list; deleting a worker session lifts the key from
+			// every list so the registry never references dead sessions.
+			const removals = await this.readRemovedWorkersMap();
+			if (removals.size) {
+				let removalsChanged = removals.delete(id);
+				for (const [routerId, keys] of removals) {
+					const next = keys.filter(key => key !== id);
+					if (next.length !== keys.length) {
+						removalsChanged = true;
+						if (next.length) {
+							removals.set(routerId, next);
+						} else {
+							removals.delete(routerId);
+						}
+					}
+				}
+				if (removalsChanged) {
+					await this.writeRemovedWorkersMap(removals);
+				}
+			}
 		});
+	}
+
+	/**
+	 * Board-removal registry (removed-workers.json).
+	 *
+	 * "✕'d off the Router board" is a durable, user-global intent. The workbench
+	 * roster lives in per-app workspace storage, but board rehydration runs in
+	 * every editor sharing ~/.zcode — without this registry a removed worker's
+	 * session (roster history row / `kind: 'worker'` tag) would resurrect its
+	 * dispatch card on the next window open. Values mix worker session ids and
+	 * worker ids; matching treats either as removed. Kept in its own file so
+	 * whole-session saves from another window can never drop it.
+	 *
+	 * Keys are workspace-scoped, not router-scoped: a removal is recorded under
+	 * BOTH the Router session id (legacy compat) and `wr:<normalized root>` —
+	 * the opened folder. The window's Router binding can legitimately change
+	 * between launches (another Router holds more dispatch cards, a second
+	 * editor app binds its own), and a removal pinned to one router id used to
+	 * vanish with it, resurrecting the card. Reads therefore union the router
+	 * key, the workspace key, and every sibling Router of the same folder.
+	 */
+	async getRemovedWorkers(routerId: string, opts?: { workspaceRoot?: string }): Promise<string[]> {
+		const map = await this.readRemovedWorkersMap();
+		const out = new Set<string>(map.get(routerId) ?? []);
+		const root = opts?.workspaceRoot;
+		if (root) {
+			for (const key of map.get(this.workspaceRemovalKey(root)) ?? []) {
+				out.add(key);
+			}
+			for (const sibling of await this.siblingRouterIds(root)) {
+				for (const key of map.get(sibling) ?? []) {
+					out.add(key);
+				}
+			}
+		}
+		return [...out];
+	}
+
+	async addRemovedWorkers(routerId: string, keys: string[], opts?: { workspaceRoot?: string }): Promise<void> {
+		const add = keys.filter(key => typeof key === 'string' && !!key && key !== routerId);
+		if (!routerId || !add.length) {
+			return;
+		}
+		const targets = [routerId];
+		if (opts?.workspaceRoot) {
+			targets.push(this.workspaceRemovalKey(opts.workspaceRoot));
+		}
+		await this.enqueue(async () => {
+			const map = await this.readRemovedWorkersMap();
+			for (const target of targets) {
+				const next = new Set(map.get(target) ?? []);
+				for (const key of add) {
+					next.add(key);
+				}
+				map.set(target, [...next]);
+			}
+			await this.writeRemovedWorkersMap(map);
+		});
+	}
+
+	/** Lift a removal (e.g. worker restored from the history menu and re-boarded). */
+	async clearRemovedWorkers(routerId: string, keys: string[], opts?: { workspaceRoot?: string }): Promise<void> {
+		if (!routerId) {
+			return;
+		}
+		const drop = new Set(keys.filter(key => typeof key === 'string' && !!key));
+		if (!drop.size) {
+			return;
+		}
+		const targets = [routerId];
+		if (opts?.workspaceRoot) {
+			targets.push(this.workspaceRemovalKey(opts.workspaceRoot));
+			for (const sibling of await this.siblingRouterIds(opts.workspaceRoot)) {
+				targets.push(sibling);
+			}
+		}
+		await this.enqueue(async () => {
+			const map = await this.readRemovedWorkersMap();
+			let changed = false;
+			for (const target of targets) {
+				const current = map.get(target);
+				if (!current || !current.some(key => drop.has(key))) {
+					continue;
+				}
+				const next = current.filter(key => !drop.has(key));
+				if (next.length) {
+					map.set(target, next);
+				} else {
+					map.delete(target);
+				}
+				changed = true;
+			}
+			if (changed) {
+				await this.writeRemovedWorkersMap(map);
+			}
+		});
+	}
+
+	/**
+	 * Self-heal: drop timeline dispatch cards whose worker keys sit in the
+	 * removal registry. The registry is the durable ✕ intent, but the Router
+	 * session file is shared by every editor app on this machine — a window on
+	 * older code (or one whose workbench roster still lists the worker as
+	 * live) can write the card right back after the removal. Rehydration prunes
+	 * first so suppression stays authoritative over whatever is on disk, not
+	 * just over rebuild candidates. Returns whether the timeline changed.
+	 */
+	async pruneSuppressedDispatchCards(sessionId: string): Promise<boolean> {
+		let changed = false;
+		await this.enqueue(async () => {
+			const session = await this.getSession(sessionId);
+			if (!session) {
+				return;
+			}
+			const removed = new Set(await this.getRemovedWorkers(sessionId, { workspaceRoot: session.workspaceRoot }));
+			if (!removed.size) {
+				return;
+			}
+			const timeline = session.timeline ?? [];
+			const next = timeline.filter(item => {
+				if (item?.kind !== 'dispatch') {
+					return true;
+				}
+				const dispatch = item as Extract<ConversationItem, { kind: 'dispatch' }>;
+				return !(removed.has(dispatch.workerSessionId ?? '') || (dispatch.workerId ? removed.has(dispatch.workerId) : false));
+			});
+			if (next.length === timeline.length) {
+				return;
+			}
+			changed = true;
+			session.timeline = next;
+			session.updatedAt = Date.now();
+			await this.writeSessionFile(session);
+			const index = await this.readIndex();
+			const meta = index.sessions.find(s => s.id === sessionId);
+			if (meta && meta.updatedAt !== session.updatedAt) {
+				meta.updatedAt = session.updatedAt;
+				await this.writeIndex(index);
+			}
+		});
+		return changed;
+	}
+
+	/** Registry key that scopes board removals to the opened folder. */
+	private workspaceRemovalKey(workspaceRoot: string): string {
+		return `wr:${normalizeWorkspaceRoot(workspaceRoot)}`;
+	}
+
+	/** Router session ids sharing `workspaceRoot` (legacy per-router removal keys live under these). */
+	private async siblingRouterIds(workspaceRoot: string): Promise<string[]> {
+		try {
+			const index = await this.readIndex();
+			return index.sessions
+				.filter(meta => (meta.kind === 'router' || meta.title === 'Router')
+					&& sameWorkspaceRoot(meta.workspaceRoot, workspaceRoot))
+				.slice(0, 30)
+				.map(meta => meta.id);
+		} catch {
+			return [];
+		}
+	}
+
+	private removedWorkersPath(): string {
+		return path.join(this.rootDir, 'removed-workers.json');
+	}
+
+	private async readRemovedWorkersMap(): Promise<Map<string, string[]>> {
+		try {
+			const raw = await fs.readFile(this.removedWorkersPath(), 'utf8');
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			const map = new Map<string, string[]>();
+			for (const [routerId, keys] of Object.entries(parsed ?? {})) {
+				if (Array.isArray(keys)) {
+					const list = keys.filter((key): key is string => typeof key === 'string' && !!key);
+					if (list.length) {
+						map.set(routerId, list);
+					}
+				}
+			}
+			return map;
+		} catch {
+			return new Map();
+		}
+	}
+
+	private async writeRemovedWorkersMap(map: Map<string, string[]>): Promise<void> {
+		await this.ensureDirs();
+		await this.atomicWrite(this.removedWorkersPath(), JSON.stringify(Object.fromEntries(map), null, 2));
 	}
 
 	/**
@@ -483,10 +795,44 @@ export class IdeChatStore {
 	}
 
 	private async writeSessionFile(session: IdeChatSession): Promise<void> {
-		const file = this.sessionPath(session.id);
-		const tmp = `${file}.tmp`;
-		await fs.writeFile(tmp, JSON.stringify(session, null, 2), 'utf8');
-		await fs.rename(tmp, file);
+		await this.ensureDirs();
+		await this.atomicWrite(this.sessionPath(session.id), JSON.stringify(session, null, 2));
+	}
+
+	/**
+	 * Atomic replace that survives concurrent writers in OTHER processes.
+	 *
+	 * The store root is user-global, and every editor window runs its own
+	 * extension host with its own IdeChatStore — the in-process writeChain
+	 * cannot serialize them. With a fixed `<file>.tmp` name two windows used
+	 * to race (A writes tmp, B writes tmp, A renames — tmp gone, B renames)
+	 * and the loser threw ENOENT up to `ensureRouterSession`, surfacing as
+	 * "Opening the Router chat session failed: rename … index.json.tmp".
+	 * A per-write unique tmp name keeps `rename` atomic with no cross-process
+	 * clobbering; transient fs errors get a short retry as belt and braces.
+	 */
+	private async atomicWrite(file: string, data: string): Promise<void> {
+		for (let attempt = 0; ; attempt++) {
+			// Unique per call: never shared with another process or write.
+			const tmp = `${file}.${process.pid}.${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.tmp`;
+			try {
+				await fs.writeFile(tmp, data, 'utf8');
+				await fs.rename(tmp, file);
+				return;
+			} catch (err) {
+				try {
+					await fs.unlink(tmp);
+				} catch {
+					// best-effort cleanup
+				}
+				const code = (err as NodeJS.ErrnoException | undefined)?.code;
+				const transient = code === 'ENOENT' || code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+				if (attempt >= 2 || !transient) {
+					throw err;
+				}
+				await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+			}
+		}
 	}
 }
 

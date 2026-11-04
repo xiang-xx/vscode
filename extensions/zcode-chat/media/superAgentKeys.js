@@ -48,4 +48,27 @@
 			// Webview torn down mid-keystroke — nothing to forward to.
 		}
 	}, true);
+
+	// Mouse back / forward side buttons (Chromium buttons 3 / 4) mirror the
+	// chords above: back leaves the worker detail for the Router main page,
+	// forward enters the pending worker detail. These buttons only deliver
+	// mouseup (no mousedown fires for XButtons), so that is the event to own.
+	document.addEventListener('mouseup', function (e) {
+		var type = null;
+		if (e.button === 3) {
+			type = 'backToRouter';
+		} else if (e.button === 4) {
+			type = 'viewPendingWorker';
+		}
+		if (!type) {
+			return;
+		}
+		e.preventDefault();
+		e.stopPropagation();
+		try {
+			api.postMessage({ type: type });
+		} catch (err) {
+			// Webview torn down mid-click — nothing to forward to.
+		}
+	}, true);
 })();

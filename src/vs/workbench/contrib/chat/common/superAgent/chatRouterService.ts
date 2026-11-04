@@ -111,6 +111,13 @@ export interface ISuperAgentEvent {
 	readonly kind: SuperAgentEventKind;
 	readonly timestamp: number;
 	readonly detail?: string;
+	/**
+	 * Plain chat-session id of the worker (parsed from its chatSessionResource).
+	 * Set on `workerRemoved` so listeners can purge every trace of the worker —
+	 * after a history-menu delete the roster row is already gone and this is
+	 * the only remaining pointer to the worker's session file.
+	 */
+	readonly workerSessionId?: string;
 }
 
 /**

@@ -12,6 +12,7 @@ import { URI } from '../../../../../base/common/uri.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { DEFAULT_MAX_CONCURRENT_WORKERS, DEFAULT_WATCHDOG_INTERVAL_MS, IChatRouterService, ISuperAgentEvent, ISuperAgentWorkerHandle, ISuperAgentWorkerHistoryEntry, ISuperAgentWorkerOptions, SuperAgentEventKind, SuperAgentWorkerState, superAgentWorkerStateIsActive, SUPER_AGENT_WORKER_ACCENTS } from '../../common/superAgent/chatRouterService.js';
+import { parseZcodeSessionId } from './zcodeSessionUri.js';
 
 const WORKERS_STORAGE_KEY = 'chat.superAgent.workers.v1';
 const HISTORY_LIMIT = 100;
@@ -194,7 +195,7 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 			);
 		});
 		worker.dispose();
-		this._fire(workerId, 'workerRemoved', worker.label);
+		this._fire(workerId, 'workerRemoved', worker.label, parseZcodeSessionId(worker.chatSessionResource));
 
 		if (this._focusedWorkerIdObs.get() === workerId) {
 			const next = this._workersObs.get()[0];
@@ -209,9 +210,10 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 	}
 
 	/**
-	 * Force-remove: no state gate, no archive step. Any history rows pointing
-	 * at the same chat session are purged too, so dirty roster entries (chat
-	 * session already deleted) cannot come back via 恢复.
+	 * Force-remove: no state gate, but the worker is still archived into
+	 * history so it can be restored or cleared from there. Older history rows
+	 * pointing at the same chat session are replaced by the fresh entry (no
+	 * duplicates), and rows sharing the id are deduped the same way.
 	 */
 	forceRemoveWorker(workerId: string): void {
 		const worker = this._workersObs.get().find(w => w.id === workerId);
@@ -221,16 +223,17 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 			return;
 		}
 		worker.watchdog.cancel();
+		const entry = this._toHistoryEntry(worker, Date.now());
 		const session = worker.chatSessionResource.toString();
 		transaction(tx => {
 			this._workersObs.set(this._workersObs.get().filter(w => w.id !== workerId), tx);
 			this._historyObs.set(
-				this._historyObs.get().filter(h => h.id !== workerId && h.chatSessionResource.toString() !== session),
+				[entry, ...this._historyObs.get().filter(h => h.id !== workerId && h.chatSessionResource.toString() !== session)].slice(0, HISTORY_LIMIT),
 				tx,
 			);
 		});
 		worker.dispose();
-		this._fire(workerId, 'workerRemoved', `force-removed:${worker.label}`);
+		this._fire(workerId, 'workerRemoved', `force-removed:${worker.label}`, parseZcodeSessionId(worker.chatSessionResource));
 
 		if (this._focusedWorkerIdObs.get() === workerId) {
 			const next = this._workersObs.get()[0];
@@ -281,19 +284,34 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 	}
 
 	deleteHistoryEntry(workerId: string): void {
-		const next = this._historyObs.get().filter(h => h.id !== workerId);
-		if (next.length === this._historyObs.get().length) {
+		const entry = this._historyObs.get().find(h => h.id === workerId);
+		const prev = this._historyObs.get();
+		const next = prev.filter(h => h.id !== workerId);
+		if (next.length === prev.length) {
 			return;
 		}
 		transaction(tx => this._historyObs.set(next, tx));
+		// Deleting a history row must also purge the worker's Router board
+		// card — fire the same event a rail removal does, so the dispatcher
+		// tells zcode-chat to drop the dispatch bubbles and record the
+		// removal instead of leaving an unclickable zombie card behind. The
+		// session id rides along so the extension can also delete the
+		// worker's session file (its kind:'worker' tag is what rehydration
+		// scans — a leftover file resurrected the card on every reload).
+		this._fire(workerId, 'workerRemoved', 'history-deleted', entry ? parseZcodeSessionId(entry.chatSessionResource) : undefined);
 		this._persist();
 	}
 
 	clearHistory(): void {
-		if (this._historyObs.get().length === 0) {
+		const prev = this._historyObs.get();
+		if (prev.length === 0) {
 			return;
 		}
 		transaction(tx => this._historyObs.set([], tx));
+		// Same purge as deleteHistoryEntry, for every cleared row.
+		for (const entry of prev) {
+			this._fire(entry.id, 'workerRemoved', 'history-cleared', parseZcodeSessionId(entry.chatSessionResource));
+		}
 		this._persist();
 	}
 
@@ -514,8 +532,8 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 		return Math.max(liveMax, historyMax) + 1;
 	}
 
-	private _fire(workerId: string, kind: SuperAgentEventKind, detail?: string): void {
-		this._onDidWorkerEvent.fire({ workerId, kind, timestamp: Date.now(), detail });
+	private _fire(workerId: string, kind: SuperAgentEventKind, detail?: string, workerSessionId?: string): void {
+		this._onDidWorkerEvent.fire({ workerId, kind, timestamp: Date.now(), detail, workerSessionId });
 	}
 
 	private _toHistoryEntry(worker: SuperAgentWorker, closedAt: number): ISuperAgentWorkerHistoryEntry {

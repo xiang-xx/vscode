@@ -20,7 +20,14 @@ import {
 	ensureWorkspaceIdeBrowserMcp,
 	IDE_BROWSER_PROMPT_HINT,
 } from './browserMcp';
-import { CursorAcpClient, type AcpSessionUpdate } from './cursorAcpClient';
+import {
+	CursorAcpClient,
+	formatCursorTransportFailure,
+	isCursorTransportDrop,
+	isCursorTransportDump,
+	type AcpClientOptions,
+	type AcpSessionUpdate,
+} from './cursorAcpClient';
 import { getCursorAuthStatus, promptCursorLogin } from './cursorAuth';
 import { getFileEditSession } from './fileEditSession';
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
@@ -194,20 +201,28 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 		void publishExternal(uri, originals.get(key) ?? '');
 	});
 
-	const client = new CursorAcpClient({
+	const transportDump = { text: '' };
+	const clientOptions: AcpClientOptions = {
 		cwd: root,
 		mode,
 		model: model || undefined,
 		mcpServers,
+		env: buildCursorAgentEnv(),
 		onPermission: async (): Promise<'allow-once'> => 'allow-once',
-		onLog: (line) => {
+		onLog: (line: string) => {
 			// Keep stderr quiet in the timeline — only surface short actionable lines.
 			const trimmed = line.trim();
 			if (trimmed && /error|fail|login|auth|denied/i.test(trimmed)) {
 				options.onProgress?.({ type: 'status', text: trimmed.slice(0, 160) });
 			}
 		},
-		onUpdate: (update) => {
+		onUpdate: (update: AcpSessionUpdate) => {
+			// Cursor ACP sometimes leaks a transport failure as assistant text and
+			// then resolves session/prompt successfully. Hold it for the retry loop.
+			if (isAcpTransportDump(update)) {
+				transportDump.text = extractUpdateText(update).trim();
+				return;
+			}
 			applyUpdate(update, {
 				onProgress: options.onProgress,
 				getAssistant: () => assistantText,
@@ -254,7 +269,8 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 			}
 			return { outcome: { outcome: 'cancelled' } };
 		},
-	});
+	};
+	let client = new CursorAcpClient(clientOptions);
 
 	const cancelSub = options.token.onCancellationRequested(() => {
 		void client.cancel();
@@ -263,12 +279,63 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 
 	try {
 		options.onProgress?.({ type: 'status', text: `Cursor Agent · ${root}` });
-		await client.start();
-		await client.newSession();
 
-		const promptText = buildPrompt(options.messages, options.sessionAwareness, options.promptPreamble);
+		const originalPrompt = buildPrompt(options.messages, options.sessionAwareness, options.promptPreamble);
+		let promptText = originalPrompt;
+		let sessionId: string | undefined;
 		options.onProgress?.({ type: 'status', text: 'Cursor Agent is working…' });
-		await client.prompt(promptText);
+
+		// ACP does not set enableAgentRetries (interactive `agent` and `agent -p` do),
+		// so a VPN/proxy blip ends the turn on the first RetriableError. Resume the
+		// same Cursor session, the way the CLI's own checkpoint retry does.
+		for (let attempt = 1; attempt <= CURSOR_TRANSPORT_ATTEMPTS; attempt++) {
+			transportDump.text = '';
+			try {
+				throwIfCancelled(options.token);
+				if (!client.isRunning || !sessionId) {
+					const hadSession = Boolean(sessionId);
+					const resumed = await reopenCursorSession(clientOptions, client, sessionId);
+					client = resumed.client;
+					sessionId = resumed.sessionId;
+					if (hadSession) {
+						promptText = resumed.resumed
+							? CURSOR_RESUME_NOTE
+							: `${originalPrompt}\n\n${CURSOR_RESUME_NOTE}`;
+					}
+				}
+				await client.prompt(promptText);
+				if (transportDump.text) {
+					throw new Error(transportDump.text);
+				}
+				break;
+			} catch (err) {
+				if (options.token.isCancellationRequested || err instanceof vscode.CancellationError) {
+					throw err instanceof vscode.CancellationError ? err : new vscode.CancellationError();
+				}
+				const message = err instanceof Error ? err.message : String(err);
+				if (!isRetryableCursorFailure(message) || attempt === CURSOR_TRANSPORT_ATTEMPTS) {
+					if (isRetryableCursorFailure(message)) {
+						throw new Error(formatCursorTransportFailure(attempt, message));
+					}
+					throw err;
+				}
+				options.onProgress?.({
+					type: 'status',
+					text: `Connection dropped, resuming Cursor Agent (${attempt + 1}/${CURSOR_TRANSPORT_ATTEMPTS})…`,
+				});
+				await delayWithCancel(options.token, transportRetryDelayMs(attempt));
+				sessionId = client.activeSessionId || sessionId;
+				if (client.isRunning && sessionId) {
+					await client.cancel(5_000);
+					throwIfCancelled(options.token);
+					promptText = CURSOR_RESUME_NOTE;
+				} else if (!client.isClosed) {
+					// Handshake failed before a session existed. Drop the child so
+					// the next attempt starts a clean CLI instead of reusing it.
+					client.dispose();
+				}
+			}
+		}
 
 		finalizeReasoning();
 		if (assistantText) {
@@ -284,6 +351,114 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 		watch.dispose();
 		client.dispose();
 	}
+}
+
+/** One initial try plus reconnects. Interactive Cursor Agent retries inside the CLI; ACP does not. */
+const CURSOR_TRANSPORT_ATTEMPTS = 5;
+
+const CURSOR_RESUME_NOTE = [
+	'The connection to Cursor dropped mid-turn (a transport error, not a model refusal).',
+	'Continue the same task from the last completed step.',
+	'Do not repeat work that already finished on disk.',
+].join(' ');
+
+function transportRetryDelayMs(attempt: number): number {
+	return Math.min(30_000, 1500 * (2 ** (attempt - 1)));
+}
+
+function isRetryableCursorFailure(message: string): boolean {
+	if (/ACP client disposed|not logged in|authentication required|unauthorized/i.test(message)) {
+		return false;
+	}
+	if (isCursorTransportDrop(message)) {
+		return true;
+	}
+	return /^Cursor agent exited\b/i.test(message);
+}
+
+function isAcpTransportDump(update: AcpSessionUpdate): boolean {
+	const kind = (update.sessionUpdate || '').toLowerCase();
+	if (kind.includes('tool')) {
+		return false;
+	}
+	const text = extractUpdateText(update);
+	if (!isCursorTransportDump(text)) {
+		return false;
+	}
+	return !kind || kind.includes('message') || kind.includes('error') || kind.includes('status');
+}
+
+function throwIfCancelled(token: vscode.CancellationToken): void {
+	if (token.isCancellationRequested) {
+		throw new vscode.CancellationError();
+	}
+}
+
+function delayWithCancel(token: vscode.CancellationToken, ms: number): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (token.isCancellationRequested) {
+			reject(new vscode.CancellationError());
+			return;
+		}
+		const timer = setTimeout(() => {
+			sub.dispose();
+			resolve();
+		}, ms);
+		const sub = token.onCancellationRequested(() => {
+			clearTimeout(timer);
+			sub.dispose();
+			reject(new vscode.CancellationError());
+		});
+	});
+}
+
+/**
+ * Pass the editor proxy through to the agent child. Dock-launched Code often
+ * has no HTTPS_PROXY, so the CLI's HTTP/2 stream bypasses a rule-mode VPN and
+ * dies with "Connection stalled" / "Stream ended without turnEnded".
+ * HTTP/1.1 (cli-config network.useHttp1ForAgent) is what actually honors this.
+ */
+function buildCursorAgentEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env };
+	const httpConfig = vscode.workspace.getConfiguration('http');
+	if (httpConfig.get<string>('proxySupport') !== 'off') {
+		const proxy = httpConfig.get<string>('proxy')?.trim();
+		if (proxy && !env.HTTPS_PROXY && !env.https_proxy && !env.HTTP_PROXY && !env.http_proxy) {
+			env.HTTPS_PROXY = proxy;
+			env.HTTP_PROXY = proxy;
+		}
+	}
+	if (env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || env.ALL_PROXY || env.all_proxy) {
+		env.NODE_USE_ENV_PROXY = env.NODE_USE_ENV_PROXY || '1';
+	}
+	return env;
+}
+
+async function reopenCursorSession(
+	options: ConstructorParameters<typeof CursorAcpClient>[0],
+	current: CursorAcpClient,
+	sessionId: string | undefined,
+): Promise<{ client: CursorAcpClient; sessionId: string; resumed: boolean }> {
+	let client = current;
+	// start() only works on a client that has never exited. A dead process
+	// stays isClosed, so the next attempt gets a fresh CLI.
+	if (!current.isRunning && current.isClosed) {
+		client = new CursorAcpClient(options);
+		current.dispose();
+	}
+	if (!client.isRunning) {
+		await client.start();
+	}
+	if (sessionId) {
+		try {
+			const loaded = await client.loadSession(sessionId);
+			return { client, sessionId: loaded, resumed: true };
+		} catch {
+			// Cursor ACP often answers session/load with "Session not found".
+		}
+	}
+	const created = await client.newSession();
+	return { client, sessionId: created, resumed: false };
 }
 
 function buildPrompt(messages: ChatMessage[], awareness?: SessionAwareness, preamble?: string): string {

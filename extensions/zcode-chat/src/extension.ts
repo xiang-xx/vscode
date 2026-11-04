@@ -24,6 +24,7 @@ import {
 } from './ideChatStore';
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
+import { searchChatSessions, type SessionSearchMatch } from './sessionSearch';
 import type { DispatchStatus } from './conversation';
 
 const DISPATCH_STATUSES: ReadonlySet<string> = new Set([
@@ -210,8 +211,47 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			panel.clearTabDoneFromTitle(sessionId);
 		}),
 		vscode.commands.registerCommand('zcode.toggleHistory', async () => {
-			// Router+Worker: closed workers live in the Super Agent history list.
-			await vscode.commands.executeCommand('zcode.internal.toggleSuperAgentWorkerHistory');
+			// Router+Worker: History is the chat webview's session drawer
+			// (ZCode 与 Cursor 共用) — worker sessions are real zcode sessions.
+			await panel.toggleHistory();
+		}),
+		vscode.commands.registerCommand('zcode.searchHistory', async () => {
+			// Ported from DeepSeek Harness `session_search` / `session_event_search`:
+			// full-text search across every saved session (~/.zcode/v2/ide-chat),
+			// then jump back into the conversation that matched.
+			const query = await vscode.window.showInputBox({
+				placeHolder: 'Search all chat history (wrap in /…/ for regex)',
+				prompt: 'ZCode: search user + assistant messages in every saved session.',
+			});
+			const trimmed = query?.trim();
+			if (!trimmed) {
+				return;
+			}
+			let matches: SessionSearchMatch[];
+			try {
+				matches = await searchChatSessions(trimmed, { limit: 60 });
+			} catch (err) {
+				void vscode.window.showErrorMessage(`Chat history search failed: ${err instanceof Error ? err.message : String(err)}`);
+				return;
+			}
+			if (!matches.length) {
+				void vscode.window.showInformationMessage(`No chat-history matches for “${trimmed}”.`);
+				return;
+			}
+			const picks = matches.map(match => ({
+				label: match.role === 'user' ? `$(comment) ${match.title}` : `$(sparkle) ${match.title}`,
+				description: `${new Date(match.updatedAt).toLocaleString()} · ${match.matchCount} hit${match.matchCount === 1 ? '' : 's'} · ${match.sessionMatchCount} in session`,
+				detail: `${match.role === 'user' ? 'You' : 'AI'}: ${match.snippet}`,
+				sessionId: match.sessionId,
+			}));
+			const pick = await vscode.window.showQuickPick(picks, {
+				placeHolder: `Chat history matches for “${trimmed}” — Enter opens that session`,
+				matchOnDescription: true,
+				matchOnDetail: true,
+			});
+			if (pick) {
+				await panel.openSessionFromTitle(pick.sessionId);
+			}
 		}),
 		vscode.commands.registerCommand('zcode.switchBrain', async () => {
 			await panel.switchBrain();

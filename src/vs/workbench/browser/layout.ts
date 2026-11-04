@@ -2110,8 +2110,27 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 			return; // Return if not initialized fully (https://github.com/microsoft/vscode/issues/105480)
 		}
 
-		if (!hidden && this.setAuxiliaryBarMaximized(false) && this.isVisible(Parts.PANEL_PART)) {
-			return; // return: leaving maximised auxiliary bar made this part visible
+		// zcode-fix: do NOT un-maximize the auxiliary bar when the panel is
+		// shown while the auxiliary bar is maximized (e.g. the chat surface
+		// owning the workbench). The previous behavior called
+		// `setAuxiliaryBarMaximized(false)` here, which also restored the
+		// side bar and editor area, so toggling the panel (⌘J) yanked the
+		// whole layout back instead of just revealing the panel strip below
+		// the maximized surface. Falling through to the regular show-panel
+		// handling keeps the chosen layout: panel visible + maximized part
+		// taking the remaining space.
+		//
+		// Keep the remembered pre-maximize panel visibility in sync with
+		// explicit panel toggles that happen while the auxiliary bar is
+		// maximized, so leaving the maximized state later restores the last
+		// panel choice instead of an outdated snapshot. (Skipped during
+		// maximize/unmaximize transitions, which manage this state itself.)
+		if (this.isAuxiliaryBarMaximized() && !this.inMaximizedAuxiliaryBarTransition) {
+			const rememberedVisibility = this.stateModel.getRuntimeValue(LayoutStateKeys.AUXILIARYBAR_LAST_NON_MAXIMIZED_VISIBILITY);
+			if (rememberedVisibility && rememberedVisibility.panelVisible === hidden) {
+				rememberedVisibility.panelVisible = !hidden;
+				this.stateModel.setRuntimeValue(LayoutStateKeys.AUXILIARYBAR_LAST_NON_MAXIMIZED_VISIBILITY, rememberedVisibility);
+			}
 		}
 
 		const wasHidden = !this.isVisible(Parts.PANEL_PART);

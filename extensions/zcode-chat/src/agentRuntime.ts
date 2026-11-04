@@ -28,12 +28,15 @@ import { getFileEditSession, type FileChangeKind } from './fileEditSession';
 import {
 	ellipsize,
 	resolveDirForSpawn,
-	runShellCommand,
 	spawnCapture,
 	truncatePreview,
 } from './processUtils';
 import type { ProviderMode } from './providers';
 import { BROWSER_TOOL_DEFS, executeBrowserTool } from './browserTools';
+import { LSP_TOOL_DEFS, executeLspTool } from './lspTools';
+import { JOB_TOOL_DEFS, executeJobTool, runShellWithJobFallback } from './backgroundJobs';
+import { TERMINAL_TOOL_DEFS, executeTerminalTool } from './persistentTerminal';
+import { PRESENT_TOOL_DEF, DeliverableTracker, executePresentTool } from './presentTools';
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 import { normalizeToolArgs, normalizeToolName } from './toolNormalize';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
@@ -416,6 +419,10 @@ const TOOLS = [
 		},
 	},
 	...BROWSER_TOOL_DEFS,
+	...LSP_TOOL_DEFS,
+	...JOB_TOOL_DEFS,
+	...TERMINAL_TOOL_DEFS,
+	PRESENT_TOOL_DEF,
 ];
 
 export async function runWorkspaceAgent(options: {
@@ -445,6 +452,7 @@ export async function runWorkspaceAgent(options: {
 	emit({ type: 'status', text: `${options.model} · ${pace} · ${root}` });
 
 	let todos = [...(options.initialTodos ?? [])];
+	const deliverables = new DeliverableTracker();
 	const auth = await resolveAuth(options.provider);
 	const awareness = formatSessionAwareness(options.sessionAwareness);
 	const readFileState = new Map<string, { mtimeMs: number; size: number }>();
@@ -456,11 +464,15 @@ export async function runWorkspaceAgent(options: {
 			content: [
 				'You are ZCode agent inside a VS Code fork (same tool philosophy as ZCode CLI).',
 				`Workspace root: ${root}`,
-				'Tools: read_file, write_file, str_replace, delete_file, list_dir, grep, glob, run_terminal_cmd, get_diagnostics, web_fetch, open_browser_page, browser_list_pages, browser_read_page, browser_click, browser_type, browser_hover, browser_screenshot, browser_navigate, browser_import_chrome_data, TodoWrite, AskUserQuestion.',
+				'Tools: read_file, write_file, str_replace, delete_file, list_dir, grep, glob, run_terminal_cmd, get_diagnostics, web_fetch, open_browser_page, browser_list_pages, browser_read_page, browser_click, browser_type, browser_hover, browser_screenshot, browser_navigate, browser_import_chrome_data, lsp_definition, lsp_references, lsp_implementation, lsp_type_definition, lsp_hover, lsp_document_symbols, lsp_workspace_symbols, job_list, job_output, job_kill, terminal_open, terminal_send, terminal_read, terminal_list, terminal_kill, present, TodoWrite, AskUserQuestion.',
 				'ZCode CLI names also work (Read/Write/Edit/Bash/Grep/Glob/WebFetch).',
 				'Prefer str_replace for small edits; set replace_all when renaming a symbol across a file. Read a file before editing when you lack exact text.',
 				'Use run_terminal_cmd (Bash) for git/tests/builds — not for reading files. Use get_diagnostics after substantive edits.',
 				'Browser: always use the integrated Browser tools (open_browser_page → keep pageId → browser_read_page → browser_click/browser_type). Do not open an external browser. Sync Chrome login with browser_import_chrome_data only after asking the user.',
+				'LSP: prefer lsp_definition/lsp_references/lsp_implementation/lsp_workspace_symbols over grep when locating symbols (1-based line/character).',
+				'Long commands: if run_terminal_cmd times out, the process becomes a background job — poll job_output/job_list, clean up with job_kill.',
+				'Persistent shell: terminal_open once, then terminal_send/terminal_read; cwd/env state persists (REPLs, venv). Not a TTY.',
+				'When the task is done, call present with the 1-4 final deliverable files so the user gets a deliverables card.',
 				'When blocked on a user decision, call AskUserQuestion and wait for their choices before continuing.',
 				'After finishing, briefly summarize what you changed in plain language.',
 				'Do not dump raw tool logs or reasoning in the final answer; the UI shows those separately.',
@@ -523,8 +535,9 @@ export async function runWorkspaceAgent(options: {
 		const toolCalls = choice.tool_calls ?? [];
 		if (!toolCalls.length) {
 			const text = (choice.content ?? '').trim() || '(done)';
-			emit({ type: 'assistant', text, done: true });
-			return { text, todos };
+			const finalText = text + deliverables.markdown();
+			emit({ type: 'assistant', text: finalText, done: true });
+			return { text: finalText, todos };
 		}
 
 		// Text already streamed stays in the timeline. Tool rows are appended after it,
@@ -570,6 +583,7 @@ export async function runWorkspaceAgent(options: {
 				result = await executeTool(toolName, call.function.arguments, root, {
 					sessionId: options.sessionAwareness?.sessionId,
 					readFileState,
+					deliverables,
 					onFileChange: change => {
 						emit({
 							type: 'file_change',
@@ -1440,6 +1454,7 @@ interface ToolExecContext {
 	sessionId?: string;
 	readFileState?: Map<string, { mtimeMs: number; size: number }>;
 	onFileChange?: FileChangeReporter;
+	deliverables?: DeliverableTracker;
 }
 
 async function rememberReadState(
@@ -1689,7 +1704,21 @@ async function executeTool(
 				return executeGrep(args, root);
 			case 'glob':
 				return executeGlob(args, root);
+			case 'present':
+				return executePresentTool(args, ctx?.deliverables ?? new DeliverableTracker(), root);
 			default: {
+				const lsp = await executeLspTool(name, args, root);
+				if (lsp) {
+					return lsp;
+				}
+				const job = await executeJobTool(name, args);
+				if (job) {
+					return job;
+				}
+				const terminal = await executeTerminalTool(name, args, root);
+				if (terminal) {
+					return terminal;
+				}
 				const browser = await executeBrowserTool(name, args);
 				if (browser) {
 					return browser;
@@ -2069,7 +2098,7 @@ async function executeShell(
 	const timeoutMs = Math.max(1_000, Math.min(Math.floor(rawTimeout), 600_000));
 	const description = typeof args.description === 'string' ? args.description.trim() : '';
 
-	const result = await runShellCommand({ command, cwd, timeoutMs });
+	const result = await runShellWithJobFallback({ command, cwd, timeoutMs });
 	const parts = [
 		`exit ${result.code ?? 'null'}`,
 		result.stdout ? `stdout:\n${result.stdout}` : '(no stdout)',
@@ -2080,9 +2109,14 @@ async function executeShell(
 	const detail = `$ ${command}\n\n${body.length > 12_000 ? `${body.slice(0, 12_000)}\n…(truncated)` : body}`;
 	const label = description || command;
 	if (result.timedOut) {
+		const jobNote = result.jobId
+			? `\n\nTimed out after ${Math.round(timeoutMs / 1000)}s — process still running as background job ${result.jobId}. Poll job_output (or job_list), or kill it with job_kill. Do NOT re-run the command.`
+			: '';
 		return {
-			summary: `shell timed out · ${ellipsize(label, 48)}`,
-			content: truncatePreview(body, 30_000),
+			summary: result.jobId
+				? `shell timeout → job ${result.jobId} · ${ellipsize(label, 48)}`
+				: `shell timed out · ${ellipsize(label, 48)}`,
+			content: truncatePreview(body + jobNote, 30_000),
 			detail,
 		};
 	}

@@ -32,6 +32,7 @@
 	"container.title": "AI Chat",
 	"view.chat": "AI Chat",
 	"command.toggleHistory": "Chat History",
+  "command.searchHistory": "Search Chat History",
 	"command.closeActiveTab": "Close Active Chat Tab",
 	"chat.fullName": "ZCode",
 	"chat.description": "ZCode agent with Start Plan / BigModel providers.",
