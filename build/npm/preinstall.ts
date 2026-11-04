@@ -139,13 +139,11 @@ function installHeaders() {
 	const remote = getHeaderInfo(path.join(import.meta.dirname, '..', '..', 'remote', '.npmrc'));
 
 	if (local !== undefined) {
-		// Both disturl and target come from a file checked into our repository
-		child_process.execFileSync(node_gyp, ['install', '--dist-url', local.disturl, local.target], { shell: true });
+		ensureHeadersInstalled(node_gyp, local);
 	}
 
 	if (remote !== undefined) {
-		// Both disturl and target come from a file checked into our repository
-		child_process.execFileSync(node_gyp, ['install', '--dist-url', remote.disturl, remote.target], { shell: true });
+		ensureHeadersInstalled(node_gyp, remote);
 	}
 
 	// Overlay any custom headers shipped in build/npm/gyp/custom-headers on top of
@@ -190,6 +188,61 @@ function getLocalHeaderPath(target: string): string | undefined {
 	const homedir = os.homedir();
 	const cachePath = process.env.XDG_CACHE_HOME || path.join(homedir, '.cache');
 	return path.join(cachePath, 'node-gyp', target, 'include', 'node');
+}
+
+function getNodeGypCacheRoot(target: string): string | undefined {
+	const headerPath = getLocalHeaderPath(target);
+	return headerPath ? path.dirname(path.dirname(headerPath)) : undefined;
+}
+
+function resolveDisturl(info: { disturl: string; target: string }): string {
+	return process.env['ELECTRON_HEADERS_DISTURL']
+		|| process.env['npm_config_disturl']
+		|| info.disturl;
+}
+
+function ensureHeadersInstalled(node_gyp: string, info: { disturl: string; target: string }): void {
+	const headerPath = getLocalHeaderPath(info.target);
+	if (headerPath && fs.existsSync(path.join(headerPath, 'common.gypi'))) {
+		console.log(`Using cached Electron headers: ${headerPath}`);
+		return;
+	}
+
+	const disturl = resolveDisturl(info);
+	try {
+		child_process.execFileSync(node_gyp, ['install', '--dist-url', disturl, info.target], { shell: true });
+		return;
+	} catch (err) {
+		console.warn(`node-gyp headers install via ${disturl} failed; trying npmmirror fallback…`);
+	}
+
+	installHeadersFromNpmmirror(info.target);
+}
+
+function installHeadersFromNpmmirror(target: string): void {
+	const cacheRoot = getNodeGypCacheRoot(target);
+	if (!cacheRoot) {
+		throw new Error('Unable to resolve node-gyp cache path for Electron headers');
+	}
+
+	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'electron-headers-'));
+	const tarball = path.join(tmp, 'headers.tgz');
+	const url = `https://cdn.npmmirror.com/binaries/electron/v${target}/node-v${target}-headers.tar.gz`;
+	console.log(`Downloading Electron headers from ${url}`);
+	child_process.execFileSync('curl', ['-fsSL', '--max-time', '120', '-o', tarball, url], { stdio: 'inherit' });
+	child_process.execFileSync('tar', ['-xzf', tarball, '-C', tmp], { stdio: 'inherit' });
+
+	const extractedInclude = path.join(tmp, 'node_headers', 'include');
+	if (!fs.existsSync(extractedInclude)) {
+		throw new Error(`Unexpected Electron headers layout in ${tmp}`);
+	}
+
+	fs.rmSync(cacheRoot, { recursive: true, force: true });
+	fs.mkdirSync(cacheRoot, { recursive: true });
+	fs.cpSync(extractedInclude, path.join(cacheRoot, 'include'), { recursive: true });
+	fs.writeFileSync(path.join(cacheRoot, 'installVersion'), '11\n');
+	fs.rmSync(tmp, { recursive: true, force: true });
+	console.log(`Installed Electron headers to ${cacheRoot}`);
 }
 
 function getHeaderInfo(rcFile: string): { disturl: string; target: string } | undefined {
