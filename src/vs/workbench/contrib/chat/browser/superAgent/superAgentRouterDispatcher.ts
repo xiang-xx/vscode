@@ -363,7 +363,10 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 		this.routerService.recordActivity(worker.id, 'request submitted');
 
 		if (opts?.routerSessionId && opts.dispatchItemId) {
-			void this.commandService.executeCommand('zcode.patchRouterDispatch', {
+			// Await the identity stamp (and its disk write) before showing the
+			// homepage. Otherwise board rehydration reads a card that still has
+			// no worker session and treats this live worker as missing.
+			await this.commandService.executeCommand('zcode.patchRouterDispatch', {
 				sessionId: opts.routerSessionId,
 				dispatchItemId: opts.dispatchItemId,
 				workerId: worker.id,
@@ -374,7 +377,7 @@ export class SuperAgentRouterDispatcher extends Disposable implements IWorkbench
 			}).catch(() => { });
 		}
 		// Ensure the webview stays on the Router dispatch log (not a worker stream).
-		void this.commandService.executeCommand(ZCODE_INTERNAL_SUPERAGENT_SHOW_ROUTER).catch(() => { });
+		await this.commandService.executeCommand(ZCODE_INTERNAL_SUPERAGENT_SHOW_ROUTER).catch(() => { });
 	}
 }
 

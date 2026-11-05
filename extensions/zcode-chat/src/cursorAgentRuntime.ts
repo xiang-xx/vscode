@@ -26,8 +26,10 @@ import {
 	isCursorTransportDrop,
 	isCursorTransportDump,
 	type AcpClientOptions,
+	type AcpMcpServerConfig,
 	type AcpSessionUpdate,
 } from './cursorAcpClient';
+import { sharedMcpServers } from './chatPlugins';
 import { getCursorAuthStatus, promptCursorLogin } from './cursorAuth';
 import { getFileEditSession } from './fileEditSession';
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
@@ -78,9 +80,20 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 
 	const mode = options.mode ?? getCursorAgentMode();
 	const model = options.model ?? getCursorModel();
-	let mcpServers: Awaited<ReturnType<typeof buildIdeBrowserMcpServers>> = [];
+	let mcpServers: AcpMcpServerConfig[] = (await sharedMcpServers()).map(server => {
+		if (server.type === 'http') {
+			return { type: 'http' as const, name: server.name, url: server.url };
+		}
+		return {
+			type: 'stdio' as const,
+			name: server.name,
+			command: server.command || '',
+			args: server.args ?? [],
+			env: Object.entries(server.env ?? {}).map(([name, value]) => ({ name, value })),
+		};
+	});
 	try {
-		mcpServers = await buildIdeBrowserMcpServers();
+		mcpServers = [...await buildIdeBrowserMcpServers(), ...mcpServers];
 		await ensureWorkspaceIdeBrowserMcp();
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);

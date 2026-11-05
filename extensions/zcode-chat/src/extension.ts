@@ -25,6 +25,8 @@ import {
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
 import { searchChatSessions, type SessionSearchMatch } from './sessionSearch';
+import { disposePluginHosts } from './chatPlugins';
+import { registerPluginCommands } from './pluginCommands';
 import type { DispatchStatus } from './conversation';
 
 const DISPATCH_STATUSES: ReadonlySet<string> = new Set([
@@ -39,6 +41,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 	setBrowserMcpExtensionRoot(context.extensionPath);
 	void ensureBrowserBridge().catch(() => { /* bridge starts lazily on first Cursor run */ });
 	context.subscriptions.push({ dispose: () => disposeBrowserBridge() });
+
+	registerPluginCommands(context);
 
 	const auth = new ZCodeAuthService(context.secrets);
 	setAuthService(auth);
@@ -146,7 +150,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			if (!opts || typeof opts.sessionId !== 'string' || typeof opts.dispatchItemId !== 'string' || typeof opts.workerId !== 'string') {
 				return;
 			}
-			panel.patchRouterDispatch({
+			await panel.patchRouterDispatch({
 				sessionId: opts.sessionId,
 				dispatchItemId: opts.dispatchItemId,
 				workerId: opts.workerId,
@@ -315,5 +319,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 }
 
 export function deactivate(): void {
+	disposePluginHosts();
 	disposeBrowserBridge();
 }

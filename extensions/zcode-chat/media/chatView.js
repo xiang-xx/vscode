@@ -24,6 +24,10 @@
 	const historyList = document.getElementById('historyList');
 	const historyClose = document.getElementById('historyClose');
 	const plusBtn = document.getElementById('plus');
+	const sceneBtn = document.getElementById('sceneBtn');
+	const sceneMenu = document.getElementById('sceneMenu');
+	const brainBtn = document.getElementById('brainBtn');
+	const brainLabel = document.getElementById('brainLabel');
 	const providerBtn = document.getElementById('providerBtn');
 	const modelBtn = document.getElementById('modelBtn');
 	const thoughtBtn = document.getElementById('thoughtBtn');
@@ -38,25 +42,7 @@
 	const cursorModelBtn = document.getElementById('cursorModelBtn');
 	const cursorModeLabel = document.getElementById('cursorModeLabel');
 	const cursorModelLabel = document.getElementById('cursorModelLabel');
-	const brainZcode = document.getElementById('brainZcode');
-	const brainCursor = document.getElementById('brainCursor');
-	const hintEl = document.getElementById('hint');
 	const scheduleTipEl = document.getElementById('scheduleTip');
-	// Footer: brain switch sits left, status hint (ZCode · root · model · …) right on the same row.
-	// Set via CSSOM (CSP blocks inline <style>; chatView.css is being edited in parallel — fold into it later).
-	if (brainZcode && hintEl) {
-		const brainBar = brainZcode.closest('.brain-bar');
-		if (brainBar) {
-			brainBar.style.justifyContent = 'space-between';
-			brainBar.style.gap = '8px';
-		}
-		hintEl.style.flex = '1';
-		hintEl.style.minWidth = '0';
-		hintEl.style.textAlign = 'right';
-		hintEl.style.whiteSpace = 'nowrap';
-		hintEl.style.overflow = 'hidden';
-		hintEl.style.textOverflow = 'ellipsis';
-	}
 	const plusMenu = document.getElementById('plusMenu');
 	const pickerMenu = document.getElementById('pickerMenu');
 	const composer = document.getElementById('composer');
@@ -91,6 +77,8 @@
 	let mentionIndex = 0;
 	let mentionRange = null;
 	let historyOpen = false;
+	let sceneKey = '';
+	let sceneChoices = [];
 	let contextPanelOpen = false;
 	const CONTEXT_RING_R = 10;
 	const CONTEXT_RING_C = 2 * Math.PI * CONTEXT_RING_R;
@@ -515,6 +503,7 @@
 	function closeMenus() {
 		openMenu = null;
 		if (plusMenu) plusMenu.classList.remove('open');
+		if (sceneMenu) sceneMenu.classList.remove('open');
 		pickerMenu.classList.remove('open', 'skill-picker');
 		pickerMenu.style.left = '';
 		pickerMenu.style.bottom = '';
@@ -529,6 +518,8 @@
 		mentionItems = [];
 		mentionIndex = 0;
 		plusBtn.setAttribute('aria-expanded', 'false');
+		if (sceneBtn) sceneBtn.setAttribute('aria-expanded', 'false');
+		if (brainBtn) brainBtn.setAttribute('aria-expanded', 'false');
 		providerBtn.setAttribute('aria-expanded', 'false');
 		modelBtn.setAttribute('aria-expanded', 'false');
 		thoughtBtn.setAttribute('aria-expanded', 'false');
@@ -632,7 +623,7 @@
 			sendBtn.setAttribute('aria-label', 'Send');
 			sendBtn.classList.remove('stopping', 'queueing');
 		}
-		[plusBtn, providerBtn, modelBtn, paceBtn, thoughtBtn, inputEl].forEach((el) => {
+		[plusBtn, brainBtn, providerBtn, modelBtn, paceBtn, thoughtBtn, inputEl].forEach((el) => {
 			if (el) el.disabled = false;
 		});
 	}
@@ -1528,7 +1519,10 @@
 		if (textEl.textContent !== (item.text || '')) {
 			textEl.textContent = item.text || '';
 		}
-		if (item.badge) {
+		// Worker cards already title themselves in the header; repeating the
+		// badge on the receipt line only squeezes the status that follows it.
+		const showBadge = !!item.badge && !el.closest('.worker-card');
+		if (showBadge) {
 			if (badgeEl) {
 				if (badgeEl.textContent !== item.badge) {
 					badgeEl.textContent = item.badge;
@@ -2000,7 +1994,7 @@
 		bubble.appendChild(text);
 		const meta = document.createElement('div');
 		meta.className = 'dispatch-meta';
-		if (item.badge) {
+		if (item.badge && !(opts && opts.omitBadge)) {
 			const badge = document.createElement('span');
 			badge.className = 'dispatch-badge';
 			badge.textContent = item.badge;
@@ -2017,7 +2011,9 @@
 		row.appendChild(meta);
 		syncDispatchPendingReply(row, item);
 		if (item.resultText) {
-			row.appendChild(renderDispatchResult(item));
+			const result = renderDispatchResult(item);
+			row.appendChild(result);
+			scheduleFitDispatchResult(result);
 		}
 		if (item.files && item.files.length) {
 			row.appendChild(renderDispatchFiles(item));
@@ -2155,6 +2151,7 @@
 				const files = row.querySelector(':scope > .dispatch-files');
 				row.insertBefore(fresh, files || null);
 			}
+			scheduleFitDispatchResult(fresh);
 		}
 		const filesKey = item.files && item.files.length ? JSON.stringify(item.files) : '';
 		let filesEl = row.querySelector(':scope > .dispatch-files');
@@ -2188,23 +2185,25 @@
 			row.className = nextClass;
 		}
 		row.title = wantClickable
-			? (selected ? '已选中：输入框内容将派发给该 Worker（点击取消）' : '点击选中：输入框内容将派发给该 Worker')
+			? (selected ? '已选中：输入框内容将派发给该 Worker（点击或按 Esc 取消）' : '点击选中：输入框内容将派发给该 Worker')
 			: '';
 		if (attach && wantClickable) {
 			row.addEventListener('click', (e) => {
-				if (e.target.closest('.dispatch-open, .dispatch-result, .dispatch-files')) {
+				const origin = e.target instanceof Element ? e.target : (e.target && e.target.parentElement);
+				if (origin && origin.closest('.dispatch-open, .dispatch-result-toggle, .file-label, a, .codeblock-copy, button, input, textarea')) {
 					return;
 				}
-				const nowSelected = !(state && state.dispatchTarget && state.dispatchTarget.workerSessionId === item.workerSessionId);
-				vscode.postMessage({
-					type: 'setDispatchTarget',
-					target: nowSelected ? {
-						workerId: item.workerId,
-						workerSessionId: item.workerSessionId,
-						badge: item.badge,
-						accent: item.accent,
-					} : null,
-				});
+				if (selectionInside(row)) {
+					return;
+				}
+				const nowSelected = !(state && state.dispatchTarget && item.workerSessionId
+					&& state.dispatchTarget.workerSessionId === item.workerSessionId);
+				applyDispatchTarget(nowSelected && item.workerSessionId ? {
+					workerId: item.workerId,
+					workerSessionId: item.workerSessionId,
+					badge: item.badge,
+					accent: item.accent,
+				} : null);
 			});
 		}
 	}
@@ -2227,33 +2226,90 @@
 	function renderDispatchResult(item) {
 		const wrap = document.createElement('div');
 		wrap.className = 'dispatch-result';
+		wrap.dataset.resultId = item.id;
 		const body = document.createElement('div');
 		body.className = 'dispatch-result-body rendered-markdown';
 		body.innerHTML = renderMarkdown(item.resultText || '');
 		wrap.appendChild(body);
-		const long = (item.resultText || '').length > 260;
-		wrap.classList.toggle('long', long);
-		wrap.classList.toggle('expanded', expandedDispatchResults.has(item.id));
-		if (long) {
-			const toggle = document.createElement('button');
+		// Cap until fitDispatchResult measures. Short replies drop the cap
+		// and never get 展开/收起.
+		if (expandedDispatchResults.has(item.id)) {
+			wrap.classList.add('expanded');
+			bindDispatchResultToggle(wrap, item.id);
+		} else {
+			wrap.classList.add('long');
+		}
+		return wrap;
+	}
+
+	function bindDispatchResultToggle(wrap, itemId) {
+		let toggle = wrap.querySelector(':scope > .dispatch-result-toggle');
+		if (!toggle) {
+			toggle = document.createElement('button');
 			toggle.type = 'button';
 			toggle.className = 'dispatch-result-toggle';
-			toggle.textContent = expandedDispatchResults.has(item.id) ? '收起' : '展开';
 			toggle.addEventListener('click', (e) => {
 				e.stopPropagation();
-				const expanded = expandedDispatchResults.has(item.id);
+				const expanded = expandedDispatchResults.has(itemId);
 				if (expanded) {
-					expandedDispatchResults.delete(item.id);
+					expandedDispatchResults.delete(itemId);
 				} else {
-					expandedDispatchResults.add(item.id);
+					expandedDispatchResults.add(itemId);
 				}
+				wrap.classList.add('long');
 				wrap.classList.toggle('expanded', !expanded);
 				toggle.textContent = !expanded ? '收起' : '展开';
 			});
 			wrap.appendChild(toggle);
 		}
-		return wrap;
+		toggle.textContent = expandedDispatchResults.has(itemId) ? '收起' : '展开';
+		return toggle;
 	}
+
+	/**
+	 * 展开/收起 only when the reply is taller than the collapsed cap.
+	 * Anything that fits is shown in full.
+	 */
+	function fitDispatchResult(wrap) {
+		if (!wrap || !wrap.isConnected) {
+			return;
+		}
+		const body = wrap.querySelector(':scope > .dispatch-result-body');
+		const itemId = wrap.dataset.resultId;
+		if (!body || !itemId) {
+			return;
+		}
+		const wantExpanded = expandedDispatchResults.has(itemId);
+		wrap.classList.add('long');
+		wrap.classList.remove('expanded');
+		const overflows = body.scrollHeight > body.clientHeight + 4;
+		if (!overflows) {
+			expandedDispatchResults.delete(itemId);
+			wrap.classList.remove('long', 'expanded');
+			const toggle = wrap.querySelector(':scope > .dispatch-result-toggle');
+			if (toggle) {
+				toggle.remove();
+			}
+			return;
+		}
+		wrap.classList.toggle('expanded', wantExpanded);
+		bindDispatchResultToggle(wrap, itemId);
+	}
+
+	let dispatchResultFitRAF = 0;
+	function scheduleFitDispatchResult(wrap) {
+		requestAnimationFrame(() => fitDispatchResult(wrap));
+	}
+	function scheduleFitDispatchResults() {
+		if (dispatchResultFitRAF) {
+			return;
+		}
+		dispatchResultFitRAF = requestAnimationFrame(() => {
+			dispatchResultFitRAF = 0;
+			document.querySelectorAll('.dispatch-result:not(.pending)').forEach(fitDispatchResult);
+		});
+	}
+	window.addEventListener('resize', scheduleFitDispatchResults);
 
 	/** Worker's working-set files mirrored under the receipt. */
 	function renderDispatchFiles(item) {
@@ -2383,6 +2439,41 @@
 		return strip;
 	}
 
+	/** True when the user is dragging a text selection inside root (don't treat that as a click). */
+	function selectionInside(root) {
+		const sel = window.getSelection && window.getSelection();
+		if (!sel || sel.isCollapsed) {
+			return false;
+		}
+		const node = sel.anchorNode;
+		if (!node) {
+			return false;
+		}
+		const el = node.nodeType === 1 ? node : node.parentElement;
+		return !!(el && root.contains(el));
+	}
+
+	/** Select or clear the Worker the next composer send goes to, and refresh the board chrome immediately. */
+	function applyDispatchTarget(target) {
+		const next = target && target.workerSessionId ? target : null;
+		if (state) {
+			state.dispatchTarget = next;
+		}
+		const isRouter = !!(state && state.isRouter);
+		renderDispatchTarget(next, isRouter);
+		if (inputEl && isRouter) {
+			inputEl.placeholder = next
+				? `发给 ${next.badge || 'Worker'}：输入跟进任务…`
+				: '描述要派发给 Worker 的任务';
+		}
+		document.querySelectorAll('.worker-card[data-worker-key]').forEach((el) => {
+			if (el._boardGroup) {
+				syncWorkerCardChrome(el, el._boardGroup);
+			}
+		});
+		vscode.postMessage({ type: 'setDispatchTarget', target: next });
+	}
+
 	function bindWorkerCardSelect(card) {
 		if (card._boardSelectBound) {
 			return;
@@ -2393,7 +2484,15 @@
 			if (!group) {
 				return;
 			}
-			if (e.target.closest('.dispatch-open, .dispatch-result, .dispatch-files, .followup-history, .dispatch-result-toggle, .worker-card-remove')) {
+			// The whole card selects this worker (reply target + clear the
+			// completed/read state). Buttons and links keep their own action:
+			// remove, open the stream, expand the reply, open a file, follow
+			// a link, or jump to the full history.
+			const origin = e.target instanceof Element ? e.target : (e.target && e.target.parentElement);
+			if (origin && origin.closest('.dispatch-open, .dispatch-result-toggle, .worker-card-remove, .followup-history, .file-label, a, .codeblock-copy, button, input, textarea')) {
+				return;
+			}
+			if (selectionInside(card)) {
 				return;
 			}
 			const sessionId = group.workerSessionId;
@@ -2401,15 +2500,12 @@
 				return;
 			}
 			const nowSelected = !(state && state.dispatchTarget && state.dispatchTarget.workerSessionId === sessionId);
-			vscode.postMessage({
-				type: 'setDispatchTarget',
-				target: nowSelected ? {
-					workerId: group.workerId,
-					workerSessionId: sessionId,
-					badge: group.badge,
-					accent: group.accent,
-				} : null,
-			});
+			applyDispatchTarget(nowSelected ? {
+				workerId: group.workerId,
+				workerSessionId: sessionId,
+				badge: group.badge,
+				accent: group.accent,
+			} : null);
 			markBoardWorkerRead(group, card);
 		});
 	}
@@ -2584,7 +2680,7 @@
 			card.style.removeProperty('--worker-status-fg');
 		}
 		card.title = group.workerId
-			? (selected ? '已选中：输入框内容将派发给该 Worker（点击取消）' : '点击选中：输入框内容将派发给该 Worker')
+			? (selected ? '已选中：输入框内容将派发给该 Worker（点击或按 Esc 取消）' : '点击选中：输入框内容将派发给该 Worker')
 				+ (read ? ' · 已看过' : '')
 			: '';
 
@@ -2623,14 +2719,14 @@
 				el.setAttribute('data-item-id', id);
 				return el;
 			};
-			row = renderDispatchCard(item, mark, { skipClick: true });
+			row = renderDispatchCard(item, mark, { skipClick: true, omitBadge: true });
 			body.replaceChildren(row);
 		} else if (!patchDispatchRow(row, item)) {
 			const mark = (el, id) => {
 				el.setAttribute('data-item-id', id);
 				return el;
 			};
-			const fresh = renderDispatchCard(item, mark, { skipClick: true });
+			const fresh = renderDispatchCard(item, mark, { skipClick: true, omitBadge: true });
 			row.replaceWith(fresh);
 		}
 		return body;
@@ -2996,6 +3092,7 @@
 			}
 		});
 		updateBoardColumnsButton(board, effective);
+		scheduleFitDispatchResults();
 	}
 
 	function ensureBoardColumnsControl(board) {
@@ -3982,6 +4079,7 @@
 		});
 		pickerMenu.classList.add('open', 'picker');
 		const map = {
+			brain: brainBtn,
 			provider: providerBtn,
 			model: modelBtn,
 			pace: paceBtn,
@@ -4022,6 +4120,355 @@
 		document.documentElement.style.setProperty('--zcode-chat-line-height', String(lineHeight));
 		const tight = Math.max(1.3, Math.round((lineHeight - 0.25) * 100) / 100);
 		document.documentElement.style.setProperty('--zcode-chat-line-height-tight', String(tight));
+	}
+
+	const UNSPLASH_TOPICS = [
+		{ slug: 'wallpapers', title: 'Wallpapers' },
+		{ slug: 'nature', title: 'Nature' },
+		{ slug: '3d-renders', title: '3D Renders' },
+		{ slug: 'textures-patterns', title: 'Textures & Patterns' },
+		{ slug: 'architecture-interior', title: 'Architecture & Interiors' },
+		{ slug: 'travel', title: 'Travel' },
+		{ slug: 'film', title: 'Film' },
+		{ slug: 'street-photography', title: 'Street Photography' },
+		{ slug: 'experimental', title: 'Experimental' },
+		{ slug: 'animals', title: 'Animals' },
+		{ slug: 'food-drink', title: 'Food & Drink' },
+		{ slug: 'athletics', title: 'Athletics' },
+	];
+	let unsplashBrowse = {
+		topic: 'wallpapers',
+		topics: UNSPLASH_TOPICS,
+		photos: [],
+		page: 0,
+		hasMore: false,
+		loading: false,
+		error: '',
+		needsKey: false,
+		started: false,
+	};
+
+	function requestUnsplash(topic, page) {
+		unsplashBrowse.loading = true;
+		unsplashBrowse.topic = topic || unsplashBrowse.topic || 'wallpapers';
+		unsplashBrowse.error = '';
+		paintUnsplash();
+		vscode.postMessage({
+			type: 'loadUnsplash',
+			topic: unsplashBrowse.topic,
+			page: page || 1,
+		});
+	}
+
+	function applyUnsplashBrowse(data) {
+		unsplashBrowse.loading = false;
+		unsplashBrowse.started = true;
+		unsplashBrowse.needsKey = !!data.needsKey;
+		unsplashBrowse.error = data.error || '';
+		if (data.topic) {
+			unsplashBrowse.topic = data.topic;
+		}
+		if (Array.isArray(data.topics) && data.topics.length) {
+			unsplashBrowse.topics = data.topics;
+		}
+		const incoming = Array.isArray(data.photos) ? data.photos : [];
+		if (data.append && data.error) {
+			unsplashBrowse.hasMore = data.hasMore !== false;
+			paintUnsplash();
+			return;
+		}
+		if (data.append) {
+			const seen = new Set(unsplashBrowse.photos.map((item) => item.id));
+			incoming.forEach((item) => {
+				if (item && item.id && !seen.has(item.id)) {
+					unsplashBrowse.photos.push(item);
+				}
+			});
+		} else if (!data.needsKey) {
+			unsplashBrowse.photos = incoming;
+		}
+		unsplashBrowse.page = data.page || (data.append ? unsplashBrowse.page : 1);
+		unsplashBrowse.hasMore = !!data.hasMore;
+		paintUnsplash();
+	}
+
+	function paintUnsplash() {
+		const mount = document.getElementById('unsplashMount');
+		if (!mount) {
+			return;
+		}
+		const selectedId = state && state.scene ? state.scene.selectedId : '';
+		const scrollParent = mount.closest('.scene-menu');
+		const scrollTop = scrollParent ? scrollParent.scrollTop : 0;
+		mount.innerHTML = '';
+		const titleRow = document.createElement('div');
+		titleRow.className = 'scene-section';
+		titleRow.appendChild(document.createTextNode('Unsplash'));
+		const credit = document.createElement('button');
+		credit.type = 'button';
+		credit.className = 'scene-credit';
+		credit.textContent = '打开 unsplash.com';
+		credit.onclick = (event) => {
+			event.stopPropagation();
+			vscode.postMessage({
+				type: 'openExternal',
+				url: 'https://unsplash.com/?utm_source=zcode&utm_medium=referral',
+			});
+		};
+		titleRow.appendChild(credit);
+		mount.appendChild(titleRow);
+
+		if (unsplashBrowse.needsKey) {
+			const note = document.createElement('div');
+			note.className = 'scene-note';
+			note.textContent = '在线分类要 Access Key。到 unsplash.com/developers 建一个应用，把 Access Key 填进来，就能按他们的分类翻页选用。没填之前先用下面这组。';
+			mount.appendChild(note);
+			const actions = document.createElement('div');
+			actions.className = 'scene-actions';
+			const openDev = document.createElement('button');
+			openDev.type = 'button';
+			openDev.className = 'scene-key';
+			openDev.textContent = '开发者页面';
+			openDev.onclick = (event) => {
+				event.stopPropagation();
+				vscode.postMessage({ type: 'openExternal', url: 'https://unsplash.com/developers' });
+			};
+			const setKey = document.createElement('button');
+			setKey.type = 'button';
+			setKey.className = 'scene-key';
+			setKey.textContent = '填写 Access Key';
+			setKey.onclick = (event) => {
+				event.stopPropagation();
+				vscode.postMessage({ type: 'setUnsplashKey' });
+			};
+			actions.appendChild(openDev);
+			actions.appendChild(setKey);
+			mount.appendChild(actions);
+			mount.appendChild(unsplashGrid(staticUnsplashChoices(), selectedId));
+			if (scrollParent) scrollParent.scrollTop = scrollTop;
+			return;
+		}
+
+		const chips = document.createElement('div');
+		chips.className = 'scene-chips';
+		(unsplashBrowse.topics || []).forEach((topic) => {
+			const chip = document.createElement('button');
+			chip.type = 'button';
+			chip.className = 'scene-chip' + (topic.slug === unsplashBrowse.topic ? ' selected' : '');
+			chip.textContent = topic.title;
+			chip.onclick = (event) => {
+				event.stopPropagation();
+				if (topic.slug === unsplashBrowse.topic && unsplashBrowse.photos.length && !unsplashBrowse.error) {
+					return;
+				}
+				unsplashBrowse.photos = [];
+				unsplashBrowse.page = 0;
+				unsplashBrowse.hasMore = false;
+				requestUnsplash(topic.slug, 1);
+			};
+			chips.appendChild(chip);
+		});
+		mount.appendChild(chips);
+		if (unsplashBrowse.error) {
+			const err = document.createElement('div');
+			err.className = 'scene-note';
+			err.textContent = unsplashBrowse.error;
+			mount.appendChild(err);
+		}
+		const showStatic = !unsplashBrowse.photos.length
+			&& (!unsplashBrowse.started || (!unsplashBrowse.loading && !!unsplashBrowse.error));
+		const live = unsplashBrowse.photos.length
+			? unsplashBrowse.photos
+			: (showStatic ? staticUnsplashChoices() : []);
+		mount.appendChild(unsplashGrid(live, selectedId));
+		if (unsplashBrowse.loading) {
+			const loading = document.createElement('div');
+			loading.className = 'scene-note';
+			loading.textContent = '正在加载…';
+			mount.appendChild(loading);
+		} else if (unsplashBrowse.hasMore) {
+			const more = document.createElement('button');
+			more.type = 'button';
+			more.className = 'scene-more';
+			more.textContent = '加载更多';
+			more.onclick = (event) => {
+				event.stopPropagation();
+				requestUnsplash(unsplashBrowse.topic, (unsplashBrowse.page || 1) + 1);
+			};
+			mount.appendChild(more);
+		} else if (unsplashBrowse.started && !unsplashBrowse.photos.length && !unsplashBrowse.error) {
+			const empty = document.createElement('div');
+			empty.className = 'scene-note';
+			empty.textContent = '这个分类暂时没有可以选用的照片';
+			mount.appendChild(empty);
+		}
+		if (scrollParent) scrollParent.scrollTop = scrollTop;
+	}
+
+	function staticUnsplashChoices() {
+		return (Array.isArray(sceneChoices) ? sceneChoices : []).filter((item) => item.group === 'unsplash');
+	}
+
+	function unsplashGrid(items, selectedId) {
+		const grid = document.createElement('div');
+		grid.className = 'scene-grid';
+		items.forEach((item) => grid.appendChild(buildSceneChoice(item, selectedId)));
+		return grid;
+	}
+
+	function sceneTileButton(className) {
+		const btn = document.createElement('button');
+		btn.type = 'button';
+		btn.className = className;
+		return btn;
+	}
+
+	function renderScene(scene) {
+		if (!scene) {
+			return;
+		}
+		const art = document.querySelector('.scene-art');
+		const src = scene.image ? String(scene.image) : '';
+		if (art) {
+			if (src) {
+				if (art.getAttribute('src') !== src) {
+					art.setAttribute('src', src);
+				}
+			} else {
+				art.removeAttribute('src');
+			}
+			art.style.objectPosition = scene.position || 'center center';
+		}
+		document.body.classList.toggle('has-scene', !!src);
+		if (!sceneMenu) {
+			return;
+		}
+		const choices = Array.isArray(scene.choices) ? scene.choices : [];
+		const usedPicks = Array.isArray(scene.used) ? scene.used : [];
+		sceneChoices = choices;
+		const key = [
+			scene.selectedId || '',
+			src,
+			choices.map((item) => `${item.id}|${item.thumb}|${item.label}`).join(','),
+			usedPicks.map((item) => `${item.id}|${item.thumb}`).join(','),
+		].join('::');
+		if (key === sceneKey) {
+			if (sceneBtn) {
+				sceneBtn.setAttribute('aria-expanded', openMenu === 'scene' ? 'true' : 'false');
+			}
+			return;
+		}
+		sceneKey = key;
+		const keptScroll = sceneMenu.scrollTop;
+		sceneMenu.innerHTML = '';
+
+		const localTitle = document.createElement('div');
+		localTitle.className = 'scene-section';
+		localTitle.textContent = '本地图片';
+		sceneMenu.appendChild(localTitle);
+		const localGrid = document.createElement('div');
+		localGrid.className = 'scene-grid';
+		const noneBtn = sceneTileButton('scene-tile plain' + (scene.selectedId === 'none' ? ' selected' : ''));
+		noneBtn.textContent = '无';
+		noneBtn.title = '去掉背景';
+		noneBtn.onclick = () => vscode.postMessage({ type: 'setScene', id: 'none' });
+		localGrid.appendChild(noneBtn);
+		choices.filter((item) => item.group === 'local').forEach((item) => {
+			localGrid.appendChild(buildSceneChoice(item, scene.selectedId));
+		});
+		const pickBtn = sceneTileButton('scene-tile plain');
+		pickBtn.textContent = '本机图片';
+		pickBtn.title = '从本机选一张图';
+		pickBtn.onclick = () => {
+			closeMenus();
+			vscode.postMessage({ type: 'pickSceneFile' });
+		};
+		localGrid.appendChild(pickBtn);
+		sceneMenu.appendChild(localGrid);
+
+		if (usedPicks.length) {
+			const usedTitle = document.createElement('div');
+			usedTitle.className = 'scene-section';
+			usedTitle.textContent = '最近使用';
+			sceneMenu.appendChild(usedTitle);
+			const usedGrid = document.createElement('div');
+			usedGrid.className = 'scene-grid';
+			usedPicks.forEach((item) => {
+				usedGrid.appendChild(buildSceneChoice({ ...item, removable: true }, scene.selectedId));
+			});
+			sceneMenu.appendChild(usedGrid);
+		}
+
+		const remoteMount = document.createElement('div');
+		remoteMount.id = 'unsplashMount';
+		sceneMenu.appendChild(remoteMount);
+		paintUnsplash();
+		sceneMenu.scrollTop = keptScroll;
+		if (sceneBtn) {
+			sceneBtn.setAttribute('aria-expanded', openMenu === 'scene' ? 'true' : 'false');
+		}
+	}
+
+	function buildSceneChoice(item, selectedId) {
+		const btn = sceneTileButton('scene-tile' + (item.id === selectedId ? ' selected' : ''));
+		const author = item.author || '';
+		btn.title = author ? `${item.label || 'Unsplash'} · ${author} on Unsplash` : (item.label || '');
+		const img = document.createElement('img');
+		img.alt = '';
+		img.src = item.thumb || '';
+		btn.appendChild(img);
+		const caption = document.createElement('span');
+		caption.className = 'caption' + (item.authorUrl ? ' link' : '');
+		caption.textContent = author || item.label || '';
+		if (item.authorUrl) {
+			caption.onclick = (event) => {
+				event.stopPropagation();
+				event.preventDefault();
+				vscode.postMessage({ type: 'openExternal', url: item.authorUrl });
+			};
+		}
+		btn.appendChild(caption);
+		const removable = typeof item.id === 'string'
+			&& (item.id.indexOf('file:') === 0 || item.removable === true);
+		if (removable) {
+			const remove = document.createElement('span');
+			remove.className = 'scene-remove';
+			remove.setAttribute('role', 'button');
+			remove.title = '从列表移除';
+			remove.setAttribute('aria-label', '从列表移除');
+			remove.textContent = '×';
+			remove.onclick = (event) => {
+				event.stopPropagation();
+				vscode.postMessage({
+					type: item.id.indexOf('file:') === 0 ? 'removeSceneFile' : 'removeSceneUnsplash',
+					id: item.id,
+				});
+			};
+			btn.appendChild(remove);
+		}
+		btn.onclick = (event) => {
+			if (event.target && event.target.closest && event.target.closest('.caption.link')) {
+				return;
+			}
+			if (item.image) {
+				vscode.postMessage({
+					type: 'useUnsplash',
+					photo: {
+						id: item.id,
+						label: item.label || '',
+						author: item.author || '',
+						authorUrl: item.authorUrl || '',
+						image: item.image,
+						thumb: item.thumb || '',
+						width: item.width || 0,
+						height: item.height || 0,
+					},
+				});
+				return;
+			}
+			vscode.postMessage({ type: 'setScene', id: item.id });
+		};
+		return btn;
 	}
 
 	function render(next) {
@@ -4074,10 +4521,12 @@
 		const brain = next.brain || 'zcode';
 		document.body.dataset.brain = brain;
 		if (timelineRoot) timelineRoot.dataset.brain = brain;
-		if (brainZcode) brainZcode.classList.toggle('active', brain === 'zcode');
-		if (brainCursor) brainCursor.classList.toggle('active', brain === 'cursor');
 		if (zcodePills) zcodePills.hidden = brain !== 'zcode';
 		if (cursorPills) cursorPills.hidden = brain !== 'cursor';
+		if (brainLabel) {
+			const brainMatch = (next.brains || []).find((item) => item.id === brain);
+			brainLabel.textContent = (brainMatch && brainMatch.label) || (brain === 'cursor' ? 'Cursor' : 'ZCode');
+		}
 
 		providerLabel.textContent =
 			(next.providers || []).find((p) => p.id === next.provider)?.label || next.provider;
@@ -4096,18 +4545,6 @@
 		if (accountBtn) {
 			accountBtn.textContent = next.signedIn ? next.accountLabel : (brain === 'cursor' ? 'Cursor login' : 'Sign in');
 		}
-		const rootLabel = next.workspaceRoot
-			? String(next.workspaceRoot).split(/[/\\]/).filter(Boolean).slice(-2).join('/')
-			: 'no folder';
-		hintEl.textContent = [
-			brain === 'cursor' ? 'Cursor' : 'ZCode',
-			rootLabel,
-			next.model || (brain === 'cursor' ? 'default model' : ''),
-			brain === 'zcode'
-				? [next.agentPaceLabel || next.agentPace, next.reasoningLabel || next.reasoningLevel].filter(Boolean).join(' · ')
-				: (next.cursorMode || 'agent'),
-		].filter(Boolean).join(' · ');
-		hintEl.title = hintEl.textContent;
 
 		if (scheduleTipEl) {
 			const tip = next.scheduleTip;
@@ -4124,6 +4561,8 @@
 
 		historyOpen = !!next.historyOpen;
 		document.body.classList.toggle('router-session', !!next.isRouter);
+		document.body.classList.toggle('worker-session', !next.isRouter && !!next.isWorker);
+		renderScene(next.scene);
 		if (inputEl) {
 			inputEl.placeholder = next.isRouter
 				? (next.dispatchTarget
@@ -4174,6 +4613,22 @@
 		vscode.postMessage({ type: 'send', text });
 	}
 
+	if (sceneBtn) {
+		sceneBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			if (openMenu === 'scene') {
+				closeMenus();
+				return;
+			}
+			closeMenus();
+			openMenu = 'scene';
+			if (sceneMenu) sceneMenu.classList.add('open');
+			sceneBtn.setAttribute('aria-expanded', 'true');
+			if (!unsplashBrowse.started) {
+				requestUnsplash(unsplashBrowse.topic || 'wallpapers', 1);
+			}
+		});
+	}
 	plusBtn.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (openMenu === 'plus') {
@@ -4183,6 +4638,18 @@
 		closeMenus();
 		vscode.postMessage({ type: 'openPlus', draft: inputEl.value });
 	});
+	if (brainBtn) {
+		brainBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			if (!state) return;
+			const brains = (state.brains && state.brains.length)
+				? state.brains
+				: [{ id: 'zcode', label: 'ZCode' }, { id: 'cursor', label: 'Cursor' }];
+			openPicker('brain', brains, state.brain || 'zcode', (id) =>
+				vscode.postMessage({ type: 'setBrain', brain: id }),
+			);
+		});
+	}
 	providerBtn.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!state) return;
@@ -4233,12 +4700,6 @@
 				vscode.postMessage({ type: 'setCursorModel', model: id }),
 			);
 		});
-	}
-	if (brainZcode) {
-		brainZcode.addEventListener('click', () => vscode.postMessage({ type: 'setBrain', brain: 'zcode' }));
-	}
-	if (brainCursor) {
-		brainCursor.addEventListener('click', () => vscode.postMessage({ type: 'setBrain', brain: 'cursor' }));
 	}
 	sendBtn.addEventListener('click', send);
 	if (queueResume) {
@@ -4328,11 +4789,6 @@
 				}
 				return;
 			}
-		}
-		if (e.key === 'Escape') {
-			closeMenus();
-			if (historyOpen) setHistoryOpen(false);
-			return;
 		}
 		if (e.key === 'Enter' && !e.shiftKey) {
 			e.preventDefault();
@@ -4496,9 +4952,67 @@
 			setHistoryOpen(false);
 		}
 	});
+	// Esc dismisses chat chrome first (menus, history, context). With that
+	// gone, it cancels a selected Worker and drops the caret — either or
+	// both, wherever focus sits in this webview. Draft text stays put.
+	function isTypingTarget(el) {
+		if (!el || el.nodeType !== 1) {
+			return false;
+		}
+		if (el.isContentEditable) {
+			return true;
+		}
+		const tag = el.tagName;
+		if (tag === 'TEXTAREA') {
+			return true;
+		}
+		if (tag !== 'INPUT') {
+			return false;
+		}
+		const type = (el.type || 'text').toLowerCase();
+		return type !== 'button' && type !== 'checkbox' && type !== 'radio'
+			&& type !== 'submit' && type !== 'file' && type !== 'range';
+	}
 	document.addEventListener('keydown', (e) => {
-		if (e.key === 'Escape' && openMenu) closeMenus();
-	});
+		if (e.key !== 'Escape' || e.repeat || e.isComposing) {
+			return;
+		}
+		if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) {
+			return;
+		}
+		let dismissedOverlay = false;
+		if (openMenu) {
+			closeMenus();
+			dismissedOverlay = true;
+		}
+		if (historyOpen) {
+			setHistoryOpen(false);
+			dismissedOverlay = true;
+		}
+		if (contextPanelOpen) {
+			setContextPanelOpen(false);
+			dismissedOverlay = true;
+		}
+		if (dismissedOverlay) {
+			e.preventDefault();
+			e.stopPropagation();
+			return;
+		}
+		let dismissed = false;
+		if (state && state.dispatchTarget && state.dispatchTarget.workerSessionId) {
+			applyDispatchTarget(null);
+			dismissed = true;
+		}
+		const active = document.activeElement;
+		if (isTypingTarget(active)) {
+			active.blur();
+			dismissed = true;
+		}
+		if (dismissed) {
+			e.preventDefault();
+			e.stopPropagation();
+		}
+	}, true);
 	// Any press inside the chat page dismisses the blue "done" badge on the
 	// active tab (capture phase so element-level stopPropagation can't skip it).
 	document.addEventListener('pointerdown', () => {
@@ -4511,11 +5025,6 @@
 			vscode.postMessage({ type: 'clearTabDone', sessionId: state.sessionId });
 		}
 	}, true);
-	document.addEventListener('keydown', (e) => {
-		if (e.key === 'Escape' && historyOpen) {
-			setHistoryOpen(false);
-		}
-	});
 	// ⌘⌥J / Ctrl+Alt+J — "view pending worker" toast shortcut. Keydown inside a
 	// webview iframe never reaches the workbench keybinding service, so re-post
 	// the chord to the host, which runs the same command the global keybinding
@@ -4607,6 +5116,7 @@
 			render(data);
 			syncDonePill();
 		}
+		if (data.type === 'unsplashBrowse') applyUnsplashBrowse(data);
 		if (data.type === 'contextUsage') renderContextUsage(data.contextUsage);
 		if (data.type === 'turnCompleted') {
 			playDoneChime();

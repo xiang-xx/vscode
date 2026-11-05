@@ -299,7 +299,9 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 			del.addEventListener('mouseleave', () => del.style.color = 'var(--vscode-descriptionForeground)');
 
 			row.addEventListener('mouseenter', () => {
-				row.style.background = 'var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground))';
+				// Neutral lift. menu.selectionBackground is the theme's saturated
+				// list-selection blue, which reads as a heavy block on a history row.
+				row.style.background = 'color-mix(in srgb, var(--vscode-foreground) 8%, transparent)';
 				del.style.opacity = '1';
 			});
 			row.addEventListener('mouseleave', () => {
@@ -332,7 +334,7 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 		clear.style.textAlign = 'center';
 		clear.style.cursor = 'pointer';
 		clear.addEventListener('mouseenter', () => {
-			clear.style.background = 'var(--vscode-menu-selectionBackground, var(--vscode-list-hoverBackground))';
+			clear.style.background = 'color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent)';
 			clear.style.color = 'var(--vscode-errorForeground)';
 		});
 		clear.addEventListener('mouseleave', () => {

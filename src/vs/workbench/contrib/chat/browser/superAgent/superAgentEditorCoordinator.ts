@@ -11,17 +11,21 @@ import { isEqual } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
+import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
 import { BrowserEditorInput } from '../../../browserView/common/browserEditorInput.js';
 import { EditorsOrder } from '../../../../common/editor.js';
 import { IDecorationData, IDecorationsProvider, IDecorationsService } from '../../../../services/decorations/common/decorations.js';
 import { IEditorGroupsService, IEditorWorkingSet } from '../../../../services/editor/common/editorGroupsService.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
+import { IWorkbenchLayoutService } from '../../../../services/layout/browser/layoutService.js';
 import { IChatEditReviewSession, IChatEditingSession, IChatEditingService } from '../../common/editing/chatEditingService.js';
 import { IChatRouterService, ISuperAgentWorkerHandle } from '../../common/superAgent/chatRouterService.js';
 
 /** Working-set map key for the Router/root chat stream (`focusedWorkerId === undefined`). */
 const ROOT_OWNER_KEY = '__super_agent_root__';
+/** Maximized auxiliary bar (Chat fullscreen) last chosen on the Router homepage. */
+const ROUTER_AUX_BAR_MAXIMIZED_KEY = 'zcode.chatRouter.auxiliaryBarMaximized';
 
 function isFullEditingSession(session: IChatEditReviewSession): session is IChatEditingSession {
 	return 'show' in session;
@@ -97,9 +101,11 @@ class SuperAgentWorkerDecorationsProvider extends Disposable implements IDecorat
  * the focused worker, or the Router/root when `focusedWorkerId` is undefined.
  * When ownership moves, the coordinator snapshots the outgoing owner's open
  * editors (files, built-in browser tabs, layout) and restores the incoming
- * owner's set. Suggested-edits multi-diff is only forced open on a worker's
- * first visit with an empty set. Background workers surface through file
- * decorations instead of stealing tabs.
+ * owner's set. The Router homepage also keeps its own fullscreen choice:
+ * opening a file on a worker detail reveals the editor and the explorer, and
+ * returning to the homepage puts that fullscreen back. Suggested-edits
+ * multi-diff is only forced open on a worker's first visit with an empty set.
+ * Background workers surface through file decorations instead of stealing tabs.
  *
  * Browser tabs survive the swap alive: while a working set is being applied,
  * disposal of open `BrowserEditorInput`s is vetoed, so the live browser view
@@ -127,6 +133,13 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 	/** True only while this coordinator applies a working set (the swap window). */
 	private _isSwappingEditorSets = false;
 	private _parkedOwnerKeyDuringSwap: string | undefined;
+	/**
+	 * Fullscreen (maximized auxiliary bar) last chosen on the Router homepage.
+	 * Seeded from the previous session. After layout restore, toggles and
+	 * leaving the homepage refresh it. Unmaximizing on a detail does not.
+	 */
+	private _routerMaximized: boolean | undefined;
+	private _layoutReady = false;
 
 	constructor(
 		@IChatRouterService private readonly _routerService: IChatRouterService,
@@ -135,13 +148,32 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 		@IEditorGroupsService private readonly _editorGroupsService: IEditorGroupsService,
 		@IEditorService private readonly _editorService: IEditorService,
 		@ILogService private readonly _logService: ILogService,
+		@IWorkbenchLayoutService private readonly _layoutService: IWorkbenchLayoutService,
+		@IStorageService private readonly _storageService: IStorageService,
 	) {
 		super();
+
+		this._routerMaximized = this._storageService.getBoolean(ROUTER_AUX_BAR_MAXIMIZED_KEY, StorageScope.WORKSPACE);
+		void this._layoutService.whenRestored.then(() => {
+			this._layoutReady = true;
+			// Landed on the homepage: the restored layout is that page's choice.
+			if (this._routerService.focusedWorkerId.get() === undefined) {
+				this._rememberRouterLayout();
+			}
+		});
 
 		// (1) File attribution for background workers (explorer, open editors, tabs)
 		this._register(decorationsService.registerDecorationsProvider(
 			new SuperAgentWorkerDecorationsProvider(this._routerService, this._chatEditingService)
 		));
+
+		// Homepage fullscreen toggles count only while that page is showing.
+		// A detail unmaximize (opening a file) must not erase the homepage choice.
+		this._register(this._layoutService.onDidChangeAuxiliaryBarMaximized(() => {
+			if (this._layoutReady && this._routerService.focusedWorkerId.get() === undefined) {
+				this._rememberRouterLayout();
+			}
+		}));
 
 		// (2) Editor tabs + layout follow the chat-stream owner (root or worker)
 		this._register(runOnChange(this._routerService.focusedWorkerId, (focusedId, previousId) => {
@@ -149,6 +181,14 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 			const nextKey = ownerKey(focusedId);
 			if (prevKey === nextKey) {
 				return;
+			}
+
+			let restoreRouterMaximized: boolean | undefined;
+			if (previousId === undefined && focusedId !== undefined && this._layoutReady) {
+				this._rememberRouterLayout();
+			}
+			if (focusedId === undefined && previousId !== undefined && this._routerMaximized !== undefined) {
+				restoreRouterMaximized = this._routerMaximized;
 			}
 
 			// Park the outgoing owner unless that worker was just removed
@@ -161,7 +201,7 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 			}
 			this._hasSeenOwner = true;
 
-			void this._applyWorkingSetFor(nextKey, focusedId, prevKey);
+			void this._applyWorkingSetFor(nextKey, focusedId, prevKey, restoreRouterMaximized);
 		}));
 
 		// Drop parked editors when the worker leaves the live list.
@@ -171,6 +211,12 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 				this._disposeRetainedBrowserInputs(e.workerId);
 			}
 		}));
+	}
+
+	private _rememberRouterLayout(): void {
+		const maximized = this._layoutService.isAuxiliaryBarMaximized();
+		this._routerMaximized = maximized;
+		this._storageService.store(ROUTER_AUX_BAR_MAXIMIZED_KEY, maximized, StorageScope.WORKSPACE, StorageTarget.MACHINE);
 	}
 
 	private _saveWorkingSet(ownerId: string): void {
@@ -194,7 +240,7 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 		this._editorGroupsService.deleteWorkingSet(existing);
 	}
 
-	private async _applyWorkingSetFor(ownerId: string, focusedWorkerId: string | undefined, parkedOwnerKey: string): Promise<void> {
+	private async _applyWorkingSetFor(ownerId: string, focusedWorkerId: string | undefined, parkedOwnerKey: string, restoreRouterMaximized?: boolean): Promise<void> {
 		const generation = ++this._applyGeneration;
 		const workingSet: IEditorWorkingSet | 'empty' = this._workingSets.get(ownerId) ?? 'empty';
 		try {
@@ -202,26 +248,38 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 				if (generation !== this._applyGeneration) {
 					return;
 				}
-				// The swap window: browser tabs closed by the set replacement get
-				// their disposal vetoed so the live view is parked, not destroyed.
-				this._trackOpenBrowserInputs();
-				this._parkedOwnerKeyDuringSwap = parkedOwnerKey;
-				this._isSwappingEditorSets = true;
 				let applied = false;
 				try {
-					applied = await this._editorGroupsService.applyWorkingSet(workingSet, { preserveFocus: true });
+					// The swap window: browser tabs closed by the set replacement get
+					// their disposal vetoed so the live view is parked, not destroyed.
+					this._trackOpenBrowserInputs();
+					this._parkedOwnerKeyDuringSwap = parkedOwnerKey;
+					this._isSwappingEditorSets = true;
+					try {
+						applied = await this._editorGroupsService.applyWorkingSet(workingSet, { preserveFocus: true });
+					} finally {
+						this._isSwappingEditorSets = false;
+						this._parkedOwnerKeyDuringSwap = undefined;
+						this._releaseRestoredBrowserInputs();
+					}
+					if (generation !== this._applyGeneration || !applied) {
+						return;
+					}
+					// First visit to a worker (empty stage): surface suggested edits if any.
+					// Root and returning visits restore the exact tabs/active editor instead.
+					if (workingSet === 'empty' && focusedWorkerId) {
+						await this._showSuggestedEdits(focusedWorkerId);
+					}
+				} catch (err) {
+					this._logService.error('[superAgent] failed to apply editor working set for focused owner', err);
 				} finally {
-					this._isSwappingEditorSets = false;
-					this._parkedOwnerKeyDuringSwap = undefined;
-					this._releaseRestoredBrowserInputs();
-				}
-				if (!applied || generation !== this._applyGeneration) {
-					return;
-				}
-				// First visit to a worker (empty stage): surface suggested edits if any.
-				// Root and returning visits restore the exact tabs/active editor instead.
-				if (workingSet === 'empty' && focusedWorkerId) {
-					await this._showSuggestedEdits(focusedWorkerId);
+					// After the detail's editors are parked, put the homepage's
+					// fullscreen back. Doing it earlier lets an in-flight editor
+					// close treat the hidden editor area as a user open and drop
+					// the maximized state again.
+					if (generation === this._applyGeneration && restoreRouterMaximized !== undefined) {
+						this._layoutService.setAuxiliaryBarMaximized(restoreRouterMaximized);
+					}
 				}
 			});
 		} catch (err) {

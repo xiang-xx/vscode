@@ -20,10 +20,12 @@ let html = src.slice(start, end + '</html>'.length);
 // Swap webview URIs for relative media paths and drop the CSP meta.
 html = html
 	.replace(/\$\{styleUri\}/g, '../media/chatView.css')
+	.replace(/\$\{sceneUri\}/g, '../media/pastoral-scene.jpg')
 	.replace(/\$\{highlightStyleUri\}/g, '../media/highlight-vscode.css')
 	.replace(/\$\{markdownItUri\}/g, '../media/markdown-it.min.js')
 	.replace(/\$\{highlightUri\}/g, '../media/highlight.min.js')
 	.replace(/\$\{markdownUri\}/g, '../media/markdown.js')
+	.replace(/\$\{superAgentKeysUri\}/g, '../media/superAgentKeys.js')
 	.replace(/\$\{scriptUri\}/g, '../media/chatView.js')
 	.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/, '');
 

@@ -152,6 +152,11 @@
           "type": "string",
           "default": "https://zcode.z.ai",
           "description": "%config.oauth.apiOrigin%"
+        },
+        "zcode.unsplashAccessKey": {
+          "type": "string",
+          "default": "",
+          "description": "%config.unsplashAccessKey%"
         }
       }
     },
@@ -241,6 +246,12 @@
         "icon": "$(search)"
       },
       {
+        "command": "zcode.plugins",
+        "title": "%command.plugins%",
+        "category": "%command.category%",
+        "icon": "$(extensions)"
+      },
+      {
         "command": "zcode.closeActiveTab",
         "title": "%command.closeActiveTab%",
         "category": "%command.category%"
@@ -309,6 +320,9 @@
         },
         {
           "command": "zcode.searchHistory"
+        },
+        {
+          "command": "zcode.plugins"
         },
         {
           "command": "zcode.closeActiveTab"

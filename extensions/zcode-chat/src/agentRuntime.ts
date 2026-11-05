@@ -37,6 +37,7 @@ import { LSP_TOOL_DEFS, executeLspTool } from './lspTools';
 import { JOB_TOOL_DEFS, executeJobTool, runShellWithJobFallback } from './backgroundJobs';
 import { TERMINAL_TOOL_DEFS, executeTerminalTool } from './persistentTerminal';
 import { PRESENT_TOOL_DEF, DeliverableTracker, executePresentTool } from './presentTools';
+import { cachedPluginToolDefs, callPluginTool, refreshPluginTools } from './chatPlugins';
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 import { normalizeToolArgs, normalizeToolName } from './toolNormalize';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
@@ -425,6 +426,10 @@ const TOOLS = [
 	PRESENT_TOOL_DEF,
 ];
 
+function activeTools() {
+	return [...TOOLS, ...cachedPluginToolDefs()];
+}
+
 export async function runWorkspaceAgent(options: {
 	messages: ChatMessage[];
 	provider: ProviderMode;
@@ -450,6 +455,12 @@ export async function runWorkspaceAgent(options: {
 	const exploreNudgeAt = exploreNudgeAfterRounds(pace);
 	const emit = (event: AgentProgressEvent) => options.onProgress?.(event);
 	emit({ type: 'status', text: `${options.model} · ${pace} · ${root}` });
+	try {
+		await refreshPluginTools();
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		emit({ type: 'status', text: `Plugins: ${message}`.slice(0, 180) });
+	}
 
 	let todos = [...(options.initialTodos ?? [])];
 	const deliverables = new DeliverableTracker();
@@ -856,7 +867,7 @@ function annotateProviderError(message: string, provider: ProviderMode): Error {
 }
 
 function toAnthropicTools(): Array<{ name: string; description: string; input_schema: Record<string, unknown> }> {
-	return TOOLS.map(tool => ({
+	return activeTools().map(tool => ({
 		name: tool.function.name,
 		description: tool.function.description,
 		input_schema: tool.function.parameters as Record<string, unknown>,
@@ -1230,7 +1241,7 @@ async function completeChatCompletions(options: {
 			body: JSON.stringify({
 				model: options.model,
 				messages: options.messages,
-				tools: TOOLS,
+				tools: activeTools(),
 				tool_choice: 'auto',
 				stream: false,
 				...buildReasoningRequestFields(options.reasoningLevel),
@@ -1284,7 +1295,7 @@ async function streamChatCompletions(options: {
 			body: JSON.stringify({
 				model: options.model,
 				messages: options.messages,
-				tools: TOOLS,
+				tools: activeTools(),
 				tool_choice: 'auto',
 				stream: true,
 				...buildReasoningRequestFields(options.reasoningLevel),
@@ -1722,6 +1733,10 @@ async function executeTool(
 				const browser = await executeBrowserTool(name, args);
 				if (browser) {
 					return browser;
+				}
+				const plugin = await callPluginTool(name, args);
+				if (plugin) {
+					return plugin;
 				}
 				return { summary: `unknown tool ${name}`, content: `Error: unknown tool ${name}` };
 			}

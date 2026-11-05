@@ -11,6 +11,7 @@ import { ViewContainerLocation } from '../../../../common/views.js';
 import { IEditorService } from '../../../../services/editor/common/editorService.js';
 import { IWorkbenchLayoutService, Parts, Position } from '../../../../services/layout/browser/layoutService.js';
 import { IPaneCompositePartService } from '../../../../services/panecomposite/browser/panecomposite.js';
+import { IChatRouterService } from '../../common/superAgent/chatRouterService.js';
 import { ZCODE_VIEW_CONTAINER_ID } from './zcodeAuxiliaryBarChrome.js';
 
 const LAYOUT_APPLIED_KEY = 'zcode.chatFirstLayout.applied.v6';
@@ -21,8 +22,9 @@ const CHAT_WIDTH_RATIO = 0.58;
  * Chat-first workbench layout:
  * - Explorer left | Chat (+ terminal below) center | editor right
  *   (via `zcode.layout.chatPosition: center`)
- * - A maximized Chat is remembered across reloads; opening a file afterwards
- *   still unmaximizes it so it shares the row with the editor.
+ * - A maximized Chat homepage is kept for that page. Opening a file on a
+ *   worker detail unmaximizes so Chat shares the row with the editor; going
+ *   back to the homepage restores the fullscreen choice.
  */
 export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenchContribution {
 	static readonly ID = 'workbench.contrib.zcodeChatLayout';
@@ -38,11 +40,20 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 		@IConfigurationService private readonly configurationService: IConfigurationService,
 		@IStorageService private readonly storageService: IStorageService,
 		@IEditorService private readonly editorService: IEditorService,
+		@IChatRouterService private readonly routerService: IChatRouterService,
 	) {
 		super();
 
 		void this.bootstrap();
 		this._register(this.editorService.onDidVisibleEditorsChange(() => this.onEditorsChanged()));
+		// A detail page schedules a side-by-side resize when it leaves fullscreen.
+		// Re-entering the maximized homepage must cancel that, or the delayed
+		// resize pulls the editor and the file explorer back out.
+		this._register(this.layoutService.onDidChangeAuxiliaryBarMaximized(() => {
+			if (this.layoutService.isAuxiliaryBarMaximized()) {
+				this.resizeTimers.clear();
+			}
+		}));
 	}
 
 	private async bootstrap(): Promise<void> {
@@ -119,6 +130,14 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 			return;
 		}
 
+		// The homepage keeps the fullscreen choice made there. Closing the
+		// detail's files on the way back must not drop it; an explicit open
+		// while the homepage itself is up still goes through the workbench
+		// layout service. A focused worker detail unmaximizes below.
+		if (this.routerService.focusedWorkerId.get() === undefined) {
+			return;
+		}
+
 		// Opening a file keeps the current Chat width; a maximized Chat is
 		// brought back to a side-by-side size so both stay usable.
 		if (!this.layoutService.isAuxiliaryBarMaximized()) {
@@ -142,8 +161,10 @@ export class ZCodeChatLayoutContribution extends Disposable implements IWorkbenc
 			return;
 		}
 		// If still maximized (restore race), leave maximized mode then size Chat.
+		// Never do that for the homepage: its fullscreen is restored on purpose
+		// when the user leaves a detail, and a late timer must not undo it.
 		if (this.layoutService.isAuxiliaryBarMaximized()) {
-			if (this.editorService.visibleEditors.length === 0) {
+			if (this.editorService.visibleEditors.length === 0 || this.routerService.focusedWorkerId.get() === undefined) {
 				return;
 			}
 			this.layoutService.setAuxiliaryBarMaximized(false);

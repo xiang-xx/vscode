@@ -11,6 +11,9 @@
 <script>window.acquireVsCodeApi = function () { return { postMessage: function (m) { console.log('postMessage', m && m.type); }, getState: function () { return {}; }, setState: function () {} }; };</script>
 </head>
 <body class="zcode-compact">
+	<div class="page-scene" aria-hidden="true">
+		<img class="scene-art" alt="" src="../media/pastoral-scene.jpg" />
+	</div>
 	<div class="history-drawer" id="historyDrawer" hidden>
 		<div class="history-header">
 			<div class="history-header-text">
@@ -110,17 +113,11 @@
 			</div>
 		</div>
 	</div>
-	<div class="brain-bar">
-		<div class="brain-switch" id="brainSwitch" role="tablist" aria-label="AI brain">
-			<button type="button" class="brain-tab" data-brain="zcode" id="brainZcode">ZCode</button>
-			<button type="button" class="brain-tab" data-brain="cursor" id="brainCursor">Cursor</button>
-		</div>
-		<div class="hint" id="hint"></div>
-	</div>
 	<div class="schedule-tip" id="scheduleTip" hidden role="status"></div>
 	<script src="../media/markdown-it.min.js"></script>
 	<script src="../media/highlight.min.js"></script>
 	<script src="../media/markdown.js"></script>
+	<script src="../media/superAgentKeys.js"></script>
 	<script src="../media/chatView.js"></script>
 
 <script>

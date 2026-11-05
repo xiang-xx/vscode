@@ -68,37 +68,6 @@ body > * {
 body > .timeline {
 	max-width: none;
 }
-/* Brain switch sits just under the composer as a slim footer row. */
-.brain-bar {
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	flex-shrink: 0;
-	padding: 4px 0 0;
-}
-.brain-switch {
-	display: inline-flex;
-	align-items: center;
-	gap: 2px;
-	padding: 2px;
-	border-radius: 999px;
-	background: color-mix(in srgb, var(--vscode-editor-foreground) 8%, transparent);
-	flex-shrink: 0;
-}
-.brain-tab {
-	border: 0;
-	background: transparent;
-	color: var(--vscode-descriptionForeground);
-	font-size: 11px;
-	font-weight: 600;
-	padding: 2px 8px;
-	border-radius: 999px;
-	cursor: pointer;
-}
-.brain-tab.active {
-	background: var(--vscode-toolbar-hoverBackground);
-	color: var(--vscode-foreground);
-}
 body[data-brain="cursor"] .chat-input-container {
 	/* Hook for future Cursor-specific chrome */
 	border-color: var(--vscode-widget-border, rgba(127,127,127,.35));
@@ -425,7 +394,6 @@ body[data-brain="cursor"] .chat-input-container {
 /* Action chrome must never become a selection endpoint while dragging. */
 .turn-actions,
 .turn-action,
-.brain-bar,
 button {
 	-webkit-user-select: none;
 	user-select: none;
@@ -553,7 +521,8 @@ button {
 	line-height: 1.4;
 	color: var(--vscode-descriptionForeground);
 }
-/* Worker title under the receipt. Width follows the text up to the row. */
+/* Worker title under the receipt, outside a Worker card. Inside a card the
+   header already shows it, so the receipt line is status only. */
 .dispatch-badge {
 	display: inline-block;
 	flex: 0 1 auto;
@@ -725,10 +694,11 @@ button {
 	max-width: 100%;
 }
 .dispatch-result.long:not(.expanded) .dispatch-result-body {
-	max-height: 8.5em;
+	/* Near half the panel, so a short Worker reply stays fully visible. */
+	max-height: min(40vh, 28rem);
 	overflow: hidden;
-	mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
-	-webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent 100%);
+	mask-image: linear-gradient(to bottom, #000 92%, transparent 100%);
+	-webkit-mask-image: linear-gradient(to bottom, #000 92%, transparent 100%);
 }
 .dispatch-result-toggle {
 	margin-top: 4px;
@@ -908,10 +878,18 @@ button {
 	border: 1px solid color-mix(in srgb, var(--vscode-widget-border, rgba(127,127,127,.3)) 80%, transparent);
 	border-left: 3px solid var(--worker-accent, var(--vscode-focusBorder, rgba(127,127,127,.45)));
 	border-radius: 8px;
-	background: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
+	background: var(--vscode-editor-background);
 	transition: border-color 120ms ease, background-color 120ms ease;
 }
-.worker-card.clickable {
+.worker-card.clickable,
+.worker-card.clickable .dispatch-bubble,
+.worker-card.clickable .dispatch-text,
+.worker-card.clickable .dispatch-meta,
+.worker-card.clickable .dispatch-result,
+.worker-card.clickable .dispatch-live,
+.worker-card.clickable .dispatch-files,
+.worker-card.clickable .followup-turn,
+.worker-card.clickable .followup-turn-body {
 	cursor: pointer;
 }
 .worker-card.clickable:hover {
@@ -1035,6 +1013,10 @@ button {
 }
 .worker-card .dispatch-row.exchange .dispatch-bubble {
 	max-width: 100%;
+}
+/* Card header owns the title; a second copy here steals width from the status. */
+.worker-card .dispatch-badge {
+	display: none;
 }
 .worker-card .dispatch-row.selected .dispatch-bubble {
 	box-shadow: none;
@@ -2537,13 +2519,6 @@ textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 	border: 1px solid color-mix(in srgb, var(--vscode-editorWarning-foreground, #bf8803) 35%, transparent);
 }
 .schedule-tip[hidden] { display: none !important; }
-.hint {
-	font-size: 11px;
-	color: var(--vscode-descriptionForeground);
-	padding: 0 4px;
-	line-height: 1.3;
-	flex-shrink: 0;
-}
 .menu {
 	display: none;
 	position: absolute;
@@ -2736,4 +2711,233 @@ textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
 a.zcode-file-link,
 a.zcode-file-link:visited {
 	color: var(--vscode-textLink-foreground);
+}
+
+/* Decorative scene.
+   Homepage: the picture covers the whole page. Worker cards keep a solid
+   surface and sit wherever the board places them, so there is no white or
+   faded band down the middle. Worker page: the picture fills the panel
+   edge to edge. The centered column is a solid page-color plate so the
+   photo does not meet the text. The plate meets the picture on a hard
+   edge. Narrow panels have no room, so the art hides. */
+.page-scene {
+	display: none;
+	position: fixed;
+	inset: 0;
+	z-index: 0;
+	width: auto;
+	max-width: none;
+	pointer-events: none;
+	overflow: hidden;
+	user-select: none;
+}
+body.has-scene.router-session > .page-scene,
+body.has-scene.worker-session > .page-scene {
+	display: block;
+}
+body > :not(.page-scene) {
+	position: relative;
+	z-index: 1;
+}
+.scene-art {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	object-position: center 38%;
+}
+/* Worker page only. The picture runs to the panel edge. The centered
+   column is a solid page-color plate so the photo does not meet the
+   text. No fade on that edge. The homepage board is not a centered column. */
+body.worker-session .page-scene::after {
+	content: "";
+	position: absolute;
+	z-index: 2;
+	top: 0;
+	bottom: 0;
+	left: 50%;
+	/* 56px is the solid gutter beside the text. */
+	width: calc(var(--chat-content-max-width) + 56px);
+	transform: translateX(-50%);
+	background: var(--vscode-sideBar-background);
+}
+/* Section labels sit on the photo, outside the cards. A small solid chip keeps them readable. */
+body.has-scene.router-session .board-section-title .label,
+body.has-scene.router-session .board-section-title .count {
+	background: var(--vscode-editor-background);
+	border-radius: 4px;
+	padding: 1px 6px;
+}
+body.has-scene.router-session .board-columns-control {
+	background: var(--vscode-editor-background);
+}
+@media (prefers-color-scheme: dark) {
+	.scene-art {
+		opacity: 0.5;
+		filter: saturate(0.8);
+	}
+}
+@media (forced-colors: active) {
+	.page-scene { display: none !important; }
+}
+@media (max-width: 980px) {
+	.page-scene { display: none !important; }
+}
+
+/* Background picker. Opens above the composer, where the input row stays visible. */
+.scene-menu {
+	left: 8px;
+	right: auto;
+	width: min(440px, calc(100% - 16px));
+	max-height: min(560px, 74vh);
+	padding: 8px 10px 10px;
+}
+.scene-chips {
+	display: flex;
+	gap: 6px;
+	overflow-x: auto;
+	padding: 0 2px 8px;
+	scrollbar-width: thin;
+}
+.scene-chip,
+.scene-more,
+.scene-key {
+	border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.35));
+	background: transparent;
+	color: var(--vscode-foreground);
+	font: inherit;
+	cursor: pointer;
+}
+.scene-chip {
+	flex: 0 0 auto;
+	border-radius: 999px;
+	padding: 2px 8px;
+	font-size: 11px;
+}
+.scene-chip.selected {
+	background: var(--vscode-badge-background, var(--vscode-button-background));
+	color: var(--vscode-badge-foreground, var(--vscode-button-foreground));
+	border-color: transparent;
+}
+.scene-note {
+	margin: 2px 2px 8px;
+	font-size: 11px;
+	line-height: 1.45;
+	color: var(--vscode-descriptionForeground);
+}
+.scene-actions {
+	display: flex;
+	gap: 6px;
+	margin: 0 0 8px;
+}
+.scene-more,
+.scene-key {
+	display: block;
+	width: 100%;
+	margin: 8px 0 2px;
+	padding: 6px 8px;
+	border-radius: 6px;
+	font-size: 12px;
+}
+.scene-actions .scene-key {
+	flex: 1;
+	width: auto;
+	margin: 0;
+}
+.scene-credit {
+	margin-left: 6px;
+	padding: 0;
+	border: none;
+	background: none;
+	color: var(--vscode-textLink-foreground);
+	font: inherit;
+	font-size: 11px;
+	cursor: pointer;
+}
+.scene-tile .caption.link {
+	cursor: pointer;
+	text-decoration: underline;
+	text-underline-offset: 2px;
+}
+.scene-section {
+	margin: 8px 2px 6px;
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+}
+.scene-section:first-child { margin-top: 2px; }
+.scene-grid {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 6px;
+}
+.scene-tile {
+	position: relative;
+	aspect-ratio: 16 / 10;
+	margin: 0;
+	padding: 0;
+	border-radius: 6px;
+	border: 1px solid var(--vscode-widget-border, rgba(127, 127, 127, 0.35));
+	background: var(--vscode-editor-background);
+	overflow: hidden;
+	cursor: pointer;
+	color: var(--vscode-foreground);
+	font: inherit;
+}
+.scene-tile img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	display: block;
+	pointer-events: none;
+}
+.scene-tile.selected {
+	outline: 2px solid var(--vscode-focusBorder, #0078d4);
+	outline-offset: 1px;
+}
+.scene-tile .caption {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	padding: 8px 4px 2px;
+	font-size: 10px;
+	line-height: 1.2;
+	color: #fff;
+	text-align: left;
+	background: linear-gradient(transparent, rgba(0, 0, 0, 0.62));
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.scene-tile.plain {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	font-size: 11px;
+	color: var(--vscode-descriptionForeground);
+	text-align: center;
+	padding: 4px;
+}
+.scene-tile .scene-remove {
+	position: absolute;
+	top: 2px;
+	right: 2px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 16px;
+	height: 16px;
+	border: none;
+	border-radius: 4px;
+	padding: 0;
+	font: inherit;
+	font-size: 12px;
+	line-height: 16px;
+	color: #fff;
+	background: rgba(0, 0, 0, 0.45);
+	cursor: pointer;
+}
+.scene-tile .scene-remove:hover {
+	background: var(--vscode-errorForeground, #c42b1c);
 }

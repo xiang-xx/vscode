@@ -386,7 +386,10 @@ export class IdeChatStore {
 		for (const meta of index.sessions) {
 			// Keep the Super Agent Router even while it has no messages yet —
 			// it is a dedicated dispatch surface, not an abandoned draft.
-			if (meta.title === 'Router') {
+			// Keep worker sessions too: the first turn's transcript is written
+			// only when that turn finishes, and deleting the file mid-task
+			// makes the homepage card an orphan that gets pruned.
+			if (meta.title === 'Router' || meta.kind === 'router' || meta.kind === 'worker') {
 				continue;
 			}
 			const session = await this.getSession(meta.id);

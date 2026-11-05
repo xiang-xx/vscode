@@ -33,6 +33,24 @@ import { completeChatTurn, getBridgeMode, getCursorBrainStatusLine, workspaceRoo
 import { compactConversation } from './contextCompact';
 import { buildPlusMenuSections, formatSlashInsert, CAPABILITY_COMMANDS, QUICK_ADD_COMMANDS } from './composerActions';
 import {
+	BUNDLED_CHAT_SCENES,
+	CHAT_SCENE_NONE,
+	CHAT_SCENE_STATE_KEY,
+	DEFAULT_CHAT_SCENE_ID,
+	UNSPLASH_CHAT_SCENES,
+	findCatalogScene,
+	isSceneImagePath,
+	parseSavedUnsplash,
+	readPersistedChatScene,
+	rememberSceneFile,
+	rememberUnsplashPick,
+	selectionIsKnown,
+	unsplashImageUrl,
+	type PersistedChatScene,
+	type SavedUnsplashScene,
+} from './chatScene';
+import { fetchUnsplashBrowse, trackUnsplashDownload, UnsplashKeyRejectedError, type UnsplashTopic } from './unsplashCatalog';
+import {
 	dispatchStatusLabel,
 	formatWorkDuration,
 	isDispatchStatusActive,
@@ -253,6 +271,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private seenClaimNotices: Set<string>;
 	private accountQuota: AccountQuota | null = null;
 	private seenNotices = new Set<string>();
+	/** Side-gutter background on the Router board and Worker pages. */
+	private scenePersisted: PersistedChatScene = { selectedId: DEFAULT_CHAT_SCENE_ID, files: [], unsplash: [] };
+	private unsplashTopics: UnsplashTopic[] | null = null;
+	private unsplashLoadSeq = 0;
+	private unsplashWorkingKey = '';
+	/** Cached Unsplash wallpapers live under global storage, outside the repo. */
+	private readonly wallpaperDir: string;
+	private readonly wallpaperDownloads = new Set<string>();
 	private billingSeq = 0;
 	/** Session id of the Super Agent Router dispatch surface (pinned Workers page). */
 	private routerSessionId: string | undefined;
@@ -386,9 +412,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		private readonly ideChat: IdeChatStore,
 		private readonly fileEdits: FileEditSession,
 		private readonly globalState: vscode.Memento,
+		private readonly globalStorageUri: vscode.Uri,
 	) {
+		this.wallpaperDir = path.join(this.globalStorageUri.fsPath, 'wallpapers');
 		this.seenNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(QUOTA_NOTICE_SEEN_KEY)));
 		this.seenClaimNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(CLAIM_NOTICE_SEEN_KEY)));
+		this.scenePersisted = readPersistedChatScene(this.globalState.get(CHAT_SCENE_STATE_KEY));
 		this.bootstrapDone = new Promise<void>(resolve => {
 			this.resolveBootstrapDone = resolve;
 		});
@@ -508,13 +537,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		_token: vscode.CancellationToken,
 	): void {
 		this.view = webviewView;
-		webviewView.webview.options = {
-			enableScripts: true,
-			localResourceRoots: [
-				vscode.Uri.joinPath(this.extensionUri, 'media'),
-				vscode.Uri.file(getAttachmentDir()),
-			],
-		};
+		this.applyWebviewOptions();
 		webviewView.webview.html = this.renderHtml(webviewView.webview);
 		webviewView.webview.onDidReceiveMessage(async (message) => {
 			await this.onMessage(message);
@@ -976,7 +999,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	/**
 	 * Fills worker identity onto a Router dispatch card after the worker exists.
 	 */
-	patchRouterDispatch(opts: {
+	async patchRouterDispatch(opts: {
 		sessionId: string;
 		dispatchItemId: string;
 		workerId: string;
@@ -984,7 +1007,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		badge?: string;
 		accent?: string;
 		status?: DispatchStatus;
-	}): void {
+	}): Promise<void> {
 		const { sessionId, dispatchItemId, workerId, workerSessionId, badge, accent, status } = opts;
 		if (!sessionId || !dispatchItemId || !workerId) {
 			return;
@@ -1019,7 +1042,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.startDispatchElapsedTimer();
 			this.pushState();
 		}
-		void this.persistSessionById(sessionId);
+		// The homepage reload that follows dispatch reads this card back from
+		// disk. Returning before the write lets that reload miss the worker.
+		await this.persistSessionById(sessionId);
 	}
 
 	/**
@@ -1581,6 +1606,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			query?: string;
 			workerId?: string;
 			target?: unknown;
+			topic?: string;
+			page?: number;
+			photo?: unknown;
+			url?: string;
 		};
 
 		if (msg.type === 'ready') {
@@ -1974,6 +2003,40 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'plusAction' && typeof msg.actionId === 'string') {
 			await this.handlePlusAction(msg.actionId, msg.slash);
+			return;
+		}
+		if (msg.type === 'setScene' && typeof msg.id === 'string') {
+			await this.setChatScene(msg.id);
+			return;
+		}
+		if (msg.type === 'pickSceneFile') {
+			await this.pickChatSceneFile();
+			return;
+		}
+		if (msg.type === 'removeSceneFile' && typeof msg.id === 'string') {
+			await this.removeChatSceneFile(msg.id);
+			return;
+		}
+		if (msg.type === 'removeSceneUnsplash' && typeof msg.id === 'string') {
+			await this.removeUnsplashScene(msg.id);
+			return;
+		}
+		if (msg.type === 'loadUnsplash') {
+			const topic = typeof msg.topic === 'string' ? msg.topic : 'wallpapers';
+			const page = typeof msg.page === 'number' ? msg.page : 1;
+			await this.loadUnsplashBrowse(topic, page);
+			return;
+		}
+		if (msg.type === 'setUnsplashKey') {
+			await this.promptUnsplashAccessKey();
+			return;
+		}
+		if (msg.type === 'useUnsplash') {
+			await this.useUnsplashPhoto(msg.photo);
+			return;
+		}
+		if (msg.type === 'openExternal' && typeof msg.url === 'string' && msg.url.startsWith('https://unsplash.com/')) {
+			await this.openUnsplashLink(msg.url);
 			return;
 		}
 		if (msg.type === 'send' && typeof msg.text === 'string') {
@@ -2738,7 +2801,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			});
 			this.startDispatchElapsedTimer();
 			this.safePushState({ clearDraft: true });
-			void this.persistSessionById(sessionId);
+			// The card must be on disk before the workbench opens the homepage
+			// again — that reload rebuilds the board from the session file, and
+			// a memory-only card disappears until the worker's first turn ends.
+			await this.persistSessionById(sessionId).catch(err => console.warn('[zcode-chat] persist dispatch card failed:', err));
 			void vscode.commands.executeCommand('zcode.internal.superAgent.routerSubmit', {
 				sessionId,
 				text: prepared.modelText,
@@ -3544,6 +3610,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			// live row means another window's roster never saw the ✕ and must
 			// not resurrect the card into the shared Router session file.
 			const removed = new Set(await this.ideChat.getRemovedWorkers(routerId, { workspaceRoot: router.workspaceRoot }));
+			// A card this window just dispatched may not be on disk yet. Treat
+			// it as bound so rehydration does not mint a second card for the
+			// same live worker.
+			const memoryItems = routerId === this.sessionId
+				? this.items
+				: (this.parked.get(routerId)?.items ?? []);
+			for (const row of memoryItems) {
+				if (row.kind !== 'dispatch' || !row.workerSessionId) {
+					continue;
+				}
+				if (removed.has(row.workerSessionId) || (row.workerId ? removed.has(row.workerId) : false)) {
+					continue;
+				}
+				bound.add(row.workerSessionId);
+			}
 			const liveWorkers = new Set<string>();
 			const candidates = new Set<string>();
 			const rosterInfo = new Map<string, { workerId?: string; label?: string }>();
@@ -3594,13 +3675,31 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			const cards: Extract<ConversationItem, { kind: 'dispatch' }>[] = [];
 			for (const workerId of candidates) {
 				const session = await this.ideChat.getSession(workerId);
-				if (!session || !session.messages?.length) {
-					continue; // deleted or never-used worker
+				if (!session) {
+					continue; // deleted
+				}
+				// A live worker's transcript is written when the turn finishes.
+				// Skipping empty sessions here is why a new dispatch stayed off
+				// the homepage until that first task completed.
+				const live = liveWorkers.has(workerId);
+				if (!session.messages?.length && !live) {
+					continue;
 				}
 				const info = rosterInfo.get(workerId);
 				const title = info?.label?.trim() || session.title?.trim() || 'Worker';
 				const firstUser = session.messages.find(m => m.role === 'user' && m.content.trim());
 				const lastAssistant = [...session.messages].reverse().find(m => m.role === 'assistant' && m.content.trim());
+				const inFlight = live && !session.messages?.length;
+				// The submit path already pushed a pending card that patch binds
+				// a moment later. Rebuilding here would leave two turns on one
+				// worker (the pending card plus dispatch-rebuilt-*).
+				if (inFlight && [...memoryItems, ...(router.timeline ?? [])].some(row =>
+					row?.kind === 'dispatch'
+					&& !row.workerSessionId
+					&& !row.workerId
+					&& (row.status === 'pending' || row.status === 'starting' || row.status === 'running'))) {
+					continue;
+				}
 				const card: Extract<ConversationItem, { kind: 'dispatch' }> = {
 					id: `dispatch-rebuilt-${workerId}`,
 					kind: 'dispatch',
@@ -3608,11 +3707,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 					workerId: info?.workerId,
 					workerSessionId: workerId,
 					badge: title,
-					status: 'done',
+					status: inFlight ? 'running' : 'done',
 					startedAt: session.createdAt,
-					durationMs: Math.max(0, (session.updatedAt ?? session.createdAt) - session.createdAt),
+					...(inFlight ? {} : { durationMs: Math.max(0, (session.updatedAt ?? session.createdAt) - session.createdAt) }),
 				};
-				const resultText = lastAssistant?.content.trim();
+				const resultText = inFlight ? '' : lastAssistant?.content.trim();
 				if (resultText) {
 					card.resultText = resultText.length > 600 ? `…${resultText.slice(-600)}` : resultText;
 				}
@@ -3635,10 +3734,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			if (this.sessionId === routerId && (cards.length || pruned)) {
 				// Re-apply from disk so the rebuilt (or just pruned) board is
-				// visible immediately.
+				// visible immediately. Keep dispatch cards that exist only in
+				// memory — a dispatch that has not finished saving must not
+				// vanish when this reload replaces the timeline.
 				const fresh = await this.ideChat.getSession(routerId);
 				if (fresh) {
-					this.applySession(routerId, fresh.timeline ?? [], fresh.todos ?? [], true);
+					const diskTimeline = fresh.timeline ?? [];
+					const diskIds = new Set(diskTimeline.map(item => item.id));
+					const kept = this.items.filter(item => {
+						if (item.kind !== 'dispatch' || diskIds.has(item.id)) {
+							return false;
+						}
+						return !(removed.has(item.workerSessionId ?? '') || (item.workerId ? removed.has(item.workerId) : false));
+					});
+					this.applySession(routerId, [...diskTimeline, ...kept], fresh.todos ?? [], true);
 					this.pushState();
 				}
 			}
@@ -3673,7 +3782,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			await this.preserveForeignDispatchCards(sessionId, chat);
 		}
 		const messages = IdeChatStore.messagesFromTimeline(chat.items);
-		if (messages.length === 0) {
+		// Dispatch cards are not chat messages. A Router board that only holds
+		// them used to take the empty-session return below, so a newly
+		// dispatched worker never reached disk — the homepage only gained its
+		// card later, when the first turn finished and rehydration rebuilt it.
+		const hasDispatchCards = chat.items.some(item => item.kind === 'dispatch');
+		if (messages.length === 0 && !hasDispatchCards) {
 			// Never garbage-collect the Super Agent Router while it is still empty.
 			if (chat.persisted && sessionId !== this.routerSessionId) {
 				await this.ideChat.deleteSession(sessionId);
@@ -4320,6 +4434,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 					type: 'state',
 					sessionId: this.sessionId,
 					isRouter: this.sessionId === this.routerSessionId,
+					isWorker: this.isWorkerChatSession(this.sessionId),
 					busy: this.busy,
 					items: this.items,
 				});
@@ -4443,6 +4558,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			// Session tabs retired under Router+Worker — Workers rail owns navigation.
 			tabs: [],
 			isRouter: !!this.routerSessionId && this.sessionId === this.routerSessionId,
+			isWorker: this.isWorkerChatSession(this.sessionId),
 			dispatchTarget: this.buildDispatchTargetState(),
 			attachments: this.attachments.map(a => ({ id: a.id, name: a.name, title: a.detail ?? a.fsPath })),
 			queue: this.queue.map(item => ({ id: item.id, text: item.text })),
@@ -4466,6 +4582,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			insertText: extra?.insertText,
 			openPlus: extra?.openPlus ?? false,
 			focusInput: extra?.focusInput ?? false,
+			scene: this.view ? this.buildSceneState(this.view.webview) : undefined,
 		});
 	}
 
@@ -4499,6 +4616,435 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
+	private applyWebviewOptions(): void {
+		const webview = this.view?.webview;
+		if (!webview) {
+			return;
+		}
+		const roots = [
+			vscode.Uri.joinPath(this.extensionUri, 'media'),
+			vscode.Uri.file(getAttachmentDir()),
+			vscode.Uri.file(this.wallpaperDir),
+		];
+		const seen = new Set(roots.map(uri => uri.fsPath));
+		for (const file of this.scenePersisted.files) {
+			const dir = path.dirname(file.path);
+			if (!dir || seen.has(dir) || !fs.existsSync(file.path)) {
+				continue;
+			}
+			seen.add(dir);
+			roots.push(vscode.Uri.file(dir));
+		}
+		webview.options = {
+			enableScripts: true,
+			localResourceRoots: roots,
+		};
+	}
+
+	private async saveChatScene(): Promise<void> {
+		await this.globalState.update(CHAT_SCENE_STATE_KEY, this.scenePersisted);
+	}
+
+	private async setChatScene(id: string): Promise<void> {
+		if (!selectionIsKnown(this.scenePersisted, id)) {
+			return;
+		}
+		if (id.startsWith('file:')) {
+			const file = this.scenePersisted.files.find(item => item.id === id);
+			if (!file || !fs.existsSync(file.path)) {
+				return;
+			}
+		}
+		this.scenePersisted = { ...this.scenePersisted, selectedId: id };
+		await this.saveChatScene();
+		this.pushState();
+	}
+
+	private async pickChatSceneFile(): Promise<void> {
+		const picked = await vscode.window.showOpenDialog({
+			canSelectFiles: true,
+			canSelectFolders: false,
+			canSelectMany: false,
+			openLabel: '用作背景',
+			title: '选择本地聊天背景',
+			filters: {
+				Images: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'avif', 'bmp'],
+			},
+		});
+		const fsPath = picked?.[0]?.fsPath;
+		if (!fsPath || !isSceneImagePath(fsPath)) {
+			return;
+		}
+		this.scenePersisted = rememberSceneFile(this.scenePersisted, fsPath);
+		await this.saveChatScene();
+		this.applyWebviewOptions();
+		this.pushState();
+	}
+
+	private async removeChatSceneFile(id: string): Promise<void> {
+		if (!id.startsWith('file:')) {
+			return;
+		}
+		const files = this.scenePersisted.files.filter(file => file.id !== id);
+		const selectedId = this.scenePersisted.selectedId === id
+			? DEFAULT_CHAT_SCENE_ID
+			: this.scenePersisted.selectedId;
+		this.scenePersisted = { selectedId, files, unsplash: this.scenePersisted.unsplash };
+		await this.saveChatScene();
+		this.applyWebviewOptions();
+		this.pushState();
+	}
+
+	private unsplashAccessKey(): string {
+		return this.unsplashKeyCandidates()[0] || '';
+	}
+
+	// Settings key first, then the local key file. A stale settings key no longer
+	// blocks browsing: loadUnsplashBrowse falls back to the next candidate on 401.
+	private unsplashKeyCandidates(): string[] {
+		const keys: string[] = [];
+		const fromSettings = (vscode.workspace.getConfiguration('zcode').get<string>('unsplashAccessKey') || '').trim();
+		if (fromSettings) {
+			keys.push(fromSettings);
+		}
+		// Local file so the key stays out of git.
+		try {
+			const fileKey = fs.readFileSync(path.join(this.extensionUri.fsPath, '.unsplash-access-key'), 'utf8').trim();
+			if (fileKey && !keys.includes(fileKey)) {
+				keys.push(fileKey);
+			}
+		} catch {
+			// No key file; settings only.
+		}
+		if (this.unsplashWorkingKey) {
+			return [this.unsplashWorkingKey, ...keys.filter(candidate => candidate !== this.unsplashWorkingKey)];
+		}
+		return keys;
+	}
+
+	private postUnsplash(body: {
+		topic: string;
+		page: number;
+		append: boolean;
+		hasMore: boolean;
+		needsKey: boolean;
+		error: string;
+		topics: UnsplashTopic[];
+		photos: PersistedChatScene['unsplash'];
+	}): void {
+		void this.view?.webview.postMessage({ type: 'unsplashBrowse', ...body });
+	}
+
+	private async loadUnsplashBrowse(topic: string, page: number): Promise<void> {
+		const seq = ++this.unsplashLoadSeq;
+		const slug = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(topic) ? topic : 'wallpapers';
+		const safePage = Math.max(1, Math.min(Math.floor(page) || 1, 40));
+		const keyCandidates = this.unsplashKeyCandidates();
+		if (!keyCandidates.length) {
+			this.postUnsplash({
+				topic: slug,
+				page: 1,
+				append: false,
+				hasMore: false,
+				needsKey: true,
+				error: '',
+				topics: [],
+				photos: [],
+			});
+			return;
+		}
+		let result: Awaited<ReturnType<typeof fetchUnsplashBrowse>> | undefined;
+		let failure: Error | undefined;
+		for (const key of keyCandidates) {
+			try {
+				result = await fetchUnsplashBrowse(key, slug, safePage, this.unsplashTopics);
+				this.unsplashWorkingKey = key;
+				break;
+			} catch (err) {
+				failure = err instanceof Error && err.message ? err : new Error('拉不到 Unsplash 目录');
+				if (!(failure instanceof UnsplashKeyRejectedError)) {
+					break;
+				}
+				// 401: this key was rejected, try the next candidate (e.g. a stale settings key).
+			}
+		}
+		if (seq !== this.unsplashLoadSeq) {
+			return;
+		}
+		if (!result) {
+			const message = failure?.message || '拉不到 Unsplash 目录';
+			this.postUnsplash({
+				topic: slug,
+				page: safePage > 1 ? safePage - 1 : 1,
+				append: safePage > 1,
+				hasMore: safePage > 1,
+				needsKey: false,
+				error: message,
+				topics: this.unsplashTopics || [],
+				photos: [],
+			});
+			return;
+		}
+		if (result.topics.length) {
+			this.unsplashTopics = result.topics;
+		}
+		this.postUnsplash({
+			topic: result.topic,
+			page: result.page,
+			append: safePage > 1,
+			hasMore: result.hasMore,
+			needsKey: false,
+			error: '',
+			topics: result.topics,
+			photos: result.photos,
+		});
+	}
+
+	private async promptUnsplashAccessKey(): Promise<void> {
+		const entered = await vscode.window.showInputBox({
+			title: 'Unsplash Access Key',
+			prompt: '在 unsplash.com/developers 创建应用，把 Access Key 贴到这里',
+			placeHolder: 'Access Key',
+			password: true,
+			ignoreFocusOut: true,
+		});
+		const key = entered?.trim();
+		if (!key) {
+			return;
+		}
+		await vscode.workspace.getConfiguration('zcode').update('unsplashAccessKey', key, vscode.ConfigurationTarget.Global);
+		this.unsplashTopics = null;
+		this.unsplashWorkingKey = '';
+		await this.loadUnsplashBrowse('wallpapers', 1);
+	}
+
+	private async useUnsplashPhoto(raw: unknown): Promise<void> {
+		const pick = parseSavedUnsplash(raw);
+		if (!pick) {
+			return;
+		}
+		const before = this.scenePersisted.unsplash;
+		this.scenePersisted = rememberUnsplashPick(this.scenePersisted, pick);
+		this.pruneWallpaperCache(before, this.scenePersisted.unsplash);
+		await this.saveChatScene();
+		this.pushState();
+		const key = this.unsplashAccessKey();
+		if (key) {
+			void trackUnsplashDownload(key, pick.id.slice('unsplash:'.length));
+		}
+		// Keep a local copy so the pick survives offline and loads instantly.
+		void this.cacheUnsplashWallpaper(this.scenePersisted.unsplash[0] ?? pick);
+	}
+
+	/** Delete cached files of picks that fell out of the remembered list. */
+	private pruneWallpaperCache(before: PersistedChatScene['unsplash'], after: PersistedChatScene['unsplash']): void {
+		const kept = new Set(after.map(item => item.id));
+		for (const old of before) {
+			if (!kept.has(old.id) && old.localPath) {
+				fs.unlink(old.localPath, () => undefined);
+			}
+		}
+	}
+
+	/** Download the full-resolution photo into global storage and pin it to the pick. */
+	private async cacheUnsplashWallpaper(pick: SavedUnsplashScene | undefined): Promise<void> {
+		if (!pick || this.wallpaperDownloads.has(pick.id)) {
+			return;
+		}
+		if (pick.localPath && fs.existsSync(pick.localPath)) {
+			return;
+		}
+		const photoId = pick.id.slice('unsplash:'.length);
+		if (!/^[A-Za-z0-9_-]{1,80}$/.test(photoId)) {
+			return;
+		}
+		this.wallpaperDownloads.add(pick.id);
+		try {
+			await fs.promises.mkdir(this.wallpaperDir, { recursive: true });
+			const target = path.join(this.wallpaperDir, `${photoId}.jpg`);
+			// The image CDN is separate from the rate-limited API.
+			const response = await fetch(pick.image, { signal: AbortSignal.timeout(120000) });
+			const type = response.headers.get('content-type') || '';
+			if (!response.ok || !type.startsWith('image/')) {
+				return;
+			}
+			const bytes = Buffer.from(await response.arrayBuffer());
+			if (!bytes.length) {
+				return;
+			}
+			await fs.promises.writeFile(target, bytes);
+			const current = this.scenePersisted.unsplash.find(item => item.id === pick.id);
+			if (!current) {
+				fs.unlink(target, () => undefined);
+				return;
+			}
+			this.scenePersisted = {
+				...this.scenePersisted,
+				unsplash: this.scenePersisted.unsplash.map(item => item.id === pick.id ? { ...item, localPath: target } : item),
+			};
+			await this.saveChatScene();
+			this.applyWebviewOptions();
+			this.pushState();
+		} catch {
+			// The hotlinked copy still works without a local cache.
+		} finally {
+			this.wallpaperDownloads.delete(pick.id);
+		}
+	}
+
+	private async removeUnsplashScene(id: string): Promise<void> {
+		const existing = this.scenePersisted.unsplash.find(item => item.id === id);
+		if (!existing) {
+			return;
+		}
+		const unsplash = this.scenePersisted.unsplash.filter(item => item.id !== id);
+		const selectedId = this.scenePersisted.selectedId === id
+			? DEFAULT_CHAT_SCENE_ID
+			: this.scenePersisted.selectedId;
+		this.scenePersisted = { ...this.scenePersisted, selectedId, unsplash };
+		await this.saveChatScene();
+		if (existing.localPath) {
+			fs.unlink(existing.localPath, () => undefined);
+		}
+		this.pushState();
+	}
+
+	private async openUnsplashLink(value: string): Promise<void> {
+		let url: URL;
+		try {
+			url = new URL(value);
+		} catch {
+			return;
+		}
+		if (url.protocol !== 'https:' || url.hostname !== 'unsplash.com') {
+			return;
+		}
+		await vscode.env.openExternal(vscode.Uri.parse(url.toString()));
+	}
+
+	private buildSceneState(webview: vscode.Webview): {
+		selectedId: string;
+		image: string;
+		position: string;
+		choices: Array<{ id: string; label: string; group: 'local' | 'unsplash'; thumb: string }>;
+		used: Array<{ id: string; label: string; author: string; authorUrl: string; thumb: string }>;
+	} {
+		const files = this.scenePersisted.files.filter(file => fs.existsSync(file.path));
+		let selectedId = this.scenePersisted.selectedId;
+		if (!selectionIsKnown({ ...this.scenePersisted, files }, selectedId)) {
+			selectedId = DEFAULT_CHAT_SCENE_ID;
+		}
+		if (selectedId.startsWith('file:') && !files.some(file => file.id === selectedId)) {
+			selectedId = DEFAULT_CHAT_SCENE_ID;
+		}
+		const choices: Array<{ id: string; label: string; group: 'local' | 'unsplash'; thumb: string }> = [];
+		for (const scene of BUNDLED_CHAT_SCENES) {
+			if (!scene.file) {
+				continue;
+			}
+			const thumb = this.mediaUri(webview, 'media', scene.file).toString();
+			choices.push({ id: scene.id, label: scene.label, group: 'local', thumb });
+		}
+		for (const file of files) {
+			choices.push({
+				id: file.id,
+				label: file.name,
+				group: 'local',
+				thumb: webview.asWebviewUri(vscode.Uri.file(file.path)).toString(),
+			});
+		}
+		for (const scene of UNSPLASH_CHAT_SCENES) {
+			if (!scene.photo) {
+				continue;
+			}
+			choices.push({
+				id: scene.id,
+				label: scene.label,
+				group: 'unsplash',
+				thumb: unsplashImageUrl(scene.photo, 640, 75),
+			});
+		}
+		// "Recently used" row: picked photos stay one click away for switching back.
+		const used: Array<{ id: string; label: string; author: string; authorUrl: string; thumb: string }> = [];
+		for (const pick of this.scenePersisted.unsplash) {
+			if (UNSPLASH_CHAT_SCENES.some(scene => scene.id === pick.id)) {
+				continue; // Static catalog entry; already shown in the Unsplash grid.
+			}
+			const local = pick.localPath && fs.existsSync(pick.localPath)
+				? webview.asWebviewUri(vscode.Uri.file(pick.localPath)).toString()
+				: '';
+			used.push({
+				id: pick.id,
+				label: pick.label,
+				author: pick.author,
+				authorUrl: pick.authorUrl,
+				thumb: local || pick.thumb,
+			});
+		}
+		// Backfill the active photo so the current background also works offline.
+		const activePick = this.scenePersisted.unsplash.find(item => item.id === selectedId);
+		if (activePick) {
+			void this.cacheUnsplashWallpaper(activePick);
+		}
+		const resolved = this.resolveSceneImage(webview, selectedId, files);
+		return {
+			selectedId,
+			image: resolved.image,
+			position: resolved.position,
+			choices,
+			used,
+		};
+	}
+
+	private resolveSceneImage(
+		webview: vscode.Webview,
+		selectedId: string,
+		files: PersistedChatScene['files'],
+	): { image: string; position: string } {
+		if (selectedId === CHAT_SCENE_NONE) {
+			return { image: '', position: 'center center' };
+		}
+		const pick = this.scenePersisted.unsplash.find(item => item.id === selectedId);
+		if (pick?.localPath && fs.existsSync(pick.localPath)) {
+			// Cached download loads instantly and survives offline.
+			return {
+				image: webview.asWebviewUri(vscode.Uri.file(pick.localPath)).toString(),
+				position: 'center center',
+			};
+		}
+		const catalog = findCatalogScene(selectedId);
+		if (catalog?.file) {
+			return {
+				image: this.mediaUri(webview, 'media', catalog.file).toString(),
+				position: catalog.position || 'center center',
+			};
+		}
+		if (catalog?.photo) {
+			return {
+				image: unsplashImageUrl(catalog.photo),
+				position: 'center center',
+			};
+		}
+		if (pick) {
+			return { image: pick.image, position: 'center center' };
+		}
+		const file = files.find(item => item.id === selectedId);
+		if (file && fs.existsSync(file.path)) {
+			return {
+				image: webview.asWebviewUri(vscode.Uri.file(file.path)).toString(),
+				position: 'center center',
+			};
+		}
+		return {
+			image: this.mediaUri(webview, 'media', 'pastoral-scene.jpg').toString(),
+			position: 'center 38%',
+		};
+	}
+
+	private escapeAttr(value: string): string {
+		return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+	}
+
 	/** Bust webview HTTP cache so CSS/JS edits show after Reload Window. */
 	private mediaUri(webview: vscode.Webview, ...pathSegments: string[]): vscode.Uri {
 		const file = vscode.Uri.joinPath(this.extensionUri, ...pathSegments);
@@ -4513,6 +5059,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private renderHtml(webview: vscode.Webview): string {
 		const styleUri = this.mediaUri(webview, 'media', 'chatView.css');
+		const resolvedScene = this.resolveSceneImage(
+			webview,
+			this.scenePersisted.selectedId,
+			this.scenePersisted.files.filter(file => fs.existsSync(file.path)),
+		);
+		const sceneUri = this.escapeAttr(resolvedScene.image || 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7');
 		const highlightStyleUri = this.mediaUri(webview, 'media', 'highlight-vscode.css');
 		const markdownItUri = this.mediaUri(webview, 'media', 'markdown-it.min.js');
 		const highlightUri = this.mediaUri(webview, 'media', 'highlight.min.js');
@@ -4526,7 +5078,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			`default-src 'none'`,
 			`style-src ${webview.cspSource}`,
 			`script-src ${webview.cspSource}`,
-			`img-src ${webview.cspSource} data:`,
+			`img-src ${webview.cspSource} data: https://images.unsplash.com`,
 		].join('; ');
 
 		return `<!DOCTYPE html>
@@ -4541,6 +5093,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	<link rel="stylesheet" href="${highlightStyleUri}" />
 </head>
 <body class="zcode-compact">
+	<div class="page-scene" aria-hidden="true">
+		<img class="scene-art" alt="" src="${sceneUri}" />
+	</div>
 	<div class="history-drawer" id="historyDrawer" hidden>
 		<div class="history-header">
 			<div class="history-header-text">
@@ -4600,12 +5155,15 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		<button type="button" class="monaco-text-button" id="claimBtn">领取</button>
 	</div>
 	<div class="chat-input-container" id="composer">
+		<div class="menu scene-menu" id="sceneMenu" role="listbox" aria-label="聊天背景"></div>
 		<div class="menu" id="plusMenu" role="menu"></div>
 		<div class="menu" id="pickerMenu" role="listbox"></div>
 		<textarea id="input" rows="2" placeholder="Plan, @ for context, / for commands, $ for skills"></textarea>
 		<div class="chat-input-toolbars" id="composerToolbar">
 			<div class="toolbar-left">
 				<button class="icon-btn" id="plus" type="button" title="Add" aria-label="Add">+</button>
+				<button class="pill" id="sceneBtn" type="button" title="选择聊天背景" aria-label="聊天背景" aria-expanded="false" aria-haspopup="listbox"><span class="label">背景</span></button>
+				<button class="pill" id="brainBtn" type="button" title="ZCode / Cursor" aria-label="ZCode / Cursor" aria-expanded="false" aria-haspopup="listbox"><span class="label" id="brainLabel">ZCode</span><span class="chev">▾</span></button>
 				<span id="zcodePills" data-brain-chrome="zcode">
 					<button class="pill" id="providerBtn" type="button" title="Provider"><span class="label" id="providerLabel">Start Plan</span><span class="chev">▾</span></button>
 					<button class="pill" id="modelBtn" type="button" title="Model"><span class="label" id="modelLabel">Model</span><span class="chev">▾</span></button>
@@ -4640,13 +5198,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			</div>
 		</div>
 	</div>
-	<div class="brain-bar">
-		<div class="brain-switch" id="brainSwitch" role="tablist" aria-label="AI brain">
-			<button type="button" class="brain-tab" data-brain="zcode" id="brainZcode">ZCode</button>
-			<button type="button" class="brain-tab" data-brain="cursor" id="brainCursor">Cursor</button>
-		</div>
-		<div class="hint" id="hint"></div>
-	</div>
 	<div class="schedule-tip" id="scheduleTip" hidden role="status"></div>
 	<script src="${markdownItUri}"></script>
 	<script src="${highlightUri}"></script>
@@ -4663,7 +5214,7 @@ export function registerChatPanel(
 	ideChat: IdeChatStore,
 	fileEdits: FileEditSession = getFileEditSession(),
 ): ZCodeChatViewProvider {
-	const provider = new ZCodeChatViewProvider(context.extensionUri, ideChat, fileEdits, context.globalState);
+	const provider = new ZCodeChatViewProvider(context.extensionUri, ideChat, fileEdits, context.globalState, context.globalStorageUri);
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider(ZCodeChatViewProvider.viewType, provider, {
 			webviewOptions: { retainContextWhenHidden: true },
