@@ -4559,28 +4559,6 @@ let lastMascotSig = '';
 			squadLabel.className = 'mascot-section-label';
 			squadLabel.textContent = '当前小队（大小和人设按角色记）';
 			menu.appendChild(squadLabel);
-			const ttsNow = window.ZCodeMascotTts ? window.ZCodeMascotTts.state : null;
-			if (ttsNow && ttsNow.supported) {
-				const ttsBtn = document.createElement('button');
-				ttsBtn.type = 'button';
-				ttsBtn.className = 'mascot-tts-toggle';
-				if (ttsNow.enabled) { ttsBtn.classList.add('is-on'); }
-				ttsBtn.textContent = ttsNow.enabled ? '语音：开' : '语音：关';
-				ttsBtn.title = '本地语音朗读台词（Qwen3-TTS 克隆音色 / macOS 系统语音；配置 zcode.mascot.tts.*）';
-				ttsBtn.onclick = () => {
-					vscode.postMessage({ type: 'mascotTtsConfig', patch: { enabled: !ttsNow.enabled } });
-				};
-				menu.appendChild(ttsBtn);
-				if (ttsNow.enabled) {
-					const cacheBtn = document.createElement('button');
-					cacheBtn.type = 'button';
-					cacheBtn.className = 'mascot-tts-toggle';
-					cacheBtn.textContent = '语音缓存';
-					cacheBtn.title = '管理已合成的语音缓存（试听 / 删除 / 清空）';
-					cacheBtn.onclick = () => { openMascotTtsCachePanel(); };
-					menu.appendChild(cacheBtn);
-				}
-			}
 			const personaList = Array.isArray(mascot.personas) ? mascot.personas : [];
 			squadSlots.forEach((slot) => {
 				const entry = catById.get(slot.id) || { id: slot.id, label: slot.label || slot.id };
@@ -4701,31 +4679,6 @@ let lastMascotSig = '';
 					hint.className = 'mascot-squad-hint';
 					hint.textContent = currentHint;
 					row.appendChild(hint);
-					const ttsSlot = window.ZCodeMascotTts ? window.ZCodeMascotTts.state : null;
-					if (ttsSlot && ttsSlot.supported) {
-						const voiceRow = document.createElement('label');
-						voiceRow.className = 'mascot-squad-persona mascot-squad-voice';
-						if (!ttsSlot.enabled) { voiceRow.style.display = 'none'; }
-						const voiceTag = document.createElement('span');
-						voiceTag.textContent = '语音';
-						const voiceSel = document.createElement('select');
-						voiceSel.className = 'mascot-tts-voice';
-						voiceSel.setAttribute('data-id', slot.id);
-						voiceSel.title = '这个角色朗读时用哪个语音';
-						window.buildMascotVoiceOptions(voiceSel, ttsSlot, slot.id);
-						voiceSel.value = ttsSlot.voiceMap[slot.id] || '';
-						voiceSel.onchange = () => {
-							if (voiceSel.value === '__add_voice__') {
-								voiceSel.value = ttsSlot.voiceMap[slot.id] || '';
-								vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'addVoice' } });
-								return;
-							}
-							vscode.postMessage({ type: 'mascotTtsConfig', patch: { voice: { id: slot.id, voice: voiceSel.value || null } } });
-						};
-						voiceRow.appendChild(voiceTag);
-						voiceRow.appendChild(voiceSel);
-						row.appendChild(voiceRow);
-					}
 				}
 				menu.appendChild(row);
 			});
@@ -5125,146 +5078,6 @@ let lastMascotSig = '';
 			window.ZCodeMascots.apply(chatMascot);
 			// Speech, drag-to-place, and right-click-reset report back through these hooks.
 			window.ZCodeMascots.onSpeak = (voice) => vscode.postMessage({ type: 'mascotSpeak', voice });
-if (window.ZCodeMascotTts) {
-	window.ZCodeMascotTts._send = (msg) => vscode.postMessage(msg);
-	vscode.postMessage({ type: 'mascotTtsConfig' });
-}
-window.ZCodeMascots.onTtsState = () => {
-	if (typeof window.syncMascotTtsUI === 'function') { window.syncMascotTtsUI(); }
-};
-/** 角色语音下拉的选项构造：自动 / 角色原声 / 音色池（克隆）/ 添加音色文件。 */
-window.buildMascotVoiceOptions = (sel, tts, id) => {
-	sel.textContent = '';
-	const auto = document.createElement('option');
-	auto.value = '';
-	auto.textContent = '自动';
-	sel.appendChild(auto);
-	const native = (tts.nativeVoices && tts.nativeVoices[id]) || [];
-	if (native.length) {
-		const nativeGroup = document.createElement('optgroup');
-		nativeGroup.label = '角色原声';
-		native.forEach((voice) => {
-			const opt = document.createElement('option');
-			opt.value = voice.value;
-			opt.textContent = voice.name;
-			nativeGroup.appendChild(opt);
-		});
-		sel.appendChild(nativeGroup);
-	}
-	const poolGroup = document.createElement('optgroup');
-	poolGroup.label = '音色池（克隆）';
-	(tts.voices || []).forEach((voice) => {
-		const opt = document.createElement('option');
-		opt.value = voice.value || voice.name;
-		opt.textContent = `${voice.name}（${voice.locale}）`;
-		poolGroup.appendChild(opt);
-	});
-	sel.appendChild(poolGroup);
-	const addOpt = document.createElement('option');
-	addOpt.value = '__add_voice__';
-	addOpt.textContent = '＋ 添加音色文件…';
-	sel.appendChild(addOpt);
-};
-
-/** 语音缓存管理浮层：试听 / 单删 / 清空（磁盘缓存，跨重启保留）。 */
-let ttsCachePanel = null;
-function openMascotTtsCachePanel() {
-	closeMascotTtsCachePanel();
-	const panel = document.createElement('div');
-	panel.className = 'mascot-tts-cache-panel';
-	const head = document.createElement('div');
-	head.className = 'mascot-tts-cache-head';
-	const title = document.createElement('span');
-	title.textContent = '语音缓存';
-	const clear = document.createElement('button');
-	clear.type = 'button';
-	clear.className = 'danger';
-	clear.textContent = '清空全部';
-	clear.onclick = () => vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cacheClear' } });
-	const close = document.createElement('button');
-	close.type = 'button';
-	close.textContent = '✕';
-	close.onclick = () => closeMascotTtsCachePanel();
-	head.appendChild(title);
-	head.appendChild(clear);
-	head.appendChild(close);
-	const list = document.createElement('div');
-	list.className = 'mascot-tts-cache-list';
-	list.textContent = '读取中…';
-	const hint = document.createElement('div');
-	hint.className = 'mascot-tts-cache-hint';
-	panel.appendChild(head);
-	panel.appendChild(list);
-	panel.appendChild(hint);
-	document.body.appendChild(panel);
-	ttsCachePanel = panel;
-	vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cacheList' } });
-}
-function closeMascotTtsCachePanel() {
-	if (ttsCachePanel) { ttsCachePanel.remove(); ttsCachePanel = null; }
-}
-function applyMascotTtsCache(msg) {
-	if (!ttsCachePanel) { return; }
-	const list = ttsCachePanel.querySelector('.mascot-tts-cache-list');
-	const hint = ttsCachePanel.querySelector('.mascot-tts-cache-hint');
-	if (!list) { return; }
-	list.textContent = '';
-	const entries = Array.isArray(msg.entries) ? msg.entries : [];
-	if (hint) {
-		hint.textContent = entries.length
-			? `${entries.length} 条 · ${msg.dir || ''}`
-			: `暂无缓存 · ${msg.dir || ''}`;
-	}
-	if (!entries.length) {
-		list.textContent = '暂无缓存——角色开口说话后会自动存档在这里。';
-		return;
-	}
-	entries.forEach((entry) => {
-		const row = document.createElement('div');
-		row.className = 'mascot-tts-cache-row';
-		const text = document.createElement('span');
-		text.className = 'mascot-tts-cache-text';
-		text.textContent = entry.text;
-		text.title = `${entry.voice || entry.refPath || ''} · ${entry.seconds || 0}s · ${Math.max(1, Math.round((entry.bytes || 0) / 1024))}KB`;
-		const play = document.createElement('button');
-		play.type = 'button';
-		play.textContent = '▶';
-		play.title = '试听';
-		play.onclick = () => vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cachePlay', key: entry.key } });
-		const del = document.createElement('button');
-		del.type = 'button';
-		del.textContent = '✕';
-		del.title = '删除这条';
-		del.onclick = () => vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cacheDelete', key: entry.key } });
-		row.appendChild(text);
-		row.appendChild(play);
-		row.appendChild(del);
-		list.appendChild(row);
-	});
-}
-
-/** 语音开关和每个角色的语音下拉，随 mascotTtsState 到达而刷新。 */
-window.syncMascotTtsUI = () => {
-	const tts = window.ZCodeMascotTts ? window.ZCodeMascotTts.state : null;
-	if (!tts) { return; }
-	document.querySelectorAll('.mascot-tts-toggle').forEach((btn) => {
-		btn.textContent = tts.enabled ? '语音：开' : '语音：关';
-		btn.classList.toggle('is-on', tts.enabled);
-	});
-	document.querySelectorAll('select.mascot-tts-voice').forEach((sel) => {
-		const id = sel.getAttribute('data-id') || '';
-		const current = tts.voiceMap[id] || '';
-		const native = (tts.nativeVoices && tts.nativeVoices[id]) || [];
-		if (sel.getAttribute('data-count') !== String(tts.voices.length + native.length + 1)) {
-			sel.setAttribute('data-count', String(tts.voices.length + native.length + 1));
-			window.buildMascotVoiceOptions(sel, tts, id);
-		}
-		sel.value = current;
-		if (sel.value !== current) { sel.value = ''; }
-		const row = sel.closest('.mascot-squad-voice');
-		if (row) { row.style.display = tts.enabled ? '' : 'none'; }
-	});
-};
 			window.ZCodeMascots.onMove = (move) => vscode.postMessage({ type: 'setMascot', patch: { move } });
 			window.ZCodeMascots.onReset = (id) => vscode.postMessage({ type: 'setMascot', patch: { resetPos: id } });
 			window.ZCodeMascots.onSize = (id, sizePx) => vscode.postMessage({ type: 'setMascot', patch: { setSize: { id, sizePx } } });
@@ -5896,23 +5709,6 @@ window.syncMascotTtsUI = () => {
 		if (!data) return;
 		if (data.type === 'mascotLine' && window.ZCodeMascots && typeof window.ZCodeMascots.hear === 'function') {
 			window.ZCodeMascots.hear(data.seq, data.line, !!data.skipped);
-		}
-		if (data.type === 'mascotTtsState' && window.ZCodeMascotTts) {
-			window.ZCodeMascotTts.onState(data);
-		}
-		if (data.type === 'mascotTtsAudio' && window.ZCodeMascotTts) {
-			window.ZCodeMascotTts.onAudio(data);
-		}
-		if (data.type === 'mascotTtsCacheState') {
-			applyMascotTtsCache(data);
-		}
-		if (data.type === 'mascotTtsCacheAudio' && data.base64) {
-			try {
-				const audio = new Audio('data:' + (data.mime || 'audio/wav') + ';base64,' + data.base64);
-				audio.volume = 0.9;
-				const played = audio.play();
-				if (played && played.catch) { played.catch(() => undefined); }
-			} catch (err) { /* 试听失败忽略 */ }
 		}
 		if (data.type === 'state') {
 			render(data);

@@ -55,16 +55,12 @@ import {
 	MASCOT_CATALOG,
 	deleteMascotModel,
 	downloadMascotModel,
-	ensureMascotModelAudio,
 	findMascotCatalog,
 	isMascotModelComplete,
-	listMascotAudioFiles,
 	mascotModel3Path,
-	mascotModelDir,
 	mascotPreviewFile,
 	mascotsDir,
 	migrateLegacyMascotModels,
-	pickMascotNativeAudio,
 	readPersistedChatMascot,
 	type ChatMascotSize,
 	type PersistedChatMascot,
@@ -74,7 +70,6 @@ import {
 	MASCOT_SIZE_STEP,
 } from './mascotCatalog';
 import { MASCOT_PERSONAS, resolveMascotPersonaId, isMascotPersonaId } from './mascotPersona';
-import { MascotTts } from './mascotTts';
 import { fetchUnsplashBrowse, trackUnsplashDownload, UnsplashKeyRejectedError, type UnsplashTopic } from './unsplashCatalog';
 import {
 	dispatchStatusLabel,
@@ -441,7 +436,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private scheduleTipTimer?: ReturnType<typeof setInterval>;
 	private readonly mascotVoice: MascotVoice;
-	private readonly mascotTts: MascotTts;
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -461,7 +455,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.scenePersisted = readPersistedChatScene(this.globalState.get(CHAT_SCENE_STATE_KEY));
 		this.mascotPersisted = readPersistedChatMascot(this.globalState.get(CHAT_MASCOT_STATE_KEY));
 		this.mascotVoice = new MascotVoice(globalState);
-		this.mascotTts = new MascotTts(globalState, extensionUri);
 		this.bootstrapDone = new Promise<void>(resolve => {
 			this.resolveBootstrapDone = resolve;
 		});
@@ -2091,14 +2084,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'mascotSpeak' && msg.voice && typeof msg.voice === 'object') {
 			await this.replyMascotLine(msg.voice as Record<string, unknown>);
-			return;
-		}
-		if (msg.type === 'mascotTtsConfig') {
-			await this.handleMascotTts(msg as Record<string, unknown>);
-			return;
-		}
-		if (msg.type === 'mascotTtsSpeak') {
-			await this.speakMascotTts(msg as Record<string, unknown>);
 			return;
 		}
 		if (msg.type === 'downloadMascot' && typeof msg.id === 'string') {
@@ -5201,120 +5186,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		};
 	}
 
-	/** Mascot spoken-audio settings + state broadcast (语音朗读). */
-	private async handleMascotTts(msg: Record<string, unknown>): Promise<void> {
-		const patch = msg.patch && typeof msg.patch === 'object' ? msg.patch as Record<string, unknown> : {};
-		const action = typeof patch.action === 'string' ? patch.action : '';
-		if (action === 'addVoice') {
-			// 选了「＋ 添加音色文件…」：弹系统文件框，拷进 refs 目录即成新音色。
-			await this.mascotTts.addVoiceFile();
-		} else if (action === 'cacheList' || action === 'cacheDelete' || action === 'cacheClear') {
-			if (action === 'cacheDelete' && typeof patch.key === 'string') {
-				await this.mascotTts.cacheDelete(patch.key);
-			} else if (action === 'cacheClear') {
-				await this.mascotTts.cacheClear();
-			}
-			await this.view?.webview.postMessage({ type: 'mascotTtsCacheState', ...(await this.mascotTts.cacheList()) });
-			return;
-		} else if (action === 'cachePlay') {
-			const key = typeof patch.key === 'string' ? patch.key : '';
-			const audio = key ? await this.mascotTts.cacheAudio(key) : undefined;
-			await this.view?.webview.postMessage({ type: 'mascotTtsCacheAudio', key, mime: audio?.mime, base64: audio?.base64 });
-			return;
-		}
-		if (typeof patch.enabled === 'boolean') {
-			await this.mascotTts.setEnabled(patch.enabled);
-		}
-		const voice = patch.voice;
-		if (voice && typeof voice === 'object') {
-			const row = voice as Record<string, unknown>;
-			await this.mascotTts.setVoice(
-				typeof row.id === 'string' ? row.id : '',
-				typeof row.voice === 'string' && row.voice ? row.voice : null,
-			);
-		}
-		const state = await this.mascotTts.describe({ nativeVoices: await this.mascotNativeVoices() });
-		await this.view?.webview.postMessage({ type: 'mascotTtsState', ...state });
-	}
-
-	/**
-	 * Native-voice options per squad character: bundles the model's own voice
-	 * clips as clone sources. First call per model also fetches the clips
-	 * (角色原声补拉, one-time, marker-guarded) — only while TTS is enabled.
-	 */
-	private async mascotNativeVoices(): Promise<Record<string, Array<{ name: string; value: string }>>> {
-		const nativeVoices: Record<string, Array<{ name: string; value: string }>> = {};
-		if (!this.mascotTts.isEnabled()) {
-			return nativeVoices;
-		}
-		for (const id of this.mascotPersisted.slots) {
-			if (!id || nativeVoices[id] || !isMascotModelComplete(this.mascotStoreUri, id)) {
-				continue;
-			}
-			try {
-				await ensureMascotModelAudio(this.mascotStoreUri, id);
-				const files = listMascotAudioFiles(this.mascotStoreUri, id);
-				if (files.length) {
-					nativeVoices[id] = files.map(file => ({
-						name: `原声 · ${path.basename(file.rel).replace(/\.[^.]+$/, '')}`,
-						value: `native:${file.rel}`,
-					}));
-				}
-			} catch (error) {
-				console.warn('[mascot] native audio for', id, error instanceof Error ? error.message : error);
-			}
-		}
-		return nativeVoices;
-	}
-
-	/** Resolve the clone source for a character: explicit 原声 pick, else default. */
-	private mascotNativeRefPath(id: string): string | undefined {
-		if (!id) {
-			return undefined;
-		}
-		const override = this.mascotTts.voiceFor(id);
-		const modelDir = mascotModelDir(this.mascotStoreUri, id);
-		if (override && override.startsWith('native:')) {
-			const file = vscode.Uri.joinPath(modelDir, ...override.slice('native:'.length).split('/')).fsPath;
-			return fs.existsSync(file) ? file : undefined;
-		}
-		if (override) {
-			return undefined;
-		}
-		const pick = pickMascotNativeAudio(listMascotAudioFiles(this.mascotStoreUri, id));
-		return pick ? vscode.Uri.joinPath(modelDir, ...pick.rel.split('/')).fsPath : undefined;
-	}
-
-	private async speakMascotTts(msg: Record<string, unknown>): Promise<void> {
-		if (!this.mascotTts.isEnabled()) {
-			return;
-		}
-		const text = typeof msg.text === 'string' ? msg.text : '';
-		const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
-		if (!text || !requestId) {
-			return;
-		}
-		try {
-			const audio = await this.mascotTts.synthesize({
-				id: typeof msg.id === 'string' ? msg.id : '',
-				persona: typeof msg.persona === 'string' ? msg.persona : undefined,
-				text,
-				refAudioPath: this.mascotNativeRefPath(typeof msg.id === 'string' ? msg.id : ''),
-			});
-			await this.view?.webview.postMessage({
-				type: 'mascotTtsAudio',
-				requestId,
-				mood: typeof msg.mood === 'string' ? msg.mood : undefined,
-				mime: audio?.mime,
-				base64: audio?.base64,
-			});
-		} catch (error) {
-			console.warn('[mascot] tts failed:', error instanceof Error ? error.message : error);
-			// 空回包让 webview 立即结束这句，别等超时。
-			await this.view?.webview.postMessage({ type: 'mascotTtsAudio', requestId });
-		}
-	}
-
 	/** Last user line and the assistant's last reply, short enough to sit in a mascot prompt. */
 	private mascotChatGlimpse(): { user: string; assistant: string } {
 		let user = '';
@@ -5620,7 +5491,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			`script-src ${webview.cspSource} 'wasm-unsafe-eval'`,
 			`img-src ${webview.cspSource} data: https://images.unsplash.com`,
 			// 桌面精灵语音朗读：合成结果以 data:/blob: 音频在 webview 里播放。
-			`media-src ${webview.cspSource} data: blob:`,
 		].join('; ');
 
 		return `<!DOCTYPE html>

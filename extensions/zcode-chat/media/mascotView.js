@@ -458,13 +458,48 @@
 			patchSettingsResolveURL();
 			// autoInteract would also track the pointer, but only events that hit
 			// the canvas. The canvas is click-through; the slot proxy drives gaze.
-			entry = { model: null, load: window.PIXI.live2d.Live2DModel.from(url, { autoInteract: false, autoUpdate: false }).then(function (model) {
+			entry = { model: null, lastUsed: Date.now(), load: window.PIXI.live2d.Live2DModel.from(url, { autoInteract: false, autoUpdate: false }).then(function (model) {
 				entry.model = model;
 				return model;
 			}) };
+			// 加载失败：把坏条目从缓存里清掉，一来下次还能重试，
+			// 二来别让带着 rejected promise 的空壳常驻内存。
+			entry.load.catch(function () {
+				if (modelCache.get(url) === entry) { modelCache.delete(url); }
+			});
 			modelCache.set(url, entry);
 		}
+		entry.lastUsed = Date.now();
 		return entry.load;
+	}
+
+	/** 下台的模型留在缓存里让「切回来」瞬间完成，但不能无限囤：
+	 *  当前小队之外最多再留 MODEL_CACHE_MAX 个，超出的连纹理一起
+	 *  销毁——长期开着精灵换角色时，这里是内存持续上涨的主因。 */
+	var MODEL_CACHE_MAX = 3;
+	function pruneModelCache() {
+		if (modelCache.size <= MODEL_CACHE_MAX) { return; }
+		var inUse = {};
+		for (var i = 0; i < slots.length; i++) {
+			if (slots[i] && slots[i].url) { inUse[slots[i].url] = true; }
+		}
+		var spare = [];
+		modelCache.forEach(function (cached, url) {
+			// 还在加载中的（model 为空）先不动，等落地后的下一轮再收。
+			if (!inUse[url] && cached.model) {
+				spare.push({ url: url, entry: cached, at: cached.lastUsed || 0 });
+			}
+		});
+		spare.sort(function (a, b) { return a.at - b.at; });
+		for (var j = 0; j < spare.length - MODEL_CACHE_MAX; j++) {
+			var item = spare[j];
+			modelCache.delete(item.url);
+			var model = item.entry.model;
+			try {
+				if (app && model.parent === app.stage) { app.stage.removeChild(model); }
+				model.destroy();
+			} catch (e) { /* already gone */ }
+		}
 	}
 
 	/** Surfaces mascot failures on the page: a console.warn alone is invisible
@@ -827,6 +862,8 @@
 			}
 		}
 		scheduleLayout();
+		// 队形变化后顺手收一收缓存：下台模型最多留 3 份，其余销毁。
+		pruneModelCache();
 		return Promise.all(loads);
 	}
 
@@ -2311,7 +2348,6 @@
 		}
 		bubble.textContent = text;
 		placeBubble(bubble);
-		tryTts(slot, text);
 		bubble.classList.add('show');
 		window.clearTimeout(slot.bubble);
 		slot.bubble = window.setTimeout(function () {
@@ -2687,149 +2723,4 @@
 
 	window.ZCodeMascots = { apply: apply, status: status, react: react, hear: hear };
 
-	/* ---- 语音朗读（本地 TTS）：say() 冒出的每句话都可朗读 ---- */
-	var ttsSeq = 0;
-	var ttsPending = {};
-	var ttsQueue = {};
-	var ttsBusy = {};
-	var ttsUnlockArmed = false;
-	var ttsState = { enabled: false, supported: false, voices: [], voiceMap: {} };
-	var TTS_SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
-
-	function ttsCleanText(text) {
-		return String(text || '')
-			.replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{FE0F}\u{200D}]/gu, ' ')
-			.replace(/\s+/g, ' ')
-			.trim()
-			.slice(0, 80);
-	}
-
-	/** 台词情绪 → 播放端变速变调，语气跟表情走（true 变调即音高随速度走）。 */
-	var TTS_MOOD_RATE = { happy: 1.06, excited: 1.1, sleepy: 0.9, puzzled: 0.97, shy: 0.94, sad: 0.93, neutral: 1 };
-	function ttsMoodFor(text) {
-		var t = String(text || '');
-		if (/哈啊|好困|瞌睡|晚安|想睡|犯困|睡一/.test(t)) { return 'sleepy'; }
-		if (/谢谢|喜欢|搞定|收工|完成|开心|好耶|♪|💗|❤/.test(t)) { return 'happy'; }
-		if (/出击|冲鸭|加油|来吧|厉害|万岁|交给我|看我的|🎉|✨/.test(t)) { return 'excited'; }
-		if (/为什么|怎么办|咦|诶\?|欸\?|？|\?/.test(t)) { return 'puzzled'; }
-		if (/哼|讨厌|才不是|笨蛋|不许/.test(t)) { return 'shy'; }
-		if (/抱歉|对不起|失败|难过|呜|失误/.test(t)) { return 'sad'; }
-		return 'neutral';
-	}
-
-	function ttsSend(msg) {
-		var api = window.ZCodeMascotTts;
-		if (api && typeof api._send === 'function') { api._send(msg); }
-	}
-
-	/** 自动播放没解锁时，等用户在面板里的第一次点击，之后就能出声了。 */
-	function ttsArmUnlock() {
-		if (ttsUnlockArmed) { return; }
-		ttsUnlockArmed = true;
-		window.addEventListener('pointerdown', function () {
-			ttsUnlockArmed = false;
-			try {
-				var audio = new Audio(TTS_SILENT_WAV);
-				audio.volume = 0;
-				var played = audio.play();
-				if (played && played.catch) { played.catch(function () {}); }
-			} catch (err) { /* ignore */ }
-		}, { once: true });
-	}
-
-	function tryTts(slot, text) {
-		if (!ttsState.enabled || !ttsState.supported) { return; }
-		var line = ttsCleanText(text);
-		if (!line) { return; }
-		var id = (slot && slot.id) || '';
-		var queue = ttsQueue[id] || (ttsQueue[id] = []);
-		if (queue.length && queue[queue.length - 1].text === line) { return; }
-		if (queue.length >= 2) { queue.shift(); }
-		queue.push({ persona: (slot && slot.persona) || '', text: line });
-		ttsArmUnlock();
-		ttsPump(id);
-	}
-
-	function ttsPump(id) {
-		if (ttsBusy[id]) { return; }
-		var queue = ttsQueue[id];
-		if (!queue || !queue.length) { return; }
-		var item = queue.shift();
-		var rid = 'tts' + (++ttsSeq);
-		var mood = ttsMoodFor(item.text);
-		ttsBusy[id] = true;
-		ttsPending[rid] = {
-			id: id,
-			mood: mood,
-			timer: window.setTimeout(function () {
-				delete ttsPending[rid];
-				ttsBusy[id] = false;
-				ttsPump(id);
-			}, ttsState.timeoutMs || 9000)
-		};
-		ttsSend({ type: 'mascotTtsSpeak', requestId: rid, id: id, persona: item.persona, text: item.text, mood: mood });
-	}
-
-	function ttsFinish(rid, id) {
-		var pending = ttsPending[rid];
-		if (pending) {
-			window.clearTimeout(pending.timer);
-			delete ttsPending[rid];
-		}
-		ttsBusy[id] = false;
-		ttsPump(id);
-	}
-
-	window.ZCodeMascotTts = {
-		state: ttsState,
-		/** chatView.js 注入的宿主消息通道。 */
-		_send: null,
-		onState: function (msg) {
-			ttsState.enabled = !!msg.enabled;
-			ttsState.supported = !!msg.supported;
-			ttsState.voices = Array.isArray(msg.voices) ? msg.voices : [];
-			ttsState.voiceMap = msg.voiceMap && typeof msg.voiceMap === 'object' ? msg.voiceMap : {};
-			ttsState.timeoutMs = Number(msg.timeoutMs) > 0 ? Number(msg.timeoutMs) : 9000;
-			if (!ttsState.enabled) {
-				ttsQueue = {};
-				ttsBusy = {};
-				var ids = Object.keys(ttsPending);
-				for (var i = 0; i < ids.length; i++) { window.clearTimeout(ttsPending[ids[i]].timer); }
-				ttsPending = {};
-			}
-			var cb = window.ZCodeMascots && window.ZCodeMascots.onTtsState;
-			if (typeof cb === 'function') { cb(ttsState); }
-		},
-		onAudio: function (msg) {
-			var rid = msg && msg.requestId;
-			var pending = ttsPending[rid];
-			if (!pending) { return; }
-			var id = pending.id;
-			var finish = function () { ttsFinish(rid, id); };
-			if (!msg.base64) { finish(); return; }
-			try {
-				var audio = new Audio('data:' + (msg.mime || 'audio/wav') + ';base64,' + msg.base64);
-				audio.volume = 0.9;
-				var mood = msg.mood || pending.mood || 'neutral';
-				var moodRate = TTS_MOOD_RATE[mood] || 1;
-				if (moodRate !== 1) {
-					try {
-						audio.preservesPitch = false;
-						audio.mozPreservesPitch = false;
-						audio.webkitPreservesPitch = false;
-						audio.playbackRate = moodRate;
-					} catch (err) { /* 该内核不支持变调时按原速播 */ }
-				}
-				audio.onended = finish;
-				audio.onerror = finish;
-				var played = audio.play();
-				if (played && played.catch) {
-					played.catch(function () {
-						/* 自动播放被拦：这句放弃，等下一次点击解锁。 */
-						finish();
-					});
-				}
-			} catch (err) { finish(); }
-		}
-	};
 }());
