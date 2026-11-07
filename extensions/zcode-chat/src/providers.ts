@@ -5,31 +5,33 @@
 
 import * as vscode from 'vscode';
 
-/** Matches ZCode’s primary account-backed routes: Start Plan + BigModel. */
-export type ProviderMode = 'startPlan' | 'bigmodel';
+/** Start Plan, BigModel Coding Plan, and the official DeepSeek Messages API. */
+export type ProviderMode = 'startPlan' | 'bigmodel' | 'deepseek';
 
-export const PROVIDER_MODES: readonly ProviderMode[] = ['startPlan', 'bigmodel'];
+export const PROVIDER_MODES: readonly ProviderMode[] = ['startPlan', 'bigmodel', 'deepseek'];
 
 export const PROVIDER_LABELS: Record<ProviderMode, string> = {
 	startPlan: 'ZCode Start Plan',
 	bigmodel: 'BigModel',
+	deepseek: 'DeepSeek',
 };
 
 export const PROVIDER_HINTS: Record<ProviderMode, string> = {
 	startPlan: 'Uses your ZCode account JWT (Start Plan quota / discount).',
 	bigmodel: 'Uses BigModel Coding Plan API key → /api/coding/paas/v4 (not the pay-as-you-go wallet).',
+	deepseek: 'Official DeepSeek Messages API (api.deepseek.com). API key as x-api-key. Thinking: off / low / high / max.',
 };
 
 export function isProviderMode(value: unknown): value is ProviderMode {
-	return value === 'startPlan' || value === 'bigmodel';
+	return value === 'startPlan' || value === 'bigmodel' || value === 'deepseek';
 }
 
-/** Map legacy P0 settings (deepseek / glm / zcode) onto the ZCode-aligned modes. */
+/** Map legacy settings (`zcode`, `glm`) onto the current modes. `deepseek` is the official API. */
 export function normalizeProviderMode(value: unknown): ProviderMode {
 	if (isProviderMode(value)) {
 		return value;
 	}
-	if (value === 'zcode' || value === 'deepseek') {
+	if (value === 'zcode') {
 		return 'startPlan';
 	}
 	if (value === 'glm') {

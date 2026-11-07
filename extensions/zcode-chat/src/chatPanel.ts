@@ -49,6 +49,32 @@ import {
 	type PersistedChatScene,
 	type SavedUnsplashScene,
 } from './chatScene';
+import {
+	CHAT_MASCOT_STATE_KEY,
+	DEFAULT_MASCOT_SLOTS,
+	MASCOT_CATALOG,
+	deleteMascotModel,
+	downloadMascotModel,
+	ensureMascotModelAudio,
+	findMascotCatalog,
+	isMascotModelComplete,
+	listMascotAudioFiles,
+	mascotModel3Path,
+	mascotModelDir,
+	mascotPreviewFile,
+	mascotsDir,
+	migrateLegacyMascotModels,
+	pickMascotNativeAudio,
+	readPersistedChatMascot,
+	type ChatMascotSize,
+	type PersistedChatMascot,
+	mascotSizeToPx,
+	MASCOT_SIZE_MAX,
+	MASCOT_SIZE_MIN,
+	MASCOT_SIZE_STEP,
+} from './mascotCatalog';
+import { MASCOT_PERSONAS, resolveMascotPersonaId, isMascotPersonaId } from './mascotPersona';
+import { MascotTts } from './mascotTts';
 import { fetchUnsplashBrowse, trackUnsplashDownload, UnsplashKeyRejectedError, type UnsplashTopic } from './unsplashCatalog';
 import {
 	dispatchStatusLabel,
@@ -86,8 +112,10 @@ import {
 	type ClaimOffer,
 } from './planBilling';
 import { buildPromptPreamble } from './promptContext';
+import { prepareDeepseekProvider } from './deepseekProvider';
 import {
 	getProviderMode,
+	isProviderMode,
 	pickProviderMode,
 	PROVIDER_LABELS,
 	PROVIDER_MODES,
@@ -111,6 +139,7 @@ import {
 import { computeContextUsage, type ContextUsageSnapshot } from './contextUsage';
 import type { SessionAwareness } from './sessionAwareness';
 import { getZcodeScheduleTip } from './zcodeScheduleTip';
+import { MascotVoice } from './mascotVoice';
 
 const VIEW_ID = 'zcode.chatView';
 
@@ -273,11 +302,16 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private seenNotices = new Set<string>();
 	/** Side-gutter background on the Router board and Worker pages. */
 	private scenePersisted: PersistedChatScene = { selectedId: DEFAULT_CHAT_SCENE_ID, files: [], unsplash: [] };
+	private mascotPersisted: PersistedChatMascot = { enabled: false, size: 'medium', slots: DEFAULT_MASCOT_SLOTS.map(id => id.toLowerCase()) };
+	/** Model downloads in flight, so the picker can show progress instead of a dead button. */
+	private mascotDownloads = new Map<string, { done: number; total: number }>();
 	private unsplashTopics: UnsplashTopic[] | null = null;
 	private unsplashLoadSeq = 0;
 	private unsplashWorkingKey = '';
 	/** Cached Unsplash wallpapers live under global storage, outside the repo. */
 	private readonly wallpaperDir: string;
+	/** Base dir for mascot models: extension media dir, not global storage. */
+	private readonly mascotStoreUri: vscode.Uri;
 	private readonly wallpaperDownloads = new Set<string>();
 	private billingSeq = 0;
 	/** Session id of the Super Agent Router dispatch surface (pinned Workers page). */
@@ -406,6 +440,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private scheduleTipTimer?: ReturnType<typeof setInterval>;
+	private readonly mascotVoice: MascotVoice;
+	private readonly mascotTts: MascotTts;
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
@@ -415,9 +451,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		private readonly globalStorageUri: vscode.Uri,
 	) {
 		this.wallpaperDir = path.join(this.globalStorageUri.fsPath, 'wallpapers');
+		// Mascot models are stored under the extension's media dir (gitignored):
+		// that location is reliably servable in the webview, unlike global storage
+		// paths which the resource loader rejects with 401 in this fork.
+		this.mascotStoreUri = vscode.Uri.joinPath(extensionUri, 'media');
+		migrateLegacyMascotModels(this.globalStorageUri, this.mascotStoreUri);
 		this.seenNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(QUOTA_NOTICE_SEEN_KEY)));
 		this.seenClaimNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(CLAIM_NOTICE_SEEN_KEY)));
 		this.scenePersisted = readPersistedChatScene(this.globalState.get(CHAT_SCENE_STATE_KEY));
+		this.mascotPersisted = readPersistedChatMascot(this.globalState.get(CHAT_MASCOT_STATE_KEY));
+		this.mascotVoice = new MascotVoice(globalState);
+		this.mascotTts = new MascotTts(globalState, extensionUri);
 		this.bootstrapDone = new Promise<void>(resolve => {
 			this.resolveBootstrapDone = resolve;
 		});
@@ -434,6 +478,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			// Auth service is registered before the panel in activate.
 		}
 		void this.refreshCursorMeta();
+		// Title-row columns toggle (workbench chrome) → webview: the board's
+		// columns control moved next to Home/History, so its clicks arrive as
+		// this command and bounce into the webview that owns the layout.
+		vscode.commands.registerCommand('zcode.cycleBoardColumns', () => {
+			void this.view?.webview.postMessage({ type: 'cycleBoardColumns' });
+		});
 		// Worker-rail cleanup bridge — lives here so all dispatch-state sync
 		// (bind/patch/remove) stays in one class.
 		vscode.commands.registerCommand('zcode.removeWorkerDispatches', (opts?: {
@@ -1496,6 +1546,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private async applyProvider(provider: ProviderMode): Promise<void> {
 		await setProviderMode(provider);
+		if (provider === 'deepseek') {
+			await prepareDeepseekProvider();
+		}
 		const modelId = await ensureModelForProvider(provider);
 		await ensureReasoningLevelForModel(provider, modelId);
 		this.pushState();
@@ -1610,6 +1663,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			page?: number;
 			photo?: unknown;
 			url?: string;
+			patch?: {
+				enabled?: unknown;
+				size?: unknown;
+				slot?: unknown;
+				slotId?: unknown;
+				removeId?: unknown;
+				appendId?: unknown;
+			};
+			voice?: unknown;
+			setting?: string;
+			effective?: number;
 		};
 
 		if (msg.type === 'ready') {
@@ -1642,7 +1706,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushState();
 			return;
 		}
-		if (msg.type === 'setProvider' && (msg.provider === 'startPlan' || msg.provider === 'bigmodel')) {
+		if (msg.type === 'setProvider' && isProviderMode(msg.provider)) {
 			await this.applyProvider(msg.provider);
 			return;
 		}
@@ -2021,6 +2085,34 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			await this.removeUnsplashScene(msg.id);
 			return;
 		}
+		if (msg.type === 'setMascot' && msg.patch && typeof msg.patch === 'object') {
+			await this.setChatMascot(msg.patch);
+			return;
+		}
+		if (msg.type === 'mascotSpeak' && msg.voice && typeof msg.voice === 'object') {
+			await this.replyMascotLine(msg.voice as Record<string, unknown>);
+			return;
+		}
+		if (msg.type === 'mascotTtsConfig') {
+			await this.handleMascotTts(msg as Record<string, unknown>);
+			return;
+		}
+		if (msg.type === 'mascotTtsSpeak') {
+			await this.speakMascotTts(msg as Record<string, unknown>);
+			return;
+		}
+		if (msg.type === 'downloadMascot' && typeof msg.id === 'string') {
+			await this.downloadChatMascot(msg.id);
+			return;
+		}
+		if (msg.type === 'deleteMascot' && typeof msg.id === 'string') {
+			await this.deleteChatMascot(msg.id);
+			return;
+		}
+		if (msg.type === 'openDevTools') {
+			await openWebviewDevTools();
+			return;
+		}
 		if (msg.type === 'loadUnsplash') {
 			const topic = typeof msg.topic === 'string' ? msg.topic : 'wallpapers';
 			const page = typeof msg.page === 'number' ? msg.page : 1;
@@ -2037,6 +2129,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'openExternal' && typeof msg.url === 'string' && msg.url.startsWith('https://unsplash.com/')) {
 			await this.openUnsplashLink(msg.url);
+			return;
+		}
+		if (msg.type === 'boardColumnsState') {
+			// Webview owns the board layout; relay its live columns state to
+			// the workbench title-row toggle (zcode.internal.setBoardColumns).
+			const setting = typeof msg.setting === 'string' && msg.setting ? msg.setting : 'auto';
+			const effective = Math.max(0, Math.floor(Number(msg.effective) || 0));
+			void Promise.resolve(vscode.commands.executeCommand('zcode.internal.setBoardColumns', { setting, effective })).catch(() => undefined);
 			return;
 		}
 		if (msg.type === 'send' && typeof msg.text === 'string') {
@@ -3931,6 +4031,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private applyProgress(sessionId: string, event: AgentProgressEvent): void {
+		if (event.type === 'usage') {
+			if (event.totalTokens > 0) {
+				this.reportedUsageTokens = event.totalTokens;
+			}
+			this.pushState();
+			return;
+		}
 		if (event.type === 'file_change') {
 			// Only refresh the visible working set when the active tab owns the edit.
 			if (sessionId === this.sessionId) {
@@ -4583,6 +4690,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			openPlus: extra?.openPlus ?? false,
 			focusInput: extra?.focusInput ?? false,
 			scene: this.view ? this.buildSceneState(this.view.webview) : undefined,
+			mascot: this.view ? this.buildMascotState(this.view.webview) : undefined,
 		});
 	}
 
@@ -4625,6 +4733,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			vscode.Uri.joinPath(this.extensionUri, 'media'),
 			vscode.Uri.file(getAttachmentDir()),
 			vscode.Uri.file(this.wallpaperDir),
+			mascotsDir(this.mascotStoreUri),
+			this.globalStorageUri,
 		];
 		const seen = new Set(roots.map(uri => uri.fsPath));
 		for (const file of this.scenePersisted.files) {
@@ -4996,6 +5106,429 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		};
 	}
 
+	/** Mascot state for the webview: config, queued models, and catalog. */
+	private buildMascotState(webview: vscode.Webview): {
+		enabled: boolean;
+		size: ChatMascotSize;
+		sizePx: number;
+		sizeRange: { min: number; max: number; step: number };
+		slots: Array<{ id: string; label: string; model: string; pos: { x: number; y: number } | null; size: number; persona: string } | null>;
+		personas: Array<{ id: string; label: string; group: string; hint: string; lines: typeof MASCOT_PERSONAS[number]['lines'] }>;
+		catalog: Array<{ id: string; label: string; source: string; sizeMB: number; downloaded: boolean; downloading: boolean; progress: number; hidden: boolean }>;
+		recent: Array<{ id: string; label: string; source: string; preview?: string; downloaded: boolean; hidden: boolean }>;
+		vendor: { pixi: string; unsafeEval: string; core: string; l2d: string };
+	} {
+		// Re-assert webview options (incl. localResourceRoots) before handing out
+		// mascot model URIs, so late-created or refreshed webviews serve them.
+		this.applyWebviewOptions();
+		// Default height first: each slot may override it with its own saved size.
+		const defaultSizePx = typeof this.mascotPersisted.sizePx === 'number'
+			? this.mascotPersisted.sizePx
+			: mascotSizeToPx(this.mascotPersisted.size);
+		const hiddenIds = this.mascotPersisted.hidden || [];
+		const slots: Array<{ id: string; label: string; model: string; pos: { x: number; y: number } | null; size: number; persona: string } | null> = [];
+		for (const id of this.mascotPersisted.slots) {
+			if (!id) {
+				slots.push(null);
+				continue;
+			}
+			const entry = findMascotCatalog(id);
+			const model3 = entry ? mascotModel3Path(this.mascotStoreUri, id) : undefined;
+			if (!entry || !model3 || !isMascotModelComplete(this.mascotStoreUri, id)) {
+				slots.push(null);
+				continue;
+			}
+			slots.push({
+				id,
+				label: entry.label,
+				model: webview.asWebviewUri(vscode.Uri.file(model3)).toString(),
+				pos: this.mascotPersisted.positions?.[id] ?? null,
+				size: this.mascotPersisted.sizes?.[id] ?? defaultSizePx,
+				persona: resolveMascotPersonaId(id, this.mascotPersisted.personas),
+			});
+		}
+		const catalog = MASCOT_CATALOG.map(entry => {
+			const progress = this.mascotDownloads.get(entry.id);
+			const preview = mascotPreviewFile(this.mascotStoreUri, entry.id);
+			return {
+				id: entry.id,
+				label: entry.label,
+				source: entry.source,
+				sizeMB: entry.sizeMB,
+				note: entry.note,
+				preview: fs.existsSync(preview.fsPath) ? webview.asWebviewUri(preview).toString() : undefined,
+				downloaded: isMascotModelComplete(this.mascotStoreUri, entry.id),
+				downloading: !!progress,
+				progress: progress ? progress.done / Math.max(1, progress.total) : 0,
+				hidden: hiddenIds.indexOf(entry.id) >= 0,
+			};
+		});
+		// Recently-used strip: newest first; entries reuse the catalog shapes
+		// (preview/downloaded flags included), trashed ones stay listed so
+		// restoring from the bin also brings them back here.
+		const catalogById = new Map(catalog.map(entry => [entry.id, entry]));
+		const recent = (this.mascotPersisted.recent || [])
+			.map(id => catalogById.get(id))
+			.filter((entry): entry is NonNullable<typeof entry> => !!entry)
+			.slice(0, 12);
+		// Vendor scripts load lazily from these URIs once a mascot is enabled.
+		const vendor = {
+			pixi: this.mediaUri(webview, 'media', 'vendor', 'pixi.min.js').toString(),
+			// Self-installing shim: patches PIXI ShaderSystem on load so pixi never needs eval.
+			unsafeEval: this.mediaUri(webview, 'media', 'vendor', 'pixi-unsafe-eval.min.js').toString(),
+			core: this.mediaUri(webview, 'media', 'vendor', 'live2dcubismcore.min.js').toString(),
+			l2d: this.mediaUri(webview, 'media', 'vendor', 'pixi-live2d-display.min.js').toString(),
+		};
+		const sizePx = typeof this.mascotPersisted.sizePx === 'number'
+			? this.mascotPersisted.sizePx
+			: mascotSizeToPx(this.mascotPersisted.size);
+		return {
+			enabled: this.mascotPersisted.enabled,
+			size: this.mascotPersisted.size,
+			sizePx,
+			sizeRange: { min: MASCOT_SIZE_MIN, max: MASCOT_SIZE_MAX, step: MASCOT_SIZE_STEP },
+			personas: MASCOT_PERSONAS.map(persona => ({
+				id: persona.id,
+				label: persona.label,
+				group: persona.group,
+				hint: persona.hint,
+				lines: persona.lines,
+			})),
+			slots,
+			catalog,
+			recent,
+			vendor,
+		};
+	}
+
+	/** Mascot spoken-audio settings + state broadcast (语音朗读). */
+	private async handleMascotTts(msg: Record<string, unknown>): Promise<void> {
+		const patch = msg.patch && typeof msg.patch === 'object' ? msg.patch as Record<string, unknown> : {};
+		const action = typeof patch.action === 'string' ? patch.action : '';
+		if (action === 'addVoice') {
+			// 选了「＋ 添加音色文件…」：弹系统文件框，拷进 refs 目录即成新音色。
+			await this.mascotTts.addVoiceFile();
+		} else if (action === 'cacheList' || action === 'cacheDelete' || action === 'cacheClear') {
+			if (action === 'cacheDelete' && typeof patch.key === 'string') {
+				await this.mascotTts.cacheDelete(patch.key);
+			} else if (action === 'cacheClear') {
+				await this.mascotTts.cacheClear();
+			}
+			await this.view?.webview.postMessage({ type: 'mascotTtsCacheState', ...(await this.mascotTts.cacheList()) });
+			return;
+		} else if (action === 'cachePlay') {
+			const key = typeof patch.key === 'string' ? patch.key : '';
+			const audio = key ? await this.mascotTts.cacheAudio(key) : undefined;
+			await this.view?.webview.postMessage({ type: 'mascotTtsCacheAudio', key, mime: audio?.mime, base64: audio?.base64 });
+			return;
+		}
+		if (typeof patch.enabled === 'boolean') {
+			await this.mascotTts.setEnabled(patch.enabled);
+		}
+		const voice = patch.voice;
+		if (voice && typeof voice === 'object') {
+			const row = voice as Record<string, unknown>;
+			await this.mascotTts.setVoice(
+				typeof row.id === 'string' ? row.id : '',
+				typeof row.voice === 'string' && row.voice ? row.voice : null,
+			);
+		}
+		const state = await this.mascotTts.describe({ nativeVoices: await this.mascotNativeVoices() });
+		await this.view?.webview.postMessage({ type: 'mascotTtsState', ...state });
+	}
+
+	/**
+	 * Native-voice options per squad character: bundles the model's own voice
+	 * clips as clone sources. First call per model also fetches the clips
+	 * (角色原声补拉, one-time, marker-guarded) — only while TTS is enabled.
+	 */
+	private async mascotNativeVoices(): Promise<Record<string, Array<{ name: string; value: string }>>> {
+		const nativeVoices: Record<string, Array<{ name: string; value: string }>> = {};
+		if (!this.mascotTts.isEnabled()) {
+			return nativeVoices;
+		}
+		for (const id of this.mascotPersisted.slots) {
+			if (!id || nativeVoices[id] || !isMascotModelComplete(this.mascotStoreUri, id)) {
+				continue;
+			}
+			try {
+				await ensureMascotModelAudio(this.mascotStoreUri, id);
+				const files = listMascotAudioFiles(this.mascotStoreUri, id);
+				if (files.length) {
+					nativeVoices[id] = files.map(file => ({
+						name: `原声 · ${path.basename(file.rel).replace(/\.[^.]+$/, '')}`,
+						value: `native:${file.rel}`,
+					}));
+				}
+			} catch (error) {
+				console.warn('[mascot] native audio for', id, error instanceof Error ? error.message : error);
+			}
+		}
+		return nativeVoices;
+	}
+
+	/** Resolve the clone source for a character: explicit 原声 pick, else default. */
+	private mascotNativeRefPath(id: string): string | undefined {
+		if (!id) {
+			return undefined;
+		}
+		const override = this.mascotTts.voiceFor(id);
+		const modelDir = mascotModelDir(this.mascotStoreUri, id);
+		if (override && override.startsWith('native:')) {
+			const file = vscode.Uri.joinPath(modelDir, ...override.slice('native:'.length).split('/')).fsPath;
+			return fs.existsSync(file) ? file : undefined;
+		}
+		if (override) {
+			return undefined;
+		}
+		const pick = pickMascotNativeAudio(listMascotAudioFiles(this.mascotStoreUri, id));
+		return pick ? vscode.Uri.joinPath(modelDir, ...pick.rel.split('/')).fsPath : undefined;
+	}
+
+	private async speakMascotTts(msg: Record<string, unknown>): Promise<void> {
+		if (!this.mascotTts.isEnabled()) {
+			return;
+		}
+		const text = typeof msg.text === 'string' ? msg.text : '';
+		const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+		if (!text || !requestId) {
+			return;
+		}
+		try {
+			const audio = await this.mascotTts.synthesize({
+				id: typeof msg.id === 'string' ? msg.id : '',
+				persona: typeof msg.persona === 'string' ? msg.persona : undefined,
+				text,
+				refAudioPath: this.mascotNativeRefPath(typeof msg.id === 'string' ? msg.id : ''),
+			});
+			await this.view?.webview.postMessage({
+				type: 'mascotTtsAudio',
+				requestId,
+				mood: typeof msg.mood === 'string' ? msg.mood : undefined,
+				mime: audio?.mime,
+				base64: audio?.base64,
+			});
+		} catch (error) {
+			console.warn('[mascot] tts failed:', error instanceof Error ? error.message : error);
+			// 空回包让 webview 立即结束这句，别等超时。
+			await this.view?.webview.postMessage({ type: 'mascotTtsAudio', requestId });
+		}
+	}
+
+	/** Last user line and the assistant's last reply, short enough to sit in a mascot prompt. */
+	private mascotChatGlimpse(): { user: string; assistant: string } {
+		let user = '';
+		let assistant = '';
+		for (let i = this.items.length - 1; i >= 0 && (!user || !assistant); i--) {
+			const item = this.items[i];
+			if (!user && item.kind === 'user') {
+				user = item.text;
+			} else if (!assistant && item.kind === 'assistant' && !item.streaming) {
+				assistant = item.text;
+			}
+		}
+		return { user, assistant };
+	}
+
+	private async replyMascotLine(raw: Record<string, unknown>): Promise<void> {
+		const seq = typeof raw.seq === 'number' ? raw.seq : 0;
+		let outcome: { line?: string; skipped: boolean; dropped?: boolean } = { skipped: true };
+		try {
+			outcome = await this.mascotVoice.speak({
+				id: typeof raw.id === 'string' ? raw.id : '',
+				label: typeof raw.label === 'string' ? raw.label : '',
+				trigger: typeof raw.trigger === 'string' ? raw.trigger : '',
+				zone: typeof raw.zone === 'string' ? raw.zone : '',
+				gift: typeof raw.gift === 'string' ? raw.gift : '',
+				glimpse: this.mascotChatGlimpse(),
+				persona: resolveMascotPersonaId(typeof raw.id === 'string' ? raw.id : '', this.mascotPersisted.personas),
+			});
+		} catch (error) {
+			console.warn('[mascot] voice failed:', error instanceof Error ? error.message : error);
+		}
+		if (outcome.dropped) {
+			return;
+		}
+		void this.view?.webview.postMessage({
+			type: 'mascotLine',
+			seq,
+			line: outcome.line ?? '',
+			skipped: outcome.skipped,
+		});
+	}
+
+	private async saveChatMascot(): Promise<void> {
+		await this.globalState.update(CHAT_MASCOT_STATE_KEY, this.mascotPersisted);
+	}
+
+	/** Config edits from the picker: enable, per-slot character, size, trash. */
+	private async setChatMascot(patch: { enabled?: unknown; size?: unknown; sizePx?: unknown; slot?: unknown; slotId?: unknown; removeId?: unknown; appendId?: unknown; hideId?: unknown; unhideId?: unknown; forgetId?: unknown; setSize?: unknown; setPersona?: unknown; move?: unknown; resetPos?: unknown }): Promise<void> {
+		const next: PersistedChatMascot = {
+			enabled: this.mascotPersisted.enabled,
+			size: this.mascotPersisted.size,
+			sizePx: this.mascotPersisted.sizePx,
+			positions: { ...(this.mascotPersisted.positions || {}) },
+			sizes: { ...(this.mascotPersisted.sizes || {}) },
+			personas: { ...(this.mascotPersisted.personas || {}) },
+			hidden: [...(this.mascotPersisted.hidden || [])],
+			recent: [...(this.mascotPersisted.recent || [])],
+			slots: [...this.mascotPersisted.slots],
+		};
+		const useRecent = (id: string) => {
+			// Newest first, deduped, capped; feeds the picker's quick strip.
+			const list = next.recent ?? (next.recent = []);
+			const at = list.indexOf(id);
+			if (at >= 0) {
+				list.splice(at, 1);
+			}
+			list.unshift(id);
+			if (list.length > 12) {
+				list.length = 12;
+			}
+		};
+		if (typeof patch.enabled === 'boolean') {
+			next.enabled = patch.enabled;
+		}
+		if (patch.size === 'small' || patch.size === 'medium' || patch.size === 'large') {
+			next.size = patch.size;
+		}
+		if (typeof patch.slot === 'number' && Number.isInteger(patch.slot) && patch.slot >= 0 && patch.slot < next.slots.length) {
+			const id = typeof patch.slotId === 'string' && patch.slotId ? patch.slotId : null;
+			next.slots[patch.slot] = id && findMascotCatalog(id) ? id : null;
+			if (next.slots[patch.slot]) {
+				useRecent(next.slots[patch.slot] as string);
+			}
+		}
+		if (typeof patch.removeId === 'string' && patch.removeId) {
+			// Clear the first slot holding this character (id-based, so
+			// webview-side hole filtering cannot skew the index).
+			const index = next.slots.indexOf(patch.removeId);
+			if (index >= 0) {
+				next.slots[index] = null;
+			}
+		}
+		if (typeof patch.appendId === 'string' && patch.appendId && findMascotCatalog(patch.appendId) && next.slots.indexOf(patch.appendId) < 0) {
+			// Fill the first free slot, or append when the roster has room.
+			const free = next.slots.findIndex(slot => !slot);
+			if (free >= 0) {
+				next.slots[free] = patch.appendId;
+			} else {
+				next.slots.push(patch.appendId);
+			}
+			if (next.slots.indexOf(patch.appendId) >= 0) {
+				useRecent(patch.appendId);
+			}
+		}
+		if (typeof patch.sizePx === 'number' && Number.isFinite(patch.sizePx)) {
+			next.sizePx = Math.min(MASCOT_SIZE_MAX, Math.max(MASCOT_SIZE_MIN, Math.round(patch.sizePx)));
+		}
+		if (patch.setSize && typeof patch.setSize === 'object') {
+			// Wheel-resize on a mascot: remember this character's own height.
+			const want = patch.setSize as { id?: unknown; sizePx?: unknown };
+			if (typeof want.id === 'string' && findMascotCatalog(want.id)
+				&& typeof want.sizePx === 'number' && Number.isFinite(want.sizePx)) {
+				const sizes = next.sizes ?? (next.sizes = {});
+				sizes[want.id] = Math.min(MASCOT_SIZE_MAX, Math.max(MASCOT_SIZE_MIN, Math.round(want.sizePx)));
+			}
+		}
+		if (patch.setPersona && typeof patch.setPersona === 'object') {
+			const want = patch.setPersona as { id?: unknown; persona?: unknown };
+			if (typeof want.id === 'string' && findMascotCatalog(want.id)
+				&& typeof want.persona === 'string' && isMascotPersonaId(want.persona)) {
+				const personas = next.personas ?? (next.personas = {});
+				personas[want.id] = want.persona;
+			}
+		}
+		if (typeof patch.hideId === 'string' && patch.hideId && findMascotCatalog(patch.hideId)) {
+			// Trash bin: drop it from the roster (and the queue) but keep it
+			// restorable from the bin list.
+			const hidden = next.hidden ?? (next.hidden = []);
+			if (hidden.indexOf(patch.hideId) < 0) {
+				hidden.push(patch.hideId);
+			}
+			const queuedAt = next.slots.indexOf(patch.hideId);
+			if (queuedAt >= 0) {
+				next.slots[queuedAt] = null;
+			}
+			if (next.positions) {
+				delete next.positions[patch.hideId];
+			}
+		}
+		if (typeof patch.unhideId === 'string' && patch.unhideId && next.hidden) {
+			const at = next.hidden.indexOf(patch.unhideId);
+			if (at >= 0) {
+				next.hidden.splice(at, 1);
+			}
+		}
+		if (typeof patch.forgetId === 'string' && patch.forgetId && next.recent) {
+			// Drop from the recently-used strip only; the catalog entry stays.
+			const at = next.recent.indexOf(patch.forgetId);
+			if (at >= 0) {
+				next.recent.splice(at, 1);
+			}
+		}
+		if (patch.move && typeof patch.move === 'object') {
+			const move = patch.move as { id?: unknown; x?: unknown; y?: unknown };
+			const x = typeof move.x === 'number' && Number.isFinite(move.x) ? Math.min(1, Math.max(0, move.x)) : null;
+			// y > 1 = feet sunk past the fold (like the default queue overhang).
+			const y = typeof move.y === 'number' && Number.isFinite(move.y) ? Math.min(2, Math.max(0, move.y)) : null;
+			if (typeof move.id === 'string' && findMascotCatalog(move.id) && x !== null && y !== null) {
+				next.positions = { ...next.positions, [move.id]: { x, y } };
+			}
+		}
+		if (typeof patch.resetPos === 'string' && patch.resetPos) {
+			const rest = { ...(next.positions || {}) };
+			delete rest[patch.resetPos];
+			next.positions = rest;
+		}
+		if (next.enabled && next.slots.length === 0) {
+			// Only a never-configured roster (no slots saved at all) falls back
+			// to the defaults. An all-null roster is a deliberate "removed
+			// every mascot" and must stay empty instead of re-seeding.
+			next.slots = DEFAULT_MASCOT_SLOTS.map(id => id.toLowerCase());
+		}
+		this.mascotPersisted = next;
+		await this.saveChatMascot();
+		this.pushState();
+	}
+
+	/** Downloads a mascot model into global storage, posting progress along the way. */
+	private async downloadChatMascot(id: string): Promise<void> {
+		if (!findMascotCatalog(id) || this.mascotDownloads.has(id)) {
+			return;
+		}
+		if (isMascotModelComplete(this.mascotStoreUri, id)) {
+			this.pushState();
+			return;
+		}
+		this.mascotDownloads.set(id, { done: 0, total: 1 });
+		this.pushState();
+		try {
+			await downloadMascotModel(this.mascotStoreUri, id, progress => {
+				this.mascotDownloads.set(id, { done: progress.done, total: progress.total });
+				this.pushState();
+			});
+		} catch (error) {
+			vscode.window.showWarningMessage(`精灵模型下载失败：${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			this.mascotDownloads.delete(id);
+			this.pushState();
+		}
+	}
+
+	private async deleteChatMascot(id: string): Promise<void> {
+		if (!findMascotCatalog(id)) {
+			return;
+		}
+		deleteMascotModel(this.mascotStoreUri, id);
+		this.mascotPersisted = {
+			...this.mascotPersisted,
+			slots: this.mascotPersisted.slots.map(slot => slot === id ? null : slot),
+		};
+		await this.saveChatMascot();
+		this.pushState();
+	}
+
 	private resolveSceneImage(
 		webview: vscode.Webview,
 		selectedId: string,
@@ -5074,11 +5607,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// re-exposes it, so chatView.js's own acquire keeps working (see note in
 		// the file). Forwards ⌘]/⌘[ keydowns to the host while composer-focused.
 		const superAgentKeysUri = this.mediaUri(webview, 'media', 'superAgentKeys.js');
+		const mascotViewUri = this.mediaUri(webview, 'media', 'mascotView.js');
 		const csp = [
 			`default-src 'none'`,
-			`style-src ${webview.cspSource}`,
-			`script-src ${webview.cspSource}`,
+			// Markdown renderer (syntax token colors) emits inline style attrs;
+			// same allowance as VS Code's built-in markdown preview.
+			`style-src ${webview.cspSource} 'unsafe-inline'`,
+			// pixi-live2d-display fetches model3.json/moc3/motions from webview URIs.
+			`connect-src ${webview.cspSource}`,
+			// Cubism Core instantiates WebAssembly; Chromium requires this keyword.
+			// (pixi itself avoids eval via the @pixi/unsafe-eval shim, so no plain 'unsafe-eval'.)
+			`script-src ${webview.cspSource} 'wasm-unsafe-eval'`,
 			`img-src ${webview.cspSource} data: https://images.unsplash.com`,
+			// 桌面精灵语音朗读：合成结果以 data:/blob: 音频在 webview 里播放。
+			`media-src ${webview.cspSource} data: blob:`,
 		].join('; ');
 
 		return `<!DOCTYPE html>
@@ -5203,9 +5745,23 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	<script src="${highlightUri}"></script>
 	<script src="${markdownUri}"></script>
 	<script src="${superAgentKeysUri}"></script>
+	<script src="${mascotViewUri}"></script>
 	<script src="${scriptUri}"></script>
 </body>
 </html>`;
+	}
+}
+
+/** Opens webview devtools; the built-in command id differs across builds. */
+async function openWebviewDevTools(): Promise<void> {
+	const candidates = ['webview.openDeveloperTools', 'workbench.action.webview.openDeveloperTools'];
+	for (const command of candidates) {
+		try {
+			await vscode.commands.executeCommand(command);
+			return;
+		} catch {
+			// Try the next command id.
+		}
 	}
 }
 
@@ -5219,6 +5775,9 @@ export function registerChatPanel(
 		vscode.window.registerWebviewViewProvider(ZCodeChatViewProvider.viewType, provider, {
 			webviewOptions: { retainContextWhenHidden: true },
 		}),
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand('zcode.openChatDevTools', () => openWebviewDevTools()),
 	);
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration(e => {

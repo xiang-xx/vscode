@@ -23,6 +23,7 @@ import {
 	type IdeChatExtensionApi,
 } from './ideChatStore';
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
+import { bindDeepseekSecrets, promptDeepseekApiKey } from './deepseekProvider';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
 import { searchChatSessions, type SessionSearchMatch } from './sessionSearch';
 import { disposePluginHosts } from './chatPlugins';
@@ -43,6 +44,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 	context.subscriptions.push({ dispose: () => disposeBrowserBridge() });
 
 	registerPluginCommands(context);
+	bindDeepseekSecrets(context.secrets);
 
 	const auth = new ZCodeAuthService(context.secrets);
 	setAuthService(auth);
@@ -72,7 +74,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 		}),
 	);
 
-	// Migrate legacy providerMode values (deepseek / glm / zcode) to Start Plan / BigModel.
+	// Migrate legacy providerMode values (`zcode`, `glm`) onto Start Plan / BigModel.
+	// `deepseek` is the official DeepSeek provider and is left as-is.
 	const configuredMode = vscode.workspace.getConfiguration('zcode').get<string>('providerMode');
 	if (configuredMode && !isProviderMode(configuredMode)) {
 		await setProviderMode(getProviderMode());
@@ -264,6 +267,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 		vscode.commands.registerCommand('zcode.switchProvider', async () => {
 			await panel.switchProvider();
 			refreshProviderStatus();
+		}),
+		vscode.commands.registerCommand('zcode.setDeepseekApiKey', async () => {
+			const key = await promptDeepseekApiKey();
+			if (key) {
+				void vscode.window.showInformationMessage('DeepSeek API Key 已保存。');
+				panel.refresh();
+			}
 		}),
 		vscode.commands.registerCommand('zcode.switchModel', async () => {
 			if (getActiveBrain() === 'cursor') {

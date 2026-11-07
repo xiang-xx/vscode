@@ -5,7 +5,7 @@
 
 import { Disposable, IDisposable } from '../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../base/common/observable.js';
-import { $, addDisposableListener, append, EventType, isHTMLElement, prepend } from '../../../../../base/browser/dom.js';
+import { $, addDisposableListener, append, EventType, prepend } from '../../../../../base/browser/dom.js';
 import { CommandsRegistry, ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { ThemeIcon } from '../../../../../base/common/themables.js';
@@ -25,28 +25,22 @@ export const ZCODE_CHAT_VIEW_ID = 'zcode.chatView';
 /**
  * When AI Chat owns the auxiliary bar:
  * - hide the "AI Chat" title / composite-bar label
- * - render the passive Workers status chip on the left of the title row and
- *   the Home / History function buttons at the right end (next to the
- *   workbench title actions). The chip is not a switch; Home forces the
- *   Router timeline, History opens a lightweight dropdown to restore /
- *   delete / clear archived workers
+ * - render the Home / History / board-columns function buttons at the right
+ *   end of the title row (next to the workbench title actions). Home forces
+ *   the Router timeline, History opens a lightweight dropdown to restore /
+ *   delete / clear archived workers, and the columns button cycles the
+ *   Router board layout (auto → 1 → 2 → 3 → 4) together with the webview
  * - keep workbench title-actions (… / maximize / close) on the right
  */
 export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchContribution {
 	static readonly ID = 'workbench.contrib.zcodeAuxiliaryBarChrome';
 
+	/** Empty spacer that keeps the function buttons at the right end of the row. */
 	private tabsHost: HTMLElement | undefined;
-	/**
-	 * Passive Workers status chip — the only title-row chat chrome.
-	 * The page itself (a layer above the chat webview) is owned by
-	 * `SuperAgentChatPageContribution`; this chrome only renders the chip and
-	 * reflects state pushed via `zcode.internal.setSuperAgentWorkersTab`:
-	 * no number bubble (per-state counts live in the strip header), just an
-	 * attention dot while some worker awaits the user.
-	 */
-	private workersTabEl: HTMLElement | undefined;
-	private workersTab: { active: boolean; badge: number; attention: boolean; routerSession?: string; pulse?: boolean } = { active: false, badge: 0, attention: false };
-	/** Right-end host for the Home / History function buttons. */
+	/** Board-columns toggle (Router homepage layout) next to Home / History. */
+	private columnsActionEl: HTMLElement | undefined;
+	private boardColumns: { setting: string; effective: number } = { setting: 'auto', effective: 0 };
+	/** Right-end host for the Home / History / columns function buttons. */
 	private actionsHost: HTMLElement | undefined;
 	/** Live history dropdown — lightweight replacement for the retired strip's history drawer. */
 	private historyMenu: { panel: HTMLElement; disposables: IDisposable[] } | undefined;
@@ -69,21 +63,24 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 				this.update();
 			}
 		}));
-		this._register(CommandsRegistry.registerCommand('zcode.internal.setSuperAgentWorkersTab', (_accessor, state: unknown) => {
-			if (state && typeof state === 'object') {
-				const s = state as { active?: unknown; badge?: unknown; attention?: unknown; routerSession?: unknown; pulse?: unknown };
-				this.workersTab = {
-					active: !!s.active,
-					badge: Math.max(0, Math.floor(Number(s.badge) || 0)),
-					attention: !!s.attention,
-					routerSession: typeof s.routerSession === 'string' ? s.routerSession : undefined,
-					pulse: !!s.pulse,
-				};
-				this.updateWorkersTab();
-			}
-		}));
+		// Legacy no-op: the Workers status chip is retired — the Router board
+		// itself carries worker counts and attention states now.
+		this._register(CommandsRegistry.registerCommand('zcode.internal.setSuperAgentWorkersTab', () => { }));
 		// Legacy no-op: session title tabs are retired under Router+Worker mode.
 		this._register(CommandsRegistry.registerCommand('zcode.internal.setTitleTabs', () => { }));
+		// Live board-columns state from the chat webview (it owns the layout):
+		// relabels the title-row toggle. `effective` is 0 while the Router
+		// board is off-screen (a worker detail page is showing).
+		this._register(CommandsRegistry.registerCommand('zcode.internal.setBoardColumns', (_accessor, state: unknown) => {
+			if (state && typeof state === 'object') {
+				const s = state as { setting?: unknown; effective?: unknown };
+				this.boardColumns = {
+					setting: typeof s.setting === 'string' && s.setting ? s.setting : 'auto',
+					effective: Math.max(0, Math.floor(Number(s.effective) || 0)),
+				};
+				this.updateColumnsAction();
+			}
+		}));
 		this.update();
 	}
 
@@ -109,8 +106,9 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 			return;
 		}
 		this.teardownChrome();
+		// Empty flex spacer: keeps the function buttons + workbench title
+		// actions right-aligned now that the Workers chip is gone.
 		this.tabsHost = prepend(title, $('div.zcode-title-tabs-host'));
-		this.mountWorkersTab();
 		// Function buttons belong at the right end of the title row, right
 		// before the workbench title actions (… / maximize / close) — not at
 		// the far left.
@@ -129,10 +127,10 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 	}
 
 	/**
-	 * Home + History — the right-end function area of the title row. Home
-	 * forces the Router main timeline back onto the surface; History opens a
-	 * lightweight dropdown (restore / delete / clear archived workers) — the
-	 * old full-width history drawer went away with the Workers strip.
+	 * Home + History + board columns — the right-end function area of the
+	 * title row. Home forces the Router main timeline back onto the surface;
+	 * History opens a lightweight dropdown (restore / delete / clear archived
+	 * workers); the columns button toggles the Router board layout.
 	 */
 	private mountTitleActions(): void {
 		if (!this.actionsHost) {
@@ -159,6 +157,41 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 		this._register(addDisposableListener(history, EventType.CLICK, () => {
 			this.showHistoryMenu(history);
 		}));
+
+		// Board columns toggle — the Router homepage layout control that used
+		// to sit at the top-left of the board. The webview owns the setting
+		// and the layout, so a click cycles it there and state flows back via
+		// `zcode.internal.setBoardColumns`.
+		const columns = append(actions, $('button.zcode-chrome-action.zcode-columns-action', {
+			type: 'button',
+		}));
+		columns.classList.add(...ThemeIcon.asClassNameArray(Codicon.editorLayout));
+		append(columns, $('span.zcode-columns-label'));
+		this.columnsActionEl = columns;
+		this.updateColumnsAction();
+		this._register(addDisposableListener(columns, EventType.CLICK, () => {
+			this.commandService.executeCommand('zcode.cycleBoardColumns').catch(() => { });
+		}));
+	}
+
+	private updateColumnsAction(): void {
+		const btn = this.columnsActionEl;
+		if (!btn) {
+			return;
+		}
+		const label = btn.querySelector('.zcode-columns-label');
+		if (label) {
+			label.textContent = this.boardColumns.setting === 'auto'
+				? (this.boardColumns.effective > 0
+					? localize('boardColumnsAutoN', "自动·{0}", String(this.boardColumns.effective))
+					: localize('boardColumnsAuto', "自动"))
+				: localize('boardColumnsFixed', "{0} 列", this.boardColumns.setting);
+		}
+		const title = this.boardColumns.setting === 'auto'
+			? localize('boardColumnsTitleAuto', "首页任务卡片列数：自动（当前 {0}）。点击切换：自动 → 1 → 2 → 3 → 4 列", String(this.boardColumns.effective || '—'))
+			: localize('boardColumnsTitleFixed', "首页任务卡片列数：{0} 列。点击切换：自动 → 1 → 2 → 3 → 4 列", this.boardColumns.setting);
+		btn.title = title;
+		btn.setAttribute('aria-label', title);
 	}
 
 	/**
@@ -355,62 +388,13 @@ export class ZCodeAuxiliaryBarChrome extends Disposable implements IWorkbenchCon
 		this.historyMenu = undefined;
 	}
 
-	/**
-	 * The Workers status chip. It lives alone in the title host — no session
-	 * tab strip, no New Chat / History chrome actions. It is *not* a button:
-	 * the Workers page is the single chat surface and opens on its own, so a
-	 * toggle here would only hide the page until the next worker event yanks
-	 * it back. The chip just labels the area and flags attention.
-	 */
-	private mountWorkersTab(): void {
-		if (!this.tabsHost) {
-			return;
-		}
-		const chip = append(this.tabsHost, $('span.zcode-session-tab.zcode-tab-pinned'));
-		chip.setAttribute('role', 'status');
-		chip.title = 'Workers';
-
-		const icon = append(chip, $('span.zcode-tab-icon'));
-		icon.classList.add(...ThemeIcon.asClassNameArray(Codicon.layers));
-
-		const label = append(chip, $('span.zcode-tab-title'));
-		label.textContent = 'Workers';
-
-		append(chip, $('span.zcode-tab-attention'));
-
-		this.workersTabEl = chip;
-		this.updateWorkersTab();
-	}
-
-	private updateWorkersTab(): void {
-		const chip = this.workersTabEl;
-		if (!chip) {
-			return;
-		}
-		chip.classList.toggle('active', this.workersTab.active);
-		const running = this.workersTab.badge;
-		chip.title = this.workersTab.attention
-			? (running > 0 ? `Workers — ${running} 个任务进行中，有任务需要你处理` : 'Workers — 有任务需要你处理')
-			: (running > 0 ? `Workers — ${running} 个任务进行中` : 'Workers');
-		const dot = chip.querySelector('.zcode-tab-attention');
-		if (dot) {
-			dot.classList.toggle('hidden', !this.workersTab.attention);
-			// One-shot pulse when attention appears: retrigger via reflow.
-			if (this.workersTab.pulse && isHTMLElement(dot)) {
-				dot.classList.remove('pulse');
-				void dot.offsetWidth;
-				dot.classList.add('pulse');
-			}
-		}
-	}
-
 	private teardownChrome(): void {
 		this.hideHistoryMenu();
 		this.tabsHost?.remove();
 		this.tabsHost = undefined;
 		this.actionsHost?.remove();
 		this.actionsHost = undefined;
-		this.workersTabEl = undefined;
+		this.columnsActionEl = undefined;
 	}
 }
 

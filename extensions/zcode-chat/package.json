@@ -50,16 +50,63 @@
           ],
           "description": "%config.activeBrain%"
         },
+        "zcode.mascot.tts.engine": {
+          "type": "string",
+          "default": "qwen",
+          "enum": [
+            "qwen",
+            "system",
+            "openai"
+          ],
+          "enumDescriptions": [
+            "本地 Qwen3-TTS（Hugging Face 开源权重，参考音频克隆音色；起不来自动退回系统语音）",
+            "macOS 系统语音（say，离线、零依赖）",
+            "本地 OpenAI 兼容 /audio/speech 服务（GPT-SoVITS、CosyVoice、fish-speech 等的兼容封装）"
+          ],
+          "description": "桌面精灵台词的语音合成引擎"
+        },
+        "zcode.mascot.tts.python": {
+          "type": "string",
+          "default": "",
+          "description": "qwen 引擎的 python 解释器（需已装 qwen-tts；留空自动探测，默认先试配音 demo 的 venv）"
+        },
+        "zcode.mascot.tts.refsDir": {
+          "type": "string",
+          "default": "",
+          "description": "qwen 引擎的参考音色目录：放 名字.wav（可选 名字.txt 写参考文案）即成一个可选音色。留空用 ~/.zcode/mascot-voice-refs"
+        },
+        "zcode.mascot.tts.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:9880/v1",
+          "description": "OpenAI 兼容语音服务的地址（engine 为 openai 时使用）"
+        },
+        "zcode.mascot.tts.model": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI 兼容语音服务的模型名（留空用服务端默认）"
+        },
+        "zcode.mascot.tts.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI 兼容语音服务的鉴权（本地服务一般留空）"
+        },
+        "zcode.mascot.tts.voice": {
+          "type": "string",
+          "default": "",
+          "description": "默认语音：qwen 引擎填参考音色名（clone:名字）；system 引擎填 say 声音名（如 Tingting、Yu-shu）；openai 引擎填 voice 名。留空自动选择"
+        },
         "zcode.providerMode": {
           "type": "string",
           "default": "startPlan",
           "enum": [
             "startPlan",
-            "bigmodel"
+            "bigmodel",
+            "deepseek"
           ],
           "enumDescriptions": [
             "%config.providerMode.startPlan%",
-            "%config.providerMode.bigmodel%"
+            "%config.providerMode.bigmodel%",
+            "%config.providerMode.deepseek%"
           ],
           "description": "%config.providerMode%"
         },
@@ -92,6 +139,16 @@
           "type": "string",
           "default": "GLM-5.3-Flash",
           "description": "%config.model%"
+        },
+        "zcode.deepseek.baseUrl": {
+          "type": "string",
+          "default": "https://api.deepseek.com/anthropic",
+          "description": "%config.deepseek.baseUrl%"
+        },
+        "zcode.deepseek.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "%config.deepseek.apiKey%"
         },
         "zcode.reasoningLevel": {
           "type": "string",
@@ -222,6 +279,12 @@
         "icon": "$(sparkle)"
       },
       {
+        "command": "zcode.openChatDevTools",
+        "title": "%command.openChatDevTools%",
+        "category": "%command.category%",
+        "icon": "$(debug)"
+      },
+      {
         "command": "zcode.addSelectionToChat",
         "title": "%command.addSelectionToChat%",
         "category": "%command.category%",
@@ -267,6 +330,12 @@
         "title": "%command.switchProvider%",
         "category": "%command.category%",
         "icon": "$(symbol-misc)"
+      },
+      {
+        "command": "zcode.setDeepseekApiKey",
+        "title": "%command.setDeepseekApiKey%",
+        "category": "%command.category%",
+        "icon": "$(key)"
       },
       {
         "command": "zcode.switchModel",
@@ -371,9 +440,14 @@
           "group": "1_more@2"
         },
         {
-          "command": "zcode.manageAccount",
+          "command": "zcode.setDeepseekApiKey",
           "when": "view == zcode.chatView",
           "group": "1_more@3"
+        },
+        {
+          "command": "zcode.manageAccount",
+          "when": "view == zcode.chatView",
+          "group": "1_more@4"
         }
       ]
     },

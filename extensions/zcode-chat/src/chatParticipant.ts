@@ -17,6 +17,7 @@ import {
 	setSelectedModelId,
 	setSelectedReasoningLevel,
 } from './models';
+import { prepareDeepseekProvider } from './deepseekProvider';
 import { getProviderMode, pickProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
 
 type ChatResponseStreamEx = vscode.ChatResponseStream & {
@@ -29,6 +30,9 @@ export function registerChatParticipant(context: vscode.ExtensionContext): void 
 			const next = await pickProviderMode();
 			if (next) {
 				await setProviderMode(next);
+				if (next === 'deepseek') {
+					await prepareDeepseekProvider();
+				}
 				const modelId = await ensureModelForProvider(next);
 				await ensureReasoningLevelForModel(next, modelId);
 				response.markdown(`Provider switched to **${PROVIDER_LABELS[next]}**.`);

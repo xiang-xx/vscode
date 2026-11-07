@@ -14,6 +14,7 @@ import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { getProviderMode, PROVIDER_HINTS, PROVIDER_LABELS, type ProviderMode } from './providers';
 import { getAgentPace, type AgentPace } from './agentPace';
 import type { SessionAwareness } from './sessionAwareness';
+import { resolveDeepseekApiKey } from './deepseekProvider';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
 
 export type BridgeMode = 'agent' | 'stub' | 'http' | 'cursor-acp';
@@ -272,6 +273,9 @@ export async function getCursorBrainStatusLine(): Promise<string> {
 }
 
 async function resolveHttpApiKey(provider: ProviderMode): Promise<string | undefined> {
+	if (provider === 'deepseek') {
+		return resolveDeepseekApiKey();
+	}
 	if (provider === 'bigmodel') {
 		return (await loadCodingPlanApiKey('bigmodel'))
 			?? emptyToUndefined(safeSession()?.accessToken);

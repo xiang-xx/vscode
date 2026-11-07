@@ -79,6 +79,15 @@
 	let historyOpen = false;
 	let sceneKey = '';
 	let sceneChoices = [];
+	let chatMascot = null;
+	// Live card handles for the mascot roster, so download progress can patch
+	// badges in place instead of rebuilding the grid (which resets scrolling).
+	let mascotCardRefs = new Map();
+// Last structural mascot signature seen by render(): trash/queue/recent/
+// download-completion changes force a roster rebuild, progress ticks do not.
+let lastMascotSig = '';
+	// Trash bin expanded state: user toggled, survives roster re-renders.
+	let mascotTrashOpen = false;
 	let contextPanelOpen = false;
 	const CONTEXT_RING_R = 10;
 	const CONTEXT_RING_C = 2 * Math.PI * CONTEXT_RING_R;
@@ -2341,9 +2350,10 @@
 	// One flat Workers panel: no 进行中/已完成/需要你 split, no re-ordering.
 	// Every worker card stays exactly where it was first dispatched — cards
 	// never jump between (or inside) sections when their status changes.
-	const BOARD_SECTIONS = [
-		{ id: 'all', title: 'Workers' },
-	];
+	// No section header either: the board is the only content on the home
+	// page, so a "Workers · N" caption would only repeat what the cards
+	// already show.
+	const BOARD_SECTIONS = ['all'];
 
 	function resolveAccentCss(accent) {
 		if (!accent || typeof accent !== 'string') {
@@ -2644,12 +2654,19 @@
 		}
 		const selected = !!(state && state.dispatchTarget && group.workerSessionId
 			&& state.dispatchTarget.workerSessionId === group.workerSessionId);
+		const wasRead = card.classList.contains('read');
 		const nextClass = 'worker-card'
 			+ (selected ? ' selected' : '')
 			+ (group.workerId ? ' clickable' : '')
 			+ (read ? ' read' : '');
 		if (card.className !== nextClass) {
 			card.className = nextClass;
+		}
+		// 空闲预览更矮。读标记切换后按新的 max-height 重测，该折叠的才出现「展开」。
+		if (wasRead !== read) {
+			card.querySelectorAll('.dispatch-result:not(.pending)').forEach((wrap) => {
+				scheduleFitDispatchResult(wrap);
+			});
 		}
 		card.dataset.workerKey = group.workerKey;
 		if (group.workerSessionId) {
@@ -2663,7 +2680,7 @@
 			delete card.dataset.workerId;
 		}
 		const statusAccent = read
-			? 'color-mix(in srgb, var(--vscode-foreground) 32%, transparent)'
+			? 'color-mix(in srgb, var(--vscode-foreground) 22%, transparent)'
 			: workerStatusAccent(latest);
 		const accentCss = statusAccent || resolveAccentCss(group.accent);
 		if (accentCss) {
@@ -2672,7 +2689,7 @@
 			card.style.removeProperty('--worker-accent');
 		}
 		const statusFg = read
-			? 'color-mix(in srgb, var(--vscode-foreground) 58%, transparent)'
+			? 'color-mix(in srgb, var(--vscode-foreground) 40%, transparent)'
 			: workerStatusFg(latest);
 		if (statusFg) {
 			card.style.setProperty('--worker-status-fg', statusFg);
@@ -2836,32 +2853,17 @@
 		return true;
 	}
 
-	function createBoardSection(sectionId, title) {
+	function createBoardSection(sectionId) {
 		const section = document.createElement('section');
 		section.className = 'board-section';
 		section.dataset.section = sectionId;
-		const heading = document.createElement('div');
-		heading.className = 'board-section-title';
-		heading.innerHTML = `<span class="label"></span><span class="count"></span>`;
-		heading.querySelector('.label').textContent = title;
 		const cards = document.createElement('div');
 		cards.className = 'board-section-cards';
-		section.append(heading, cards);
+		section.append(cards);
 		return section;
 	}
 
-	function syncBoardSection(section, title, groups) {
-		const countEl = section.querySelector(':scope > .board-section-title .count');
-		const labelEl = section.querySelector(':scope > .board-section-title .label');
-		if (labelEl && labelEl.textContent !== title) {
-			labelEl.textContent = title;
-		}
-		if (countEl) {
-			const next = String(groups.length);
-			if (countEl.textContent !== next) {
-				countEl.textContent = next;
-			}
-		}
+	function syncBoardSection(section, groups) {
 		section.hidden = groups.length === 0;
 		const host = section.querySelector(':scope > .board-section-cards');
 		if (!host) {
@@ -2900,7 +2902,7 @@
 		host._orderedKeys = groups.map((group) => group.workerKey);
 		const board = section.parentElement;
 		if (board) {
-			ensureBoardColumnsControl(board);
+			ensureBoardLayoutWatchers(board);
 			updateBoardEdgeBreakout(board);
 			applyBoardColumns(board);
 		}
@@ -2952,15 +2954,35 @@
 		return Math.max(1, Math.min(BOARD_MAX_AUTO_COLUMNS, cols));
 	}
 
-	function updateBoardColumnsButton(board, effectiveCols) {
-		const btn = board && board.querySelector(':scope > .board-columns-control');
-		if (!btn) {
+	// The columns control lives in the workbench title row now (next to Home /
+	// History). Report the live setting + effective column count so that button
+	// can label itself; dedupe because applyBoardColumns also runs on resizes.
+	let boardColumnsLastNotified = '';
+
+	function notifyBoardColumnsState(effectiveCols) {
+		const setting = loadBoardColumnsSetting();
+		const effective = Math.max(0, Math.floor(Number(effectiveCols) || 0));
+		const key = `${setting}|${effective}`;
+		if (key === boardColumnsLastNotified) {
 			return;
 		}
-		btn.textContent = boardColumnsSetting === 'auto'
-			? `列数：自动（当前 ${effectiveCols}）`
-			: `列数：${boardColumnsSetting}`;
-		btn.title = '宽屏时把首页任务卡片排成多列，单张卡宽约 800px（接近详情页阅读宽度）。点击切换：自动 → 1 → 2 → 3 → 4 列';
+		boardColumnsLastNotified = key;
+		vscode.postMessage({ type: 'boardColumnsState', setting, effective });
+	}
+
+	/** Title-row button click path: cycle auto → 1 → 2 → 3 → 4 and relay. */
+	function cycleBoardColumns() {
+		loadBoardColumnsSetting();
+		const idx = BOARD_COLUMNS_ORDER.indexOf(String(boardColumnsSetting));
+		boardColumnsSetting = BOARD_COLUMNS_ORDER[(idx + 1) % BOARD_COLUMNS_ORDER.length];
+		persistBoardColumnsSetting();
+		const board = timelineEl.querySelector(':scope > .router-board');
+		if (board) {
+			applyBoardColumns(board); // notifies with the live effective count
+			return;
+		}
+		boardColumnsLastNotified = '';
+		notifyBoardColumnsState(0);
 	}
 
 	// Wide windows: chat turns stay centered at --chat-content-max-width, but the
@@ -3030,7 +3052,6 @@
 			return;
 		}
 		board.querySelectorAll('.board-section-cards').forEach((host) => {
-			const section = host.closest('.board-section');
 			// 收集现有卡片（可能还在旧列容器里），按权威顺序排好。
 			const byKey = new Map();
 			host.querySelectorAll('.worker-card[data-worker-key]').forEach((el) => {
@@ -3077,7 +3098,6 @@
 			cards.forEach((card, i) => {
 				colEls[i % effCols].appendChild(card);
 			});
-			const groupW = effCols * trackW + (effCols - 1) * gap;
 			host.dataset.cols = String(effCols);
 			host.style.setProperty('--board-cols', String(effCols));
 			host.style.display = 'flex';
@@ -3085,17 +3105,15 @@
 			host.style.alignItems = 'flex-start';
 			host.style.gap = `${gap}px`;
 			host.style.removeProperty('grid-template-columns');
-			const title = section && section.querySelector(':scope > .board-section-title');
-			if (title) {
-				title.style.width = `${groupW}px`;
-				title.style.marginInline = 'auto';
-			}
 		});
-		updateBoardColumnsButton(board, effective);
+		notifyBoardColumnsState(effective);
 		scheduleFitDispatchResults();
 	}
 
-	function ensureBoardColumnsControl(board) {
+	// Observers only — the visible columns toggle moved to the workbench
+	// title row (zcodeAuxiliaryBarChrome); clicks arrive back here through
+	// the zcode.cycleBoardColumns command → 'cycleBoardColumns' message.
+	function ensureBoardLayoutWatchers(board) {
 		if (!board) {
 			return;
 		}
@@ -3139,23 +3157,6 @@
 			};
 			window.addEventListener('resize', board._boardColumnsWinResize);
 		}
-		if (board.querySelector(':scope > .board-columns-control')) {
-			return;
-		}
-		const btn = document.createElement('button');
-		btn.type = 'button';
-		btn.className = 'board-columns-control';
-		btn.textContent = '列数：自动';
-		btn.title = '宽屏时把首页任务卡片排成多列（Feed 瀑布流，每列独立竖排）。点击切换：自动 → 1 → 2 → 3 → 4 列';
-		btn.addEventListener('click', (e) => {
-			e.stopPropagation();
-			loadBoardColumnsSetting();
-			const idx = BOARD_COLUMNS_ORDER.indexOf(String(boardColumnsSetting));
-			boardColumnsSetting = BOARD_COLUMNS_ORDER[(idx + 1) % BOARD_COLUMNS_ORDER.length];
-			persistBoardColumnsSetting();
-			applyBoardColumns(board);
-		});
-		board.prepend(btn);
 	}
 
 	function ensureRouterBoard() {
@@ -3166,8 +3167,8 @@
 		timelineEl.replaceChildren();
 		board = document.createElement('div');
 		board.className = 'router-board';
-		for (const spec of BOARD_SECTIONS) {
-			board.appendChild(createBoardSection(spec.id, spec.title));
+		for (const sectionId of BOARD_SECTIONS) {
+			board.appendChild(createBoardSection(sectionId));
 		}
 		timelineEl.appendChild(board);
 		return board;
@@ -3182,12 +3183,12 @@
 		timelineEl.querySelectorAll(':scope > .turn').forEach((el) => el.remove());
 		const model = buildRouterBoardModel(items);
 		const board = ensureRouterBoard();
-		for (const spec of BOARD_SECTIONS) {
-			const section = board.querySelector(`:scope > .board-section[data-section="${spec.id}"]`);
+		for (const sectionId of BOARD_SECTIONS) {
+			const section = board.querySelector(`:scope > .board-section[data-section="${sectionId}"]`);
 			if (!section) {
 				continue;
 			}
-			syncBoardSection(section, spec.title, model.sections[spec.id] || []);
+			syncBoardSection(section, model.sections[sectionId] || []);
 		}
 		if (timelineStickBottom && !timelineHasSelection()) {
 			scrollTimelineToBottom();
@@ -3204,9 +3205,9 @@
 		timelineEl.replaceChildren();
 		const board = document.createElement('div');
 		board.className = 'router-board';
-		for (const spec of BOARD_SECTIONS) {
-			const section = createBoardSection(spec.id, spec.title);
-			syncBoardSection(section, spec.title, model.sections[spec.id] || []);
+		for (const sectionId of BOARD_SECTIONS) {
+			const section = createBoardSection(sectionId);
+			syncBoardSection(section, model.sections[sectionId] || []);
 			board.appendChild(section);
 		}
 		timelineEl.appendChild(board);
@@ -4351,6 +4352,8 @@
 			src,
 			choices.map((item) => `${item.id}|${item.thumb}|${item.label}`).join(','),
 			usedPicks.map((item) => `${item.id}|${item.thumb}`).join(','),
+			mascotMenuKey(chatMascot),
+			mascotTrashOpen ? 'trash-open' : '',
 		].join('::');
 		if (key === sceneKey) {
 			if (sceneBtn) {
@@ -4403,6 +4406,7 @@
 		remoteMount.id = 'unsplashMount';
 		sceneMenu.appendChild(remoteMount);
 		paintUnsplash();
+		renderMascotSection(sceneMenu);
 		sceneMenu.scrollTop = keptScroll;
 		if (sceneBtn) {
 			sceneBtn.setAttribute('aria-expanded', openMenu === 'scene' ? 'true' : 'false');
@@ -4471,6 +4475,544 @@
 		return btn;
 	}
 
+	function mascotMenuKey(mascot) {
+		if (!mascot) {
+			return 'none';
+		}
+		return JSON.stringify({
+			e: mascot.enabled,
+			s: mascot.sizePx ?? mascot.size,
+			l: (mascot.slots || []).map((slot) => (slot
+				? slot.id + '/' + (slot.persona || '') + (slot.pos ? `@${Math.round(slot.pos.x * 100)},${Math.round(slot.pos.y * 100)}` : '')
+				: '')),
+			c: (mascot.catalog || []).map((entry) => `${entry.id}:${entry.downloaded ? 1 : 0}:${entry.hidden ? 1 : 0}`),
+		});
+	}
+
+	/**
+	 * Mascot manager inside the background menu: a toggle, size chips, and
+	 * character chips. A chip click toggles that character in the queue;
+	 * picking an undownloaded one downloads it first. Queue order = chip
+	 * pick order, slot 0 sits closest to the composer.
+	 */
+	function renderMascotSection(menu) {
+		const mascot = chatMascot;
+		const title = document.createElement('div');
+		title.className = 'scene-section';
+		title.textContent = '精灵';
+		menu.appendChild(title);
+
+		const toggle = sceneTileButton('scene-key mascot-toggle' + (mascot && mascot.enabled ? ' on' : ''));
+		toggle.textContent = mascot && mascot.enabled ? '已开启（点击关闭）' : '显示输入框旁的小精灵';
+		toggle.title = '在输入框右侧显示会动的 Live2D 小家伙';
+		toggle.onclick = () => {
+			vscode.postMessage({ type: 'setMascot', patch: { enabled: !(mascot && mascot.enabled) } });
+		};
+		menu.appendChild(toggle);
+
+		if (!mascot) {
+			return;
+		}
+		const catalog = Array.isArray(mascot.catalog) ? mascot.catalog : [];
+		const slots = Array.isArray(mascot.slots) ? mascot.slots : [];
+		const queuedIds = slots.filter((slot) => slot && slot.id).map((slot) => slot.id);
+
+		const sizeRow = document.createElement('div');
+		sizeRow.className = 'mascot-size-row';
+		const sizeRange = mascot.sizeRange || {};
+		const sizeMin = typeof sizeRange.min === 'number' ? sizeRange.min : 160;
+		const sizeMax = typeof sizeRange.max === 'number' ? sizeRange.max : 1000;
+		const sizeStep = typeof sizeRange.step === 'number' ? sizeRange.step : 10;
+		const sizeNow = typeof mascot.sizePx === 'number' ? mascot.sizePx : 300;
+		const slider = document.createElement('input');
+		slider.type = 'range';
+		slider.min = String(sizeMin);
+		slider.max = String(sizeMax);
+		slider.step = String(sizeStep);
+		slider.value = String(sizeNow);
+		slider.className = 'mascot-size-slider';
+		slider.title = '拖动调整精灵大小';
+		const sizeLabel = document.createElement('span');
+		sizeLabel.className = 'mascot-size-value';
+		sizeLabel.textContent = `${sizeNow}px`;
+		// Live label + throttled apply, so dragging the slider resizes smoothly.
+		let sizeTimer = 0;
+		slider.oninput = () => {
+			const v = Math.round(Number(slider.value) || sizeNow);
+			sizeLabel.textContent = `${v}px`;
+			window.clearTimeout(sizeTimer);
+			sizeTimer = window.setTimeout(() => {
+				vscode.postMessage({ type: 'setMascot', patch: { sizePx: v } });
+			}, 120);
+		};
+		sizeRow.appendChild(slider);
+		sizeRow.appendChild(sizeLabel);
+		menu.appendChild(sizeRow);
+
+		// Current squad, one row per queued character with its OWN size slider.
+		// The global slider above only sets the default height for newcomers;
+		// models differ a lot in native size, so each keeps its own here.
+		const squadSlots = (mascot.slots || []).filter((slot) => slot && slot.id);
+		const catById = new Map(catalog.map((entry) => [entry.id, entry]));
+		if (squadSlots.length) {
+			const squadLabel = document.createElement('div');
+			squadLabel.className = 'mascot-section-label';
+			squadLabel.textContent = '当前小队（大小和人设按角色记）';
+			menu.appendChild(squadLabel);
+			const ttsNow = window.ZCodeMascotTts ? window.ZCodeMascotTts.state : null;
+			if (ttsNow && ttsNow.supported) {
+				const ttsBtn = document.createElement('button');
+				ttsBtn.type = 'button';
+				ttsBtn.className = 'mascot-tts-toggle';
+				if (ttsNow.enabled) { ttsBtn.classList.add('is-on'); }
+				ttsBtn.textContent = ttsNow.enabled ? '语音：开' : '语音：关';
+				ttsBtn.title = '本地语音朗读台词（Qwen3-TTS 克隆音色 / macOS 系统语音；配置 zcode.mascot.tts.*）';
+				ttsBtn.onclick = () => {
+					vscode.postMessage({ type: 'mascotTtsConfig', patch: { enabled: !ttsNow.enabled } });
+				};
+				menu.appendChild(ttsBtn);
+				if (ttsNow.enabled) {
+					const cacheBtn = document.createElement('button');
+					cacheBtn.type = 'button';
+					cacheBtn.className = 'mascot-tts-toggle';
+					cacheBtn.textContent = '语音缓存';
+					cacheBtn.title = '管理已合成的语音缓存（试听 / 删除 / 清空）';
+					cacheBtn.onclick = () => { openMascotTtsCachePanel(); };
+					menu.appendChild(cacheBtn);
+				}
+			}
+			const personaList = Array.isArray(mascot.personas) ? mascot.personas : [];
+			squadSlots.forEach((slot) => {
+				const entry = catById.get(slot.id) || { id: slot.id, label: slot.label || slot.id };
+				const row = document.createElement('div');
+				row.className = 'mascot-squad-row';
+				const top = document.createElement('div');
+				top.className = 'mascot-squad-top';
+				const thumb = document.createElement('span');
+				thumb.className = 'mascot-squad-thumb';
+				if (entry.preview) {
+					const img = document.createElement('img');
+					img.alt = '';
+					img.src = entry.preview;
+					img.onerror = () => { img.remove(); };
+					thumb.appendChild(img);
+				} else {
+					thumb.textContent = (entry.label || '?').slice(0, 1);
+				}
+				top.appendChild(thumb);
+				const name = document.createElement('span');
+				name.className = 'mascot-squad-name';
+				name.textContent = entry.label || slot.id;
+				name.title = entry.source || '';
+				top.appendChild(name);
+				const kick = document.createElement('span');
+				kick.className = 'mascot-squad-kick';
+				kick.setAttribute('role', 'button');
+				kick.title = '移出小队';
+				kick.textContent = '✕';
+				kick.onclick = (event) => {
+					event.stopPropagation();
+					event.preventDefault();
+					vscode.postMessage({ type: 'setMascot', patch: { removeId: slot.id } });
+				};
+				top.appendChild(kick);
+				row.appendChild(top);
+				const sizeLine = document.createElement('div');
+				sizeLine.className = 'mascot-squad-size';
+				const range = document.createElement('input');
+				range.type = 'range';
+				range.className = 'mascot-squad-range';
+				const bounds = mascot.sizeRange || {};
+				range.min = String(bounds.min ?? 160);
+				range.max = String(bounds.max ?? 480);
+				range.step = String(bounds.step ?? 8);
+				const own = typeof slot.size === 'number' && slot.size > 0 ? slot.size : sizeNow;
+				range.value = String(Math.round(own));
+				const px = document.createElement('span');
+				px.className = 'mascot-squad-px';
+				px.textContent = `${Math.round(own)}px`;
+				// Debounced: the label tracks the thumb live, the model resizes
+				// shortly after the drag settles (one state round-trip).
+				let sizeTimer = null;
+				range.addEventListener('input', () => {
+					px.textContent = `${range.value}px`;
+					if (sizeTimer) { clearTimeout(sizeTimer); }
+					sizeTimer = setTimeout(() => {
+						vscode.postMessage({ type: 'setMascot', patch: { setSize: { id: slot.id, sizePx: Number(range.value) } } });
+					}, 200);
+				});
+				sizeLine.appendChild(range);
+				sizeLine.appendChild(px);
+				row.appendChild(sizeLine);
+				if (personaList.length) {
+					const personaRow = document.createElement('label');
+					personaRow.className = 'mascot-squad-persona';
+					const personaTag = document.createElement('span');
+					personaTag.textContent = '人设';
+					const select = document.createElement('select');
+					select.className = 'mascot-squad-select';
+					const currentId = slot.persona || personaList[0].id;
+					let currentHint = '';
+					const groups = [];
+					personaList.forEach((persona) => {
+						const groupName = persona.group || '性格';
+						let group = groups.find((item) => item.name === groupName);
+						if (!group) {
+							group = { name: groupName, items: [] };
+							groups.push(group);
+						}
+						group.items.push(persona);
+						if (persona.id === currentId) {
+							currentHint = persona.hint || '';
+						}
+					});
+					groups.forEach((group) => {
+						const optgroup = document.createElement('optgroup');
+						optgroup.label = group.name;
+						group.items.forEach((persona) => {
+							const opt = document.createElement('option');
+							opt.value = persona.id;
+							opt.textContent = persona.label;
+							opt.title = persona.hint || '';
+							if (persona.id === currentId) {
+								opt.selected = true;
+							}
+							optgroup.appendChild(opt);
+						});
+						select.appendChild(optgroup);
+					});
+					select.title = currentHint;
+					select.addEventListener('change', () => {
+						const picked = personaList.find((persona) => persona.id === select.value);
+						select.title = picked && picked.hint ? picked.hint : '';
+						const hintEl = row.querySelector('.mascot-squad-hint');
+						if (hintEl) {
+							hintEl.textContent = select.title;
+						}
+						vscode.postMessage({
+							type: 'setMascot',
+							patch: { setPersona: { id: slot.id, persona: select.value } },
+						});
+					});
+					personaRow.appendChild(personaTag);
+					personaRow.appendChild(select);
+					row.appendChild(personaRow);
+					const hint = document.createElement('div');
+					hint.className = 'mascot-squad-hint';
+					hint.textContent = currentHint;
+					row.appendChild(hint);
+					const ttsSlot = window.ZCodeMascotTts ? window.ZCodeMascotTts.state : null;
+					if (ttsSlot && ttsSlot.supported) {
+						const voiceRow = document.createElement('label');
+						voiceRow.className = 'mascot-squad-persona mascot-squad-voice';
+						if (!ttsSlot.enabled) { voiceRow.style.display = 'none'; }
+						const voiceTag = document.createElement('span');
+						voiceTag.textContent = '语音';
+						const voiceSel = document.createElement('select');
+						voiceSel.className = 'mascot-tts-voice';
+						voiceSel.setAttribute('data-id', slot.id);
+						voiceSel.title = '这个角色朗读时用哪个语音';
+						window.buildMascotVoiceOptions(voiceSel, ttsSlot, slot.id);
+						voiceSel.value = ttsSlot.voiceMap[slot.id] || '';
+						voiceSel.onchange = () => {
+							if (voiceSel.value === '__add_voice__') {
+								voiceSel.value = ttsSlot.voiceMap[slot.id] || '';
+								vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'addVoice' } });
+								return;
+							}
+							vscode.postMessage({ type: 'mascotTtsConfig', patch: { voice: { id: slot.id, voice: voiceSel.value || null } } });
+						};
+						voiceRow.appendChild(voiceTag);
+						voiceRow.appendChild(voiceSel);
+						row.appendChild(voiceRow);
+					}
+				}
+				menu.appendChild(row);
+			});
+		}
+
+		// Recently used: everything the user has queued before, one click to
+		// re-summon. ✕ here only edits history, the roster below is untouched.
+		const recentEntries = (mascot.recent || []).filter((entry) => {
+			const full = catById.get(entry.id);
+			return !full || !full.hidden;
+		});
+		if (recentEntries.length) {
+			const recentLabel = document.createElement('div');
+			recentLabel.className = 'mascot-section-label';
+			recentLabel.textContent = '最近使用';
+			menu.appendChild(recentLabel);
+			const strip = document.createElement('div');
+			strip.className = 'mascot-roster recent';
+			const queuedIds = squadSlots.map((slot) => slot.id);
+			recentEntries.forEach((entry) => {
+				const full = catById.get(entry.id) || entry;
+				const queued = queuedIds.indexOf(entry.id) >= 0;
+				const card = document.createElement('button');
+				card.type = 'button';
+				card.className = 'mascot-card recent' + (queued ? ' selected' : '');
+				const thumb = document.createElement('span');
+				thumb.className = 'mascot-card-thumb';
+				if (full.preview) {
+					const img = document.createElement('img');
+					img.alt = '';
+					img.src = full.preview;
+					img.onerror = () => { img.remove(); };
+					thumb.appendChild(img);
+				} else {
+					thumb.textContent = (full.label || '?').slice(0, 1);
+				}
+				if (queued) {
+					const on = document.createElement('b');
+					on.className = 'mascot-card-on';
+					on.textContent = '●';
+					thumb.appendChild(on);
+				}
+				card.appendChild(thumb);
+				const name = document.createElement('span');
+				name.className = 'mascot-card-name';
+				name.textContent = full.label || entry.id;
+				card.appendChild(name);
+				card.title = queued ? '点击移出小队' : '点击加入小队';
+				card.onclick = () => {
+					if (queued) {
+						vscode.postMessage({ type: 'setMascot', patch: { removeId: entry.id } });
+						return;
+					}
+					if (!full.downloaded) {
+						vscode.postMessage({ type: 'downloadMascot', id: entry.id });
+					}
+					vscode.postMessage({ type: 'setMascot', patch: { appendId: entry.id } });
+				};
+				const forget = document.createElement('span');
+				forget.className = 'mascot-card-forget';
+				forget.setAttribute('role', 'button');
+				forget.title = '从最近使用中移除';
+				forget.textContent = '✕';
+				forget.onclick = (event) => {
+					event.stopPropagation();
+					event.preventDefault();
+					vscode.postMessage({ type: 'setMascot', patch: { forgetId: entry.id } });
+				};
+				card.appendChild(forget);
+				strip.appendChild(card);
+			});
+			menu.appendChild(strip);
+		}
+
+		const roster = document.createElement('div');
+		roster.className = 'mascot-roster';
+		mascotCardRefs = new Map();
+		const hiddenOnes = catalog.filter((entry) => entry.hidden);
+		catalog.filter((entry) => !entry.hidden).forEach((entry) => {
+			const queued = queuedIds.indexOf(entry.id) >= 0;
+			const downloading = !!entry.downloading;
+			const card = document.createElement('button');
+			card.type = 'button';
+			card.className = 'mascot-card' + (queued ? ' selected' : '') + (downloading ? ' busy' : '');
+
+			// Thumbnail: shipped render snapshot when we have one, initial
+			// letter tile as fallback so every model stays recognizable.
+			const thumb = document.createElement('span');
+			thumb.className = 'mascot-card-thumb';
+			if (entry.preview) {
+				const img = document.createElement('img');
+				img.alt = '';
+				img.src = entry.preview;
+				img.onerror = () => { img.remove(); };
+				thumb.appendChild(img);
+			} else {
+				thumb.textContent = (entry.label || '?').slice(0, 1);
+			}
+			if (downloading) {
+				const bar = document.createElement('i');
+				bar.className = 'mascot-card-progress';
+				bar.style.width = `${Math.max(4, Math.round((entry.progress || 0) * 100))}%`;
+				thumb.appendChild(bar);
+			} else if (!entry.downloaded && !queued) {
+				const dl = document.createElement('b');
+				dl.className = 'mascot-card-dl';
+				dl.textContent = '↓';
+				thumb.appendChild(dl);
+			} else if (queued) {
+				const on = document.createElement('b');
+				on.className = 'mascot-card-on';
+				on.textContent = '●';
+				thumb.appendChild(on);
+			}
+			card.appendChild(thumb);
+
+			const name = document.createElement('span');
+			name.className = 'mascot-card-name';
+			name.textContent = entry.label;
+			card.appendChild(name);
+
+			// Trash bin entry point: tuck ugly/broken models away without
+			// deleting the downloaded files (restorable from the bin).
+			const hide = document.createElement('span');
+			hide.className = 'mascot-card-hide';
+			hide.setAttribute('role', 'button');
+			hide.title = '收进垃圾篓（不再默认展示，可随时恢复）';
+			hide.textContent = '✕';
+			hide.onclick = (event) => {
+				event.stopPropagation();
+				event.preventDefault();
+				vscode.postMessage({ type: 'setMascot', patch: { hideId: entry.id } });
+			};
+			card.appendChild(hide);
+
+			const origin = entry.note || 'Live2D 官方样例';
+			card.title = queued
+				? `${entry.source}（${origin}）— 点击移出队列`
+				: entry.downloaded
+					? `${entry.source}（${origin}）— 点击加入队列`
+					: `${entry.source}（${origin}）· 约 ${entry.sizeMB}MB — 点击下载并加入队列`;
+			card.disabled = downloading || (!queued && queuedIds.length >= 3);
+			card.onclick = () => {
+				if (queued) {
+					// Id-based removal: slot indices in the webview (holes
+					// filtered out) do not line up with host-side slots.
+					vscode.postMessage({ type: 'setMascot', patch: { removeId: entry.id } });
+					return;
+				}
+				if (!entry.downloaded) {
+					vscode.postMessage({ type: 'downloadMascot', id: entry.id });
+				}
+				vscode.postMessage({ type: 'setMascot', patch: { appendId: entry.id } });
+			};
+			roster.appendChild(card);
+			mascotCardRefs.set(entry.id, { card, thumb });
+		});
+		menu.appendChild(roster);
+		if (hiddenOnes.length) {
+			appendMascotTrash(menu, hiddenOnes);
+		}
+
+		const note = document.createElement('div');
+		note.className = 'scene-note';
+		note.textContent = mascot.enabled
+			? '点角色加入或移出小队（最多三个）；「当前小队」里可单独调每个角色的大小（悬停角色上滚轮也行）；按住可拖到任意位置，右键复位；点它会做动作说话。'
+			: '开启后，小家伙会蹲在输入框右边，会动、会看你、会搭话。';
+		menu.appendChild(note);
+	}
+
+	/** Trash bin: hidden models listed under a collapsed toggle. Clicking a
+	 *  card restores it to the default roster. */
+	function appendMascotTrash(menu, hiddenOnes) {
+		const toggle = document.createElement('button');
+		toggle.type = 'button';
+		toggle.className = 'mascot-trash-toggle' + (mascotTrashOpen ? ' open' : '');
+		toggle.textContent = mascotTrashOpen
+			? `垃圾篓（${hiddenOnes.length}）— 点击收起`
+			: `垃圾篓（${hiddenOnes.length}）`;
+		toggle.title = '被你收起来的模型放在这里，点击卡片可恢复展示';
+		toggle.onclick = () => {
+			mascotTrashOpen = !mascotTrashOpen;
+			sceneKey = '';
+			if (state) {
+				renderScene(state.scene);
+			}
+		};
+		menu.appendChild(toggle);
+		if (!mascotTrashOpen) {
+			return;
+		}
+		const bin = document.createElement('div');
+		bin.className = 'mascot-roster trash';
+		hiddenOnes.forEach((entry) => {
+			const card = document.createElement('button');
+			card.type = 'button';
+			card.className = 'mascot-card trashed';
+			const thumb = document.createElement('span');
+			thumb.className = 'mascot-card-thumb';
+			if (entry.preview) {
+				const img = document.createElement('img');
+				img.alt = '';
+				img.src = entry.preview;
+				img.onerror = () => { img.remove(); };
+				thumb.appendChild(img);
+			} else {
+				thumb.textContent = (entry.label || '?').slice(0, 1);
+			}
+			card.appendChild(thumb);
+			const name = document.createElement('span');
+			name.className = 'mascot-card-name';
+			name.textContent = `↩ ${entry.label}`;
+			card.appendChild(name);
+			card.title = `${entry.source} — 点击恢复展示`;
+			card.onclick = () => {
+				vscode.postMessage({ type: 'setMascot', patch: { unhideId: entry.id } });
+			};
+			bin.appendChild(card);
+		});
+		menu.appendChild(bin);
+	}
+
+	/** Structural mascot signature: everything the roster lays out positions
+	 *  for. Downloading/progress flags are deliberately excluded — they change
+	 *  every few files and must never trigger a rebuild (scroll preservation),
+	 *  the in-place patcher covers their visuals. */
+	function mascotStructureSig(m) {
+		if (!m) {
+			return '';
+		}
+		const slots = (m.slots || []).map((slot) => (slot && slot.id) || '-').join(',');
+		const cat = (m.catalog || []).map((entry) => `${entry.id}:${entry.downloaded ? 1 : 0}${entry.hidden ? 'h' : ''}`).join(',');
+		const recent = (m.recent || []).map((entry) => entry.id).join(',');
+		return `${m.enabled ? 1 : 0}|${slots}|${cat}|${recent}`;
+	}
+
+	/** Patches roster cards for download progress/queue state without a DOM
+	 *  rebuild, so the grid keeps its scroll position while downloading. */
+	function updateMascotRosterLive() {
+		if (!mascotCardRefs.size || !chatMascot) {
+			return;
+		}
+		const slots = Array.isArray(chatMascot.slots) ? chatMascot.slots : [];
+		const queuedIds = slots.filter((slot) => slot && slot.id).map((slot) => slot.id);
+		const byId = new Map((chatMascot.catalog || []).map((entry) => [entry.id, entry]));
+		mascotCardRefs.forEach((ref, id) => {
+			const entry = byId.get(id);
+			if (!entry || !ref.card || !ref.thumb) {
+				return;
+			}
+			const queued = queuedIds.indexOf(id) >= 0;
+			ref.card.classList.toggle('selected', queued);
+			ref.card.classList.toggle('busy', !!entry.downloading);
+			ref.card.disabled = !!entry.downloading || (!queued && queuedIds.length >= 3);
+			const badge = ref.thumb.querySelector('.mascot-card-progress, .mascot-card-dl, .mascot-card-on');
+			if (badge) {
+				badge.remove();
+			}
+			if (entry.downloading) {
+				const bar = document.createElement('i');
+				bar.className = 'mascot-card-progress';
+				bar.style.width = `${Math.max(4, Math.round((entry.progress || 0) * 100))}%`;
+				ref.thumb.appendChild(bar);
+			} else if (!entry.downloaded && !queued) {
+				const dl = document.createElement('b');
+				dl.className = 'mascot-card-dl';
+				dl.textContent = '↓';
+				ref.thumb.appendChild(dl);
+			} else if (queued) {
+				const on = document.createElement('b');
+				on.className = 'mascot-card-on';
+				on.textContent = '●';
+				ref.thumb.appendChild(on);
+			}
+		});
+	}
+
+	/** Task lifecycle feedback for the mascots: dispatch when a run starts,
+	 * complete when it ends. Purely decorative — never throws into render. */
+	function notifyMascots(kind) {
+		try {
+			if (window.ZCodeMascots && typeof window.ZCodeMascots.react === 'function') {
+				window.ZCodeMascots.react(kind);
+			}
+		} catch (e) { /* ignore */ }
+	}
+
 	function render(next) {
 		const wasBusy = busy;
 		state = next;
@@ -4479,6 +5021,9 @@
 		setBusy(!!next.busy);
 		if (next.busy && !wasBusy) {
 			pinTimelineToBottom();
+			notifyMascots('dispatch');
+		} else if (!next.busy && wasBusy) {
+			notifyMascots('complete');
 		}
 		if (next.clearDraft) {
 			inputEl.value = '';
@@ -4562,7 +5107,168 @@
 		historyOpen = !!next.historyOpen;
 		document.body.classList.toggle('router-session', !!next.isRouter);
 		document.body.classList.toggle('worker-session', !next.isRouter && !!next.isWorker);
+		chatMascot = next.mascot || null;
+		// Mascot state must be in place BEFORE renderScene — the roster inside
+		// the scene menu reads it. Structural changes (trash/queue/recent/
+		// download finished) invalidate the scene key so the menu rebuilds;
+		// progress-only ticks fall through to the in-place patch below.
+		const mascotSig = mascotStructureSig(chatMascot);
+		if (mascotSig !== lastMascotSig) {
+			lastMascotSig = mascotSig;
+			sceneKey = '';
+		}
 		renderScene(next.scene);
+		// Download progress changes every few files; a full roster rebuild on
+		// each tick resets scrolling mid-browse. Patch the live cards instead.
+		updateMascotRosterLive();
+		if (window.ZCodeMascots) {
+			window.ZCodeMascots.apply(chatMascot);
+			// Speech, drag-to-place, and right-click-reset report back through these hooks.
+			window.ZCodeMascots.onSpeak = (voice) => vscode.postMessage({ type: 'mascotSpeak', voice });
+if (window.ZCodeMascotTts) {
+	window.ZCodeMascotTts._send = (msg) => vscode.postMessage(msg);
+	vscode.postMessage({ type: 'mascotTtsConfig' });
+}
+window.ZCodeMascots.onTtsState = () => {
+	if (typeof window.syncMascotTtsUI === 'function') { window.syncMascotTtsUI(); }
+};
+/** 角色语音下拉的选项构造：自动 / 角色原声 / 音色池（克隆）/ 添加音色文件。 */
+window.buildMascotVoiceOptions = (sel, tts, id) => {
+	sel.textContent = '';
+	const auto = document.createElement('option');
+	auto.value = '';
+	auto.textContent = '自动';
+	sel.appendChild(auto);
+	const native = (tts.nativeVoices && tts.nativeVoices[id]) || [];
+	if (native.length) {
+		const nativeGroup = document.createElement('optgroup');
+		nativeGroup.label = '角色原声';
+		native.forEach((voice) => {
+			const opt = document.createElement('option');
+			opt.value = voice.value;
+			opt.textContent = voice.name;
+			nativeGroup.appendChild(opt);
+		});
+		sel.appendChild(nativeGroup);
+	}
+	const poolGroup = document.createElement('optgroup');
+	poolGroup.label = '音色池（克隆）';
+	(tts.voices || []).forEach((voice) => {
+		const opt = document.createElement('option');
+		opt.value = voice.value || voice.name;
+		opt.textContent = `${voice.name}（${voice.locale}）`;
+		poolGroup.appendChild(opt);
+	});
+	sel.appendChild(poolGroup);
+	const addOpt = document.createElement('option');
+	addOpt.value = '__add_voice__';
+	addOpt.textContent = '＋ 添加音色文件…';
+	sel.appendChild(addOpt);
+};
+
+/** 语音缓存管理浮层：试听 / 单删 / 清空（磁盘缓存，跨重启保留）。 */
+let ttsCachePanel = null;
+function openMascotTtsCachePanel() {
+	closeMascotTtsCachePanel();
+	const panel = document.createElement('div');
+	panel.className = 'mascot-tts-cache-panel';
+	const head = document.createElement('div');
+	head.className = 'mascot-tts-cache-head';
+	const title = document.createElement('span');
+	title.textContent = '语音缓存';
+	const clear = document.createElement('button');
+	clear.type = 'button';
+	clear.className = 'danger';
+	clear.textContent = '清空全部';
+	clear.onclick = () => vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cacheClear' } });
+	const close = document.createElement('button');
+	close.type = 'button';
+	close.textContent = '✕';
+	close.onclick = () => closeMascotTtsCachePanel();
+	head.appendChild(title);
+	head.appendChild(clear);
+	head.appendChild(close);
+	const list = document.createElement('div');
+	list.className = 'mascot-tts-cache-list';
+	list.textContent = '读取中…';
+	const hint = document.createElement('div');
+	hint.className = 'mascot-tts-cache-hint';
+	panel.appendChild(head);
+	panel.appendChild(list);
+	panel.appendChild(hint);
+	document.body.appendChild(panel);
+	ttsCachePanel = panel;
+	vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cacheList' } });
+}
+function closeMascotTtsCachePanel() {
+	if (ttsCachePanel) { ttsCachePanel.remove(); ttsCachePanel = null; }
+}
+function applyMascotTtsCache(msg) {
+	if (!ttsCachePanel) { return; }
+	const list = ttsCachePanel.querySelector('.mascot-tts-cache-list');
+	const hint = ttsCachePanel.querySelector('.mascot-tts-cache-hint');
+	if (!list) { return; }
+	list.textContent = '';
+	const entries = Array.isArray(msg.entries) ? msg.entries : [];
+	if (hint) {
+		hint.textContent = entries.length
+			? `${entries.length} 条 · ${msg.dir || ''}`
+			: `暂无缓存 · ${msg.dir || ''}`;
+	}
+	if (!entries.length) {
+		list.textContent = '暂无缓存——角色开口说话后会自动存档在这里。';
+		return;
+	}
+	entries.forEach((entry) => {
+		const row = document.createElement('div');
+		row.className = 'mascot-tts-cache-row';
+		const text = document.createElement('span');
+		text.className = 'mascot-tts-cache-text';
+		text.textContent = entry.text;
+		text.title = `${entry.voice || entry.refPath || ''} · ${entry.seconds || 0}s · ${Math.max(1, Math.round((entry.bytes || 0) / 1024))}KB`;
+		const play = document.createElement('button');
+		play.type = 'button';
+		play.textContent = '▶';
+		play.title = '试听';
+		play.onclick = () => vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cachePlay', key: entry.key } });
+		const del = document.createElement('button');
+		del.type = 'button';
+		del.textContent = '✕';
+		del.title = '删除这条';
+		del.onclick = () => vscode.postMessage({ type: 'mascotTtsConfig', patch: { action: 'cacheDelete', key: entry.key } });
+		row.appendChild(text);
+		row.appendChild(play);
+		row.appendChild(del);
+		list.appendChild(row);
+	});
+}
+
+/** 语音开关和每个角色的语音下拉，随 mascotTtsState 到达而刷新。 */
+window.syncMascotTtsUI = () => {
+	const tts = window.ZCodeMascotTts ? window.ZCodeMascotTts.state : null;
+	if (!tts) { return; }
+	document.querySelectorAll('.mascot-tts-toggle').forEach((btn) => {
+		btn.textContent = tts.enabled ? '语音：开' : '语音：关';
+		btn.classList.toggle('is-on', tts.enabled);
+	});
+	document.querySelectorAll('select.mascot-tts-voice').forEach((sel) => {
+		const id = sel.getAttribute('data-id') || '';
+		const current = tts.voiceMap[id] || '';
+		const native = (tts.nativeVoices && tts.nativeVoices[id]) || [];
+		if (sel.getAttribute('data-count') !== String(tts.voices.length + native.length + 1)) {
+			sel.setAttribute('data-count', String(tts.voices.length + native.length + 1));
+			window.buildMascotVoiceOptions(sel, tts, id);
+		}
+		sel.value = current;
+		if (sel.value !== current) { sel.value = ''; }
+		const row = sel.closest('.mascot-squad-voice');
+		if (row) { row.style.display = tts.enabled ? '' : 'none'; }
+	});
+};
+			window.ZCodeMascots.onMove = (move) => vscode.postMessage({ type: 'setMascot', patch: { move } });
+			window.ZCodeMascots.onReset = (id) => vscode.postMessage({ type: 'setMascot', patch: { resetPos: id } });
+			window.ZCodeMascots.onSize = (id, sizePx) => vscode.postMessage({ type: 'setMascot', patch: { setSize: { id, sizePx } } });
+		}
 		if (inputEl) {
 			inputEl.placeholder = next.isRouter
 				? (next.dispatchTarget
@@ -4867,6 +5573,82 @@
 			}
 		}
 	}
+	// Right-click page menu. Webview devtools are not exposed by this build,
+	// and mascot/background failures need a way to be inspected without them.
+	// Editable fields keep the native cut/copy/paste context menu.
+	let webviewMenuEl = null;
+	const closeWebviewMenu = () => {
+		if (webviewMenuEl) {
+			webviewMenuEl.remove();
+			webviewMenuEl = null;
+		}
+	};
+	// alert() is blocked in webviews without allow-modals; render in-page instead.
+	const showMascotStatusPanel = (status) => {
+		const prev = document.querySelector('.mascot-status-panel');
+		if (prev) prev.remove();
+		const panel = document.createElement('div');
+		panel.className = 'mascot-status-panel';
+		const close = document.createElement('button');
+		close.type = 'button';
+		close.className = 'mascot-status-close';
+		close.textContent = '关闭';
+		close.addEventListener('click', () => panel.remove());
+		const pre = document.createElement('pre');
+		pre.textContent = JSON.stringify(status, null, 2);
+		panel.appendChild(close);
+		panel.appendChild(pre);
+		document.body.appendChild(panel);
+	};
+	document.addEventListener('contextmenu', (event) => {
+		const target = event.target instanceof Element ? event.target : null;
+		if (target && target.closest('textarea, input, select, [contenteditable="true"]')) {
+			return;
+		}
+		event.preventDefault();
+		closeWebviewMenu();
+		const menu = document.createElement('div');
+		menu.className = 'webview-context-menu';
+		const items = [
+			{ label: '打开开发者工具', run: () => vscode.postMessage({ type: 'openDevTools' }) },
+			{ label: '重新加载聊天页面', run: () => location.reload() },
+			{
+				label: '精灵状态',
+				run: () => {
+					const status = window.ZCodeMascots && window.ZCodeMascots.status
+						? window.ZCodeMascots.status()
+						: { error: 'ZCodeMascots 未加载（mascotView.js 没有执行）' };
+					showMascotStatusPanel(status);
+				},
+			},
+		];
+		for (const item of items) {
+			const btn = document.createElement('button');
+			btn.type = 'button';
+			btn.className = 'webview-context-item';
+			btn.textContent = item.label;
+			btn.addEventListener('click', () => {
+				closeWebviewMenu();
+				item.run();
+			});
+			menu.appendChild(btn);
+		}
+		menu.style.left = Math.max(4, Math.min(event.clientX, window.innerWidth - 210)) + 'px';
+		menu.style.top = Math.max(4, Math.min(event.clientY, window.innerHeight - 130)) + 'px';
+		document.body.appendChild(menu);
+		webviewMenuEl = menu;
+	});
+	document.addEventListener('click', (event) => {
+		if (webviewMenuEl && event.target instanceof Node && !webviewMenuEl.contains(event.target)) {
+			closeWebviewMenu();
+		}
+	}, true);
+	document.addEventListener('keydown', (event) => {
+		if (event.key === 'Escape') {
+			closeWebviewMenu();
+		}
+	});
+
 	document.addEventListener('paste', (e) => {
 		const items = e.clipboardData && e.clipboardData.items;
 		if (!items) return;
@@ -5112,6 +5894,26 @@
 	window.addEventListener('message', (event) => {
 		const data = event.data;
 		if (!data) return;
+		if (data.type === 'mascotLine' && window.ZCodeMascots && typeof window.ZCodeMascots.hear === 'function') {
+			window.ZCodeMascots.hear(data.seq, data.line, !!data.skipped);
+		}
+		if (data.type === 'mascotTtsState' && window.ZCodeMascotTts) {
+			window.ZCodeMascotTts.onState(data);
+		}
+		if (data.type === 'mascotTtsAudio' && window.ZCodeMascotTts) {
+			window.ZCodeMascotTts.onAudio(data);
+		}
+		if (data.type === 'mascotTtsCacheState') {
+			applyMascotTtsCache(data);
+		}
+		if (data.type === 'mascotTtsCacheAudio' && data.base64) {
+			try {
+				const audio = new Audio('data:' + (data.mime || 'audio/wav') + ';base64,' + data.base64);
+				audio.volume = 0.9;
+				const played = audio.play();
+				if (played && played.catch) { played.catch(() => undefined); }
+			} catch (err) { /* 试听失败忽略 */ }
+		}
 		if (data.type === 'state') {
 			render(data);
 			syncDonePill();
@@ -5123,6 +5925,7 @@
 			showDonePill(data.sessionId, data.title);
 		}
 		if (data.type === 'dispatchLive') applyDispatchLive(data.sessionId, data.text);
+		if (data.type === 'cycleBoardColumns') cycleBoardColumns();
 		if (data.type === 'skillMatches') {
 			const query = currentSkillQuery();
 			if (!query || query.query !== (data.query || '')) return;

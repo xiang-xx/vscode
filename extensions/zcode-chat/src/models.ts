@@ -4,6 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as vscode from 'vscode';
+import { deepseekCatalog } from './deepseekProvider';
 import type { ProviderMode } from './providers';
 
 /**
@@ -71,7 +72,13 @@ export const REASONING_LABELS: Record<string, string> = {
 };
 
 export function modelsForProvider(provider: ProviderMode): readonly ZCodeModelOption[] {
-	return provider === 'bigmodel' ? BIGMODEL_MODELS : START_PLAN_MODELS;
+	if (provider === 'bigmodel') {
+		return BIGMODEL_MODELS;
+	}
+	if (provider === 'deepseek') {
+		return deepseekCatalog();
+	}
+	return START_PLAN_MODELS;
 }
 
 export function findModel(provider: ProviderMode, modelId: string | undefined): ZCodeModelOption {

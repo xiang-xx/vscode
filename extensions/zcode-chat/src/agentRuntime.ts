@@ -41,6 +41,18 @@ import { cachedPluginToolDefs, callPluginTool, refreshPluginTools } from './chat
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 import { normalizeToolArgs, normalizeToolName } from './toolNormalize';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
+import {
+	applyDeepseekStreamEvent,
+	buildDeepseekBody,
+	createDeepseekAccumulator,
+	deepseekHeaders,
+	deepseekHttpError,
+	deepseekMessagesUrl,
+	finishDeepseekTurn,
+	parseDeepseekCompletion,
+	resolveDeepseekApiKey,
+	type DeepseekParsedTurn,
+} from './deepseekProvider';
 
 /** Match ZCode Read default line budget. */
 const READ_DEFAULT_MAX_LINES = 2_000;
@@ -56,7 +68,7 @@ const BIGMODEL_CODING_CHAT_URL = 'https://open.bigmodel.cn/api/coding/paas/v4/ch
 const START_PLAN_ANTHROPIC_URL = 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages';
 const MAX_TOOL_TURNS_FALLBACK = 96;
 
-type ProviderApiKind = 'openai' | 'anthropic';
+type ProviderApiKind = 'openai' | 'anthropic' | 'deepseek';
 
 interface ToolCall {
 	id: string;
@@ -71,6 +83,8 @@ interface ChatCompletionMessage {
 	tool_call_id?: string;
 	name?: string;
 	reasoning_content?: string | null;
+	/** DeepSeek thinking blocks, signatures included, replayed on the next tool turn. */
+	reasoning_blocks?: Array<{ text: string; signature?: string }>;
 }
 
 export type AgentProgressEvent =
@@ -91,6 +105,7 @@ export type AgentProgressEvent =
 		added?: number;
 		removed?: number;
 	}
+	| { type: 'usage'; totalTokens: number }
 	| { type: 'todos'; todos: TodoItem[] }
 	| {
 		type: 'file_change';
@@ -511,7 +526,13 @@ export async function runWorkspaceAgent(options: {
 			});
 		}
 
-		let choice: { content: string; reasoning: string; tool_calls?: ToolCall[] };
+		let choice: {
+			content: string;
+			reasoning: string;
+			reasoningBlocks?: Array<{ text: string; signature?: string }>;
+			tool_calls?: ToolCall[];
+			usageTokens?: number;
+		};
 		try {
 			choice = await streamOrCompleteChat({
 				url: auth.url,
@@ -535,12 +556,16 @@ export async function runWorkspaceAgent(options: {
 		if (choice.reasoning?.trim()) {
 			emit({ type: 'reasoning', text: choice.reasoning.trim(), done: true });
 		}
+		if (choice.usageTokens && choice.usageTokens > 0) {
+			emit({ type: 'usage', totalTokens: choice.usageTokens });
+		}
 
 		apiMessages.push({
 			role: 'assistant',
 			content: choice.content ?? null,
 			tool_calls: choice.tool_calls,
 			...(choice.reasoning ? { reasoning_content: choice.reasoning } : {}),
+			...(choice.reasoningBlocks?.length ? { reasoning_blocks: choice.reasoningBlocks } : {}),
 		});
 
 		const toolCalls = choice.tool_calls ?? [];
@@ -827,6 +852,16 @@ async function executeAskUserQuestion(
 }
 
 async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKey: string; api: ProviderApiKind }> {
+	if (provider === 'deepseek') {
+		const apiKey = await resolveDeepseekApiKey();
+		if (!apiKey) {
+			throw new Error(
+				'DeepSeek 需要 API Key。在命令面板运行 “ZCode: Set DeepSeek API Key”，或设置环境变量 DEEPSEEK_API_KEY。',
+			);
+		}
+		return { url: deepseekMessagesUrl(), apiKey, api: 'deepseek' };
+	}
+
 	if (provider === 'startPlan') {
 		try {
 			const jwt = getAuthService().getSession()?.zcodeJwtToken?.trim();
@@ -859,6 +894,11 @@ function annotateProviderError(message: string, provider: ProviderMode): Error {
 	if (provider === 'startPlan') {
 		return new Error(
 			`${message}\n（当前是 Start Plan。若额度在 BigModel Coding Plan 上，请把 provider 切到 BigModel。）`,
+		);
+	}
+	if (provider === 'deepseek') {
+		return new Error(
+			`${message}\n（当前是 DeepSeek 官方接口。请到 platform.deepseek.com 确认余额，或检查 API Key。）`,
 		);
 	}
 	return new Error(
@@ -1153,6 +1193,185 @@ async function streamAnthropicMessages(options: {
 	}
 }
 
+function deepseekTurn(parsed: DeepseekParsedTurn): {
+	content: string;
+	reasoning: string;
+	reasoningBlocks?: Array<{ text: string; signature?: string }>;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+} {
+	const calls = parsed.toolCalls.filter(call => call.name).map(call => ({
+		id: call.id,
+		type: 'function' as const,
+		function: { name: call.name, arguments: call.arguments || '{}' },
+	}));
+	return {
+		content: parsed.content,
+		reasoning: parsed.reasoning,
+		reasoningBlocks: parsed.reasoningBlocks.length ? parsed.reasoningBlocks : undefined,
+		tool_calls: calls.length ? calls : undefined,
+		usageTokens: parsed.usageTokens,
+	};
+}
+
+async function completeDeepseekMessages(options: {
+	url: string;
+	apiKey: string;
+	model: string;
+	reasoningLevel: string;
+	messages: ChatCompletionMessage[];
+	token: vscode.CancellationToken;
+	onReasoning: (text: string) => void;
+	onAssistant: (text: string) => void;
+}): Promise<{
+	content: string;
+	reasoning: string;
+	reasoningBlocks?: Array<{ text: string; signature?: string }>;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+}> {
+	const controller = new AbortController();
+	const cancel = options.token.onCancellationRequested(() => controller.abort());
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			redirect: 'error',
+			headers: deepseekHeaders(options.apiKey, false),
+			body: JSON.stringify(buildDeepseekBody({
+				model: options.model,
+				reasoningLevel: options.reasoningLevel,
+				messages: options.messages,
+				tools: toAnthropicTools(),
+				stream: false,
+			})),
+			signal: controller.signal,
+		});
+		const raw = await response.text();
+		if (!response.ok) {
+			throw deepseekHttpError(response.status, raw);
+		}
+		let data: unknown;
+		try {
+			data = JSON.parse(raw) as unknown;
+		} catch {
+			throw new Error(`DeepSeek returned non-JSON (${response.status}): ${raw.slice(0, 300)}`);
+		}
+		const parsed = parseDeepseekCompletion(data);
+		if (parsed.reasoning) {
+			options.onReasoning(parsed.reasoning);
+		}
+		if (parsed.content && !parsed.toolCalls.length) {
+			options.onAssistant(parsed.content);
+		}
+		return deepseekTurn(parsed);
+	} finally {
+		cancel.dispose();
+	}
+}
+
+async function streamDeepseekMessages(options: {
+	url: string;
+	apiKey: string;
+	model: string;
+	reasoningLevel: string;
+	messages: ChatCompletionMessage[];
+	token: vscode.CancellationToken;
+	onReasoning: (text: string) => void;
+	onAssistant: (text: string) => void;
+}): Promise<{
+	content: string;
+	reasoning: string;
+	reasoningBlocks?: Array<{ text: string; signature?: string }>;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+}> {
+	const controller = new AbortController();
+	const cancel = options.token.onCancellationRequested(() => controller.abort());
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			redirect: 'error',
+			headers: deepseekHeaders(options.apiKey, true),
+			body: JSON.stringify(buildDeepseekBody({
+				model: options.model,
+				reasoningLevel: options.reasoningLevel,
+				messages: options.messages,
+				tools: toAnthropicTools(),
+				stream: true,
+			})),
+			signal: controller.signal,
+		});
+		if (!response.ok || !response.body) {
+			const raw = await response.text().catch(() => '');
+			throw deepseekHttpError(response.status, raw);
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		const state = createDeepseekAccumulator();
+		let buffer = '';
+		let lastReasoningEmit = 0;
+		let lastContentEmit = 0;
+
+		const consume = (chunk: string) => {
+			for (const line of chunk.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed.startsWith('data:')) {
+					continue;
+				}
+				const payload = trimmed.slice(5).trim();
+				if (!payload || payload === '[DONE]') {
+					continue;
+				}
+				let json: unknown;
+				try {
+					json = JSON.parse(payload) as unknown;
+				} catch {
+					continue;
+				}
+				const update = applyDeepseekStreamEvent(state, json);
+				if (!update) {
+					continue;
+				}
+				const now = Date.now();
+				if (update.reasoning && now - lastReasoningEmit > 80) {
+					options.onReasoning(update.reasoning);
+					lastReasoningEmit = now;
+				}
+				if (update.content && !update.hasTools && now - lastContentEmit > 80) {
+					options.onAssistant(update.content);
+					lastContentEmit = now;
+				}
+			}
+		};
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			const splitAt = buffer.lastIndexOf('\n');
+			if (splitAt >= 0) {
+				consume(buffer.slice(0, splitAt));
+				buffer = buffer.slice(splitAt + 1);
+			}
+		}
+		buffer += decoder.decode();
+		if (buffer.trim()) {
+			consume(buffer);
+		}
+
+		const parsed = finishDeepseekTurn(state);
+		if (parsed.content && !parsed.toolCalls.length) {
+			options.onAssistant(parsed.content);
+		}
+		return deepseekTurn(parsed);
+	} finally {
+		cancel.dispose();
+	}
+}
+
 async function streamOrCompleteChat(options: {
 	url: string;
 	apiKey: string;
@@ -1163,7 +1382,24 @@ async function streamOrCompleteChat(options: {
 	token: vscode.CancellationToken;
 	onReasoning: (text: string) => void;
 	onAssistant: (text: string) => void;
-}): Promise<{ content: string; reasoning: string; tool_calls?: ToolCall[] }> {
+}): Promise<{
+	content: string;
+	reasoning: string;
+	reasoningBlocks?: Array<{ text: string; signature?: string }>;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+}> {
+	if (options.api === 'deepseek') {
+		try {
+			return await streamDeepseekMessages(options);
+		} catch (error) {
+			if (options.token.isCancellationRequested) {
+				throw error;
+			}
+			return completeDeepseekMessages(options);
+		}
+	}
+
 	if (options.api === 'anthropic') {
 		try {
 			return await streamAnthropicMessages(options);
