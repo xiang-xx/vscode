@@ -11,8 +11,9 @@
  * saved. Listing, open tabs, and the restored active session stay inside that
  * root so `/Users/xiang/apps` and `/Users/xiang/projects` do not mix.
  *
- * On-disk layout (user-global, not per-extension):
- *   ~/.zcode/v2/ide-chat/
+ * On-disk layout (per runtime, not per-extension):
+ *   installed: ~/.zcode/v2/ide-chat/
+ *   DEV:       ~/.zcode/v2/ide-chat-dev/
  *     index.json
  *     sessions/<id>.json
  *
@@ -21,9 +22,9 @@
  */
 
 import { promises as fs } from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import type { ConversationItem, TodoItem } from './conversation';
+import { ideChatRootDir } from './runtimeEnv';
 
 export const IDE_CHAT_STORE_VERSION = 1;
 export const IDE_CHAT_SOURCE_ZCODE = 'zcode';
@@ -71,12 +72,12 @@ interface IdeChatIndex {
 }
 
 export interface IdeChatStoreOptions {
-	/** Override root (tests). Default: ~/.zcode/v2/ide-chat */
+	/** Override root (tests). Default: ideChatRootDir() for this runtime. */
 	rootDir?: string;
 }
 
 function defaultRoot(): string {
-	return path.join(os.homedir(), '.zcode', 'v2', 'ide-chat');
+	return ideChatRootDir();
 }
 
 function newId(): string {

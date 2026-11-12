@@ -8,7 +8,7 @@
 ### 若以后做：技术选型
 
 - 路线：three.js + `@pixiv/three-vrm`，VRM/VRoid 生态模型
-- 形态：设置里的实验性开关，默认关闭；three-vrm 与模型资源同样**懒加载**（参照现有 pixi-live2d-display 的懒加载方式，见 `media/mascotView.js`）
+- 形态：设置里的实验性开关，默认关闭；three-vrm 与模型资源同样**懒加载**（应用内已有先例：功能脚本按需加载）
 - 与 Live2D 并存，不动现有架构
 
 ### 届时的评估要点
@@ -20,7 +20,6 @@
 
 ### Live2D 主线上更便宜的提升（优先做）
 
-- [ ] 打开视线跟随鼠标（mascotView.js 中 gaze 跟随指针被刻意关掉，有注释）
 - [ ] 更丰富的 idle motion / 高质量模型（模型库扩充进行中）
 - [ ] 任务状态表情联动：长任务 worried、完成 smile（模型自带 expression）
 - [ ] 以后接 TTS 时加口型同步

@@ -10,18 +10,6 @@ import { createDecorator } from '../../../../../platform/instantiation/common/in
 
 //#region Constants
 
-/**
- * Execution budget: how many workers may occupy a concurrency slot at once.
- * Extra tasks are queued until a slot frees up, so dispatching never
- * overwhelms the machine.
- *
- * This is deliberately NOT the human attention budget (humans track ~3-5
- * sessions at full fidelity). Attention is rationed by the UI layer —
- * one page, a presentation queue, and a bottom-right tip (see §5 of
- * superAgentRedesign.md) — not by refusing work or switching tabs.
- */
-export const DEFAULT_MAX_CONCURRENT_WORKERS = 10;
-
 /** Default inactivity budget before a worker's watchdog trips. */
 export const DEFAULT_WATCHDOG_INTERVAL_MS = 120_000;
 
@@ -30,10 +18,9 @@ export const DEFAULT_WATCHDOG_INTERVAL_MS = 120_000;
  * worker's edits are visually attributable across the workbench.
  *
  * The palette holds every `charts.*` hue registered in this checkout
- * (6 total; `charts.pink` does not exist here). When slots (10) exceed the
- * palette, hues repeat via modulo — the slot badge is the unique attribution
- * key, the hue is a secondary cue. Phase 2 may register dedicated
- * `superAgent.*` theme colors if 10-way distinctness proves necessary.
+ * (6 total; `charts.pink` does not exist here). Hues repeat via modulo as
+ * slot numbers grow — the slot badge is the unique attribution key, the hue
+ * is a secondary cue.
  */
 export const SUPER_AGENT_WORKER_ACCENTS = [
 	'charts.blue',
@@ -54,8 +41,6 @@ export const SUPER_AGENT_WORKER_ACCENTS = [
  * {@link IChatRouterService.recordActivity} and terminal transitions.
  */
 export const enum SuperAgentWorkerState {
-	/** Waiting for a free concurrency slot. */
-	Queued = 'Queued',
 	/** Warming up: context assembly, first model call. */
 	Starting = 'Starting',
 	/** Making progress on the current turn. */
@@ -80,7 +65,7 @@ export const enum SuperAgentWorkerState {
 	Cancelled = 'Cancelled',
 }
 
-/** Whether a state occupies one of the concurrency slots. */
+/** Whether the worker is live and should accept heartbeats. Failed and Cancelled are terminal. */
 export function superAgentWorkerStateIsActive(state: SuperAgentWorkerState): boolean {
 	return state === SuperAgentWorkerState.Starting
 		|| state === SuperAgentWorkerState.Running
@@ -136,7 +121,7 @@ export interface ISuperAgentWorkerHandle {
 	readonly createdAt: number;
 	/** Stable 1-based slot number; reused for badges and accent color. */
 	readonly slot: number;
-	/** Badge glyph ("1".."10", the 1-based slot number) used for file attribution decorations. */
+	/** Badge glyph (the 1-based slot number) used for file attribution decorations. */
 	readonly badge: string;
 	/** Theme color id for all visuals belonging to this worker. */
 	readonly accentColorId: string;
@@ -198,8 +183,7 @@ export interface IChatRouterService {
 	readonly focusedWorkerId: IObservable<string | undefined>;
 
 	/**
-	 * Creates a worker bound to a chat session. Starts immediately when a
-	 * concurrency slot is free, otherwise the worker is queued.
+	 * Creates a worker bound to a chat session and starts it immediately.
 	 */
 	createWorker(options: ISuperAgentWorkerOptions): ISuperAgentWorkerHandle;
 	getWorker(workerId: string): ISuperAgentWorkerHandle | undefined;
@@ -278,7 +262,7 @@ export interface IChatRouterService {
 
 	/**
 	 * User viewed a finished turn (or acknowledged the worker). Moves
-	 * Completed → Idle so the tip / toast clears. Keeps the concurrency slot.
+	 * Completed → Idle so the tip / toast clears.
 	 */
 	markIdle(workerId: string, detail?: string): void;
 
@@ -291,7 +275,6 @@ export interface IChatRouterService {
 	/**
 	 * Turn finished successfully, unread. Moves to Completed so the presentation
 	 * queue can toast「查看」; viewing then calls {@link markIdle}.
-	 * Still occupies a concurrency slot (unlike Failed / Cancelled).
 	 */
 	completeWorker(workerId: string, detail?: string): void;
 	failWorker(workerId: string, detail?: string): void;

@@ -154,7 +154,6 @@
           ],
           "description": "%config.bridge.mode%"
         },
-
         "zcode.bridge.endpoint": {
           "type": "string",
           "default": "http://127.0.0.1:4096/api/chat",
@@ -169,6 +168,26 @@
           "type": "string",
           "default": "",
           "description": "%config.unsplashAccessKey%"
+        },
+        "zcode.feishu.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable the Feishu worker bridge: drive Super Agent workers from your phone via a Feishu self-built app bot (long-connection mode). Needs zcode.feishu.appId plus the App Secret stored via command “ZCode: 设置飞书机器人 App Secret”."
+        },
+        "zcode.feishu.appId": {
+          "type": "string",
+          "default": "",
+          "description": "Feishu self-built app id (cli_…) whose bot relays phone messages to workers."
+        },
+        "zcode.feishu.allowOpenIds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "ou_912ac573ace6c728711106e369503cb6"
+          ],
+          "description": "Allowed Feishu open_id senders. Empty blocks everyone; when blocked the bot replies with your open_id so you can copy it here."
         }
       }
     },
@@ -293,6 +312,18 @@
         "icon": "$(key)"
       },
       {
+        "command": "zcode.setFeishuSecret",
+        "title": "设置飞书机器人 App Secret",
+        "category": "%command.category%",
+        "icon": "$(key)"
+      },
+      {
+        "command": "zcode.showFeishuStatus",
+        "title": "飞书桥状态",
+        "category": "%command.category%",
+        "icon": "$(broadcast)"
+      },
+      {
         "command": "zcode.switchModel",
         "title": "%command.switchModel%",
         "category": "%command.category%",
@@ -367,6 +398,12 @@
           "command": "zcode.showBridgeStatus"
         },
         {
+          "command": "zcode.setFeishuSecret"
+        },
+        {
+          "command": "zcode.showFeishuStatus"
+        },
+        {
           "command": "zcode.manageAccount"
         },
         {
@@ -432,5 +469,8 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/microsoft/vscode.git"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.76.0"
   }
 }

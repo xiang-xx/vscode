@@ -139,6 +139,16 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 	 * leaving the homepage refresh it. Unmaximizing on a detail does not.
 	 */
 	private _routerMaximized: boolean | undefined;
+	/**
+	 * Until this timestamp, a drop out of maximized while the Router homepage
+	 * is showing is treated as a return-transition race and re-asserted, not
+	 * remembered. Showing the editor or the explorer part silently leaves
+	 * maximized mode (WorkbenchLayoutService#setEditorHidden /
+	 * setSideBarHidden), and the homepage return runs the working-set swap,
+	 * the router-session reopen and the webview reload concurrently — any of
+	 * them landing after the restore used to kill the homepage fullscreen.
+	 */
+	private _homepageRestoreGuardUntil = 0;
 	private _layoutReady = false;
 
 	constructor(
@@ -170,9 +180,25 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 		// Homepage fullscreen toggles count only while that page is showing.
 		// A detail unmaximize (opening a file) must not erase the homepage choice.
 		this._register(this._layoutService.onDidChangeAuxiliaryBarMaximized(() => {
-			if (this._layoutReady && this._routerService.focusedWorkerId.get() === undefined) {
-				this._rememberRouterLayout();
+			if (!this._layoutReady) {
+				return;
 			}
+			if (this._routerService.focusedWorkerId.get() !== undefined) {
+				return; // worker detail: unmaximizing there never touches the choice
+			}
+			// Dropped out of maximized right after the homepage restored it:
+			// an internal reveal (editor/sidebar show from the concurrent
+			// router-session reopen or webview reload), not a user toggle.
+			// Put the fullscreen back instead of recording the dropped state.
+			if (
+				!this._layoutService.isAuxiliaryBarMaximized()
+				&& this._routerMaximized
+				&& Date.now() < this._homepageRestoreGuardUntil
+			) {
+				this._layoutService.setAuxiliaryBarMaximized(true);
+				return; // the re-maximize re-fires this event and remembers true
+			}
+			this._rememberRouterLayout();
 		}));
 
 		// (2) Editor tabs + layout follow the chat-stream owner (root or worker)
@@ -276,8 +302,13 @@ export class SuperAgentEditorCoordinator extends Disposable implements IWorkbenc
 					// After the detail's editors are parked, put the homepage's
 					// fullscreen back. Doing it earlier lets an in-flight editor
 					// close treat the hidden editor area as a user open and drop
-					// the maximized state again.
+					// the maximized state again. Arm the guard window so drops
+					// caused by the concurrent router reopen / webview reload
+					// are re-asserted (see the maximize-change listener).
 					if (generation === this._applyGeneration && restoreRouterMaximized !== undefined) {
+						if (restoreRouterMaximized) {
+							this._homepageRestoreGuardUntil = Date.now() + 2000;
+						}
 						this._layoutService.setAuxiliaryBarMaximized(restoreRouterMaximized);
 					}
 				}

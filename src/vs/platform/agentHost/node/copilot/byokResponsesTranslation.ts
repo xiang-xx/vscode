@@ -281,7 +281,7 @@ export function responsesRequestToBridge(vendor: string, body: IResponsesRequest
  * requests with more, and the Copilot SDK runtime only defers tools behind
  * tool search for models it serves natively, so BYOK requests are capped here.
  */
-export const BYOK_MAX_TOOLS = 128;
+export const BYOK_MAX_TOOLS = 166;
 
 /**
  * Trims {@link IByokLmChatRequest.tools} to at most {@link maxTools}. Tools the

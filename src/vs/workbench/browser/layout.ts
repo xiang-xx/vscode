@@ -1951,9 +1951,13 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 	}
 
 	private setSideBarHidden(hidden: boolean): void {
-		if (!hidden && this.setAuxiliaryBarMaximized(false) && this.isVisible(Parts.SIDEBAR_PART)) {
-			return; // return: leaving maximised auxiliary bar made this part visible
-		}
+		// Showing the side bar (e.g. clicking Explorer in the activity bar) while
+		// the auxiliary bar is maximized must NOT leave the maximized state: the user
+		// only asked for the side bar. The editor area stays hidden and the maximized
+		// auxiliary surface keeps the remaining width. Leaving the maximized state
+		// restores part visibility itself (see `setAuxiliaryBarMaximized`); its calls
+		// back into this method are safe because the transition flag and the early
+		// state return in `setAuxiliaryBarMaximized` prevent re-entrance.
 
 		this.stateModel.setRuntimeValue(LayoutStateKeys.SIDEBAR_HIDDEN, hidden);
 
@@ -2264,7 +2268,10 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
 			try {
 				this.setEditorHidden(!state?.editorVisible);	// this order of updating view visibility
 				this.setPanelHidden(!state?.panelVisible);		// helps in restoring the previous view
-				this.setSideBarHidden(!state?.sideBarVisible);	// sizes we had
+				// Keep the side bar open if the user showed it while the auxiliary bar
+				// was maximized (e.g. clicked Explorer); otherwise restore the
+				// visibility we had before maximizing.
+				this.setSideBarHidden(!state?.sideBarVisible && !this.isVisible(Parts.SIDEBAR_PART));	// sizes we had
 
 				const size = this.workbenchGrid.getViewSize(this.auxiliaryBarPartView);
 				this.workbenchGrid.resizeView(this.auxiliaryBarPartView, {

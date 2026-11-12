@@ -29,8 +29,6 @@ type DispatchStatus =
 
 function dispatchStatusFromWorkerState(state: SuperAgentWorkerState): DispatchStatus {
 	switch (state) {
-		case SuperAgentWorkerState.Queued:
-			return 'queued';
 		case SuperAgentWorkerState.Starting:
 			return 'starting';
 		case SuperAgentWorkerState.Running:

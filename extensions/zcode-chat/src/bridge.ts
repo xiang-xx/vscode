@@ -36,7 +36,7 @@ export interface ChatTurnRequest {
 	askUser?: AskUserHandler;
 	/** Concurrent-session occupancy so agents avoid conflicting edits. */
 	sessionAwareness?: SessionAwareness;
-	/** ZCode explore-vs-edit bias (ignored for Cursor brain). */
+	/** Explore-vs-edit bias (mirrored into both brains' prompts). */
 	agentPace?: AgentPace;
 	/** Personal instructions, project AGENTS.md, and the skill catalog. */
 	promptPreamble?: string;
@@ -131,6 +131,9 @@ async function completeViaCursorAcp(
 		askUser: request.askUser,
 		sessionAwareness: request.sessionAwareness,
 		promptPreamble: request.promptPreamble,
+		agentPace: request.agentPace ?? getAgentPace(),
+		reasoningLevel: request.reasoningLevel
+			?? getSelectedReasoningLevel(request.provider, request.model || getCursorModel()),
 	});
 	return {
 		content: result.text,

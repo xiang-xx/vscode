@@ -36,9 +36,9 @@ import type { IServerToolDisplay, IServerToolDisplayResult, IServerToolGroup } f
 const maxSessionSpawnDepth = 3;
 
 /** Per-session backstops against runaway spawning (breadth) and `send_message` fan-out, independent of depth. */
-const maxCreatedSessions = 50;
-const maxCreatedChats = 50;
-const maxSentMessages = 100;
+const maxCreatedSessions = 65;
+const maxCreatedChats = 65;
+const maxSentMessages = 130;
 
 /** Sliding window over which the per-session backstops count; capacity frees up as older actions leave it. */
 const orchestrationLimitWindowMs = 60 * 60 * 1000;

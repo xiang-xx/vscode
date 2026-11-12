@@ -11,7 +11,7 @@ import { isEqual } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { generateUuid } from '../../../../../base/common/uuid.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
-import { DEFAULT_MAX_CONCURRENT_WORKERS, DEFAULT_WATCHDOG_INTERVAL_MS, IChatRouterService, ISuperAgentEvent, ISuperAgentWorkerHandle, ISuperAgentWorkerHistoryEntry, ISuperAgentWorkerOptions, SuperAgentEventKind, SuperAgentWorkerState, superAgentWorkerStateIsActive, SUPER_AGENT_WORKER_ACCENTS } from '../../common/superAgent/chatRouterService.js';
+import { DEFAULT_WATCHDOG_INTERVAL_MS, IChatRouterService, ISuperAgentEvent, ISuperAgentWorkerHandle, ISuperAgentWorkerHistoryEntry, ISuperAgentWorkerOptions, SuperAgentEventKind, SuperAgentWorkerState, superAgentWorkerStateIsActive, SUPER_AGENT_WORKER_ACCENTS } from '../../common/superAgent/chatRouterService.js';
 import { parseZcodeSessionId } from './zcodeSessionUri.js';
 
 const WORKERS_STORAGE_KEY = 'chat.superAgent.workers.v1';
@@ -99,7 +99,7 @@ class SuperAgentWorker extends Disposable implements ISuperAgentWorkerHandle {
 
 /**
  * Super-Agent router: orchestrates worker chat sessions behind a single
- * conversation. Workers execute concurrently (budgeted), report into a shared
+ * conversation. Workers execute concurrently, report into a shared
  * event bus, are supervised by per-worker watchdogs and never block user
  * input (full-duplex). See `superAgentRedesign.md` for the full design.
  *
@@ -131,7 +131,6 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 	}
 
 	createWorker(options: ISuperAgentWorkerOptions): ISuperAgentWorkerHandle {
-		const hasFreeSlot = this._workersObs.get().filter(w => superAgentWorkerStateIsActive(w.state.get())).length < DEFAULT_MAX_CONCURRENT_WORKERS;
 		const worker = new SuperAgentWorker(
 			options.label,
 			options.chatSessionResource,
@@ -139,13 +138,10 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 			options.watchdogIntervalMs ?? DEFAULT_WATCHDOG_INTERVAL_MS,
 			w => this._onWatchdogTripped(w),
 		);
-		worker.setWorkerState(hasFreeSlot ? SuperAgentWorkerState.Starting : SuperAgentWorkerState.Queued);
 		transaction(tx => {
 			this._workersObs.set([...this._workersObs.get(), worker], tx);
 		});
-		if (worker.state.get() !== SuperAgentWorkerState.Queued) {
-			worker.armWatchdog();
-		}
+		worker.armWatchdog();
 		this._fire(worker.id, 'workerCreated', options.label);
 		this._persist();
 
@@ -205,7 +201,6 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 				this.clearFocusedWorker();
 			}
 		}
-		this._maybePromoteQueued();
 		this._persist();
 	}
 
@@ -243,7 +238,6 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 				this.clearFocusedWorker();
 			}
 		}
-		this._maybePromoteQueued();
 		this._persist();
 	}
 
@@ -494,7 +488,6 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 		worker.watchdog.cancel();
 		worker.setWorkerState(state);
 		this._fire(workerId, 'stateChanged', detail);
-		this._maybePromoteQueued();
 		this._persist();
 	}
 
@@ -508,22 +501,6 @@ export class ChatRouterService extends Disposable implements IChatRouterService 
 		worker.setWorkerState(SuperAgentWorkerState.WatchdogTripped);
 		this._fire(worker.id, 'watchdogTripped', `no activity for ${worker.watchdogIntervalMs}ms`);
 		this._persist();
-	}
-
-	private _maybePromoteQueued(): void {
-		const workers = this._workersObs.get();
-		let activeCount = workers.filter(w => superAgentWorkerStateIsActive(w.state.get())).length;
-		for (const worker of workers) {
-			if (activeCount >= DEFAULT_MAX_CONCURRENT_WORKERS) {
-				break;
-			}
-			if (worker.state.get() === SuperAgentWorkerState.Queued) {
-				worker.setWorkerState(SuperAgentWorkerState.Starting);
-				worker.armWatchdog();
-				this._fire(worker.id, 'stateChanged', 'promoted from queue');
-				activeCount++;
-			}
-		}
 	}
 
 	private _nextSlot(): number {

@@ -6,7 +6,6 @@
 import * as vscode from 'vscode';
 import { buildReasoningRequestFields } from './agentPace';
 import { getAuthService } from './authSession';
-import { findMascotCatalog } from './mascotCatalog';
 import { defaultMascotPersonaId, findMascotPersona, type MascotPersona } from './mascotPersona';
 import { getProviderMode } from './providers';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
@@ -407,8 +406,7 @@ export class MascotVoice {
 		this.current = controller;
 		const timer = setTimeout(() => controller.abort(), VOICE_TIMEOUT_MS);
 		try {
-			const entry = findMascotCatalog(input.id);
-			const label = cleanLabel(entry?.label || input.label) || '精灵';
+			const label = cleanLabel(input.label) || '精灵';
 			const trigger = normalizeTrigger(input.trigger);
 			const zone = ZONE_WORDS[input.zone] ? input.zone : '';
 			const gift = GIFT_WORDS[input.gift] ? input.gift : '';

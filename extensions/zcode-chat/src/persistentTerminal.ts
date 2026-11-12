@@ -23,6 +23,7 @@ const MARKER = /__ZC_DONE_([a-z0-9]+):(-?\d+)__/;
 class AgentShell {
 	readonly name: string;
 	readonly createdCwd: string;
+	readonly createdAt = Date.now();
 	private child: ChildProcess | null = null;
 	private terminal: vscode.Terminal | null = null;
 	private readonly writeEmitter = new vscode.EventEmitter<string>();
@@ -336,4 +337,35 @@ export async function executeTerminalTool(
 		default:
 			return undefined;
 	}
+}
+
+/** Serializable view of a persistent shell, for the chat UI's process panel. */
+export interface TerminalSnapshot {
+	name: string;
+	cwd: string;
+	running: boolean;
+	exitCode: number | null;
+	elapsedSec: number;
+}
+
+/** All persistent shells as plain snapshots for the UI. */
+export function getTerminalsSnapshot(): TerminalSnapshot[] {
+	const now = Date.now();
+	return [...shells.values()].map(s => ({
+		name: s.name,
+		cwd: s.createdCwd,
+		running: s.alive(),
+		exitCode: s.exitCode,
+		elapsedSec: Math.max(0, Math.round((now - s.createdAt) / 1000)),
+	}));
+}
+
+/** Reveal a persistent shell's VS Code terminal. Returns false if unknown. */
+export function showTerminalByName(name: string): boolean {
+	const shell = shells.get(name);
+	if (!shell) {
+		return false;
+	}
+	shell.show();
+	return true;
 }

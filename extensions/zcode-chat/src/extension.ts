@@ -14,6 +14,7 @@ import { getBridgeStatusText } from './bridge';
 import { registerChatParticipant, switchModelCommand, switchReasoningLevelCommand } from './chatParticipant';
 import { registerChatPanel } from './chatPanel';
 import { EditDecorationController } from './editDecorations';
+import { bindFeishuSecrets, disposeFeishuBridge, ensureFeishuBridge, FEISHU_SECRET_KEY, getFeishuBridgeStatus } from './feishuBridge';
 import { getFileEditSession, resetFileEditSession } from './fileEditSession';
 import {
 	IDE_CHAT_SOURCE_CURSOR,
@@ -25,6 +26,7 @@ import {
 import { getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { bindDeepseekSecrets, promptDeepseekApiKey } from './deepseekProvider';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
+import { stampZcodeRuntime } from './runtimeEnv';
 import { searchChatSessions, type SessionSearchMatch } from './sessionSearch';
 import { disposePluginHosts } from './chatPlugins';
 import { registerPluginCommands } from './pluginCommands';
@@ -39,6 +41,9 @@ function isDispatchStatus(value: unknown): value is DispatchStatus {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<IdeChatExtensionApi> {
+	// Before any session file is opened: DEV and the installed app keep
+	// separate chat histories. See runtimeEnv.ts.
+	stampZcodeRuntime(vscode.env.appName);
 	setBrowserMcpExtensionRoot(context.extensionPath);
 	void ensureBrowserBridge().catch(() => { /* bridge starts lazily on first Cursor run */ });
 	context.subscriptions.push({ dispose: () => disposeBrowserBridge() });
@@ -88,6 +93,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 
 	const panel = registerChatPanel(context, ideChat, fileEdits);
 	registerChatParticipant(context);
+
+	// Feishu bot bridge: phone → Super Agent workers. Runs in at most one
+	// window (heartbeat lock in ~/.zcode); see feishuBridge.ts for commands.
+	bindFeishuSecrets(context.secrets);
+	context.subscriptions.push({ dispose: () => disposeFeishuBridge() });
+	void ensureFeishuBridge(panel, ideChat).catch(err =>
+		console.warn('[zcode-chat] feishu bridge start failed:', err));
 
 	const providerStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	providerStatus.command = 'zcode.switchBrain';
@@ -224,7 +236,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 		}),
 		vscode.commands.registerCommand('zcode.searchHistory', async () => {
 			// Ported from DeepSeek Harness `session_search` / `session_event_search`:
-			// full-text search across every saved session (~/.zcode/v2/ide-chat),
+			// full-text search across this runtime's saved sessions,
 			// then jump back into the conversation that matched.
 			const query = await vscode.window.showInputBox({
 				placeHolder: 'Search all chat history (wrap in /…/ for regex)',
@@ -274,6 +286,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 				void vscode.window.showInformationMessage('DeepSeek API Key 已保存。');
 				panel.refresh();
 			}
+		}),
+		vscode.commands.registerCommand('zcode.setFeishuSecret', async () => {
+			const value = await vscode.window.showInputBox({
+				password: true,
+				prompt: '飞书自建应用 App Secret（配套 zcode.feishu.appId，存入系统凭据库，不进 settings 文件）',
+				placeHolder: 'App Secret',
+				ignoreFocusOut: true,
+			});
+			if (value === undefined) {
+				return;
+			}
+			await context.secrets.store(FEISHU_SECRET_KEY, value.trim());
+			await ensureFeishuBridge(panel, ideChat).catch(err =>
+				void vscode.window.showErrorMessage(`飞书桥启动失败：${err instanceof Error ? err.message : String(err)}`));
+			void vscode.window.showInformationMessage(getFeishuBridgeStatus());
+		}),
+		vscode.commands.registerCommand('zcode.showFeishuStatus', async () => {
+			await ensureFeishuBridge(panel, ideChat).catch(() => undefined);
+			void vscode.window.showInformationMessage(getFeishuBridgeStatus());
 		}),
 		vscode.commands.registerCommand('zcode.switchModel', async () => {
 			if (getActiveBrain() === 'cursor') {
@@ -331,4 +362,5 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 export function deactivate(): void {
 	disposePluginHosts();
 	disposeBrowserBridge();
+	disposeFeishuBridge();
 }

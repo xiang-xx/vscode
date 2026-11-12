@@ -7,6 +7,10 @@
  * Background job tools (job_list / job_output / job_kill) ported from dsh.
  * Long-running shell commands that hit the foreground timeout are converted
  * into background jobs instead of being killed, so the agent can poll them.
+ *
+ * Additionally every job lifecycle change is broadcast (onJobEvent) so the
+ * chat UI can show the user which background processes the worker started
+ * and how they are doing — the agent no longer keeps this to itself.
  */
 
 import { spawn, type ChildProcess } from 'child_process';
@@ -16,6 +20,8 @@ import { assertDirectory } from './processUtils';
 const MAX_JOBS = 24;
 const MAX_BUFFER = 2_000_000;
 const MAX_PREVIEW = 30_000;
+const MAX_TAIL_CHARS = 600;
+const UPDATE_THROTTLE_MS = 500;
 
 export interface ShellJob {
 	id: string;
@@ -38,8 +44,127 @@ export interface ShellRunResult {
 	jobId?: string;
 }
 
+/** Serializable view of a job, pushed to the webview panel. */
+export interface JobSnapshot {
+	id: string;
+	command: string;
+	cwd: string;
+	startedAt: number;
+	finishedAt: number | null;
+	exitCode: number | null;
+	killed: boolean;
+	running: boolean;
+	status: string;
+	elapsedSec: number;
+	stdoutLen: number;
+	stderrLen: number;
+	stdoutTail: string;
+	stderrTail: string;
+}
+
+export type JobEventKind = 'created' | 'updated' | 'finished';
+export interface JobEvent {
+	kind: JobEventKind;
+	job: JobSnapshot;
+}
+export type JobEventListener = (event: JobEvent) => void;
+
 const jobs = new Map<string, ShellJob>();
 let seq = 0;
+
+const jobEventListeners = new Set<JobEventListener>();
+const jobEmitMarks = new WeakMap<object, number>();
+
+/** Subscribe to job lifecycle events. Returns an unsubscribe function. */
+export function onJobEvent(listener: JobEventListener): () => void {
+	jobEventListeners.add(listener);
+	return () => {
+		jobEventListeners.delete(listener);
+	};
+}
+
+function emitJob(kind: JobEventKind, job: ShellJob, throttleMs = 0): void {
+	if (throttleMs > 0 && kind === 'updated') {
+		const now = Date.now();
+		const last = jobEmitMarks.get(job) ?? 0;
+		if (now - last < throttleMs) {
+			return;
+		}
+		jobEmitMarks.set(job, now);
+	}
+	const event: JobEvent = { kind, job: snapshotOf(job) };
+	for (const listener of [...jobEventListeners]) {
+		try {
+			listener(event);
+		} catch {
+			// A broken UI listener must never take down the job pipeline.
+		}
+	}
+}
+
+function tailText(text: string, max = MAX_TAIL_CHARS): string {
+	const clean = text.replace(/\n{3,}/g, '\n\n');
+	return clean.length > max ? `…${clean.slice(clean.length - max)}` : clean;
+}
+
+function snapshotOf(job: ShellJob): JobSnapshot {
+	return {
+		id: job.id,
+		command: job.command,
+		cwd: job.cwd,
+		startedAt: job.startedAt,
+		finishedAt: job.finishedAt,
+		exitCode: job.exitCode,
+		killed: job.killed,
+		running: !job.finishedAt,
+		status: statusOf(job),
+		elapsedSec: Math.max(0, Math.round(((job.finishedAt ?? Date.now()) - job.startedAt) / 1000)),
+		stdoutLen: job.stdout.length,
+		stderrLen: job.stderr.length,
+		stdoutTail: tailText(job.stdout),
+		stderrTail: tailText(job.stderr),
+	};
+}
+
+/** All jobs (latest first) as plain snapshots for the UI. */
+export function getJobsSnapshot(): JobSnapshot[] {
+	return [...jobs.values()]
+		.sort((a, b) => b.startedAt - a.startedAt)
+		.slice(0, 30)
+		.map(snapshotOf);
+}
+
+/** Read a job's tail output for the UI (independent of the agent tool path). */
+export function readJobOutput(id: string, tailLinesCount = 120): { found: boolean; text: string } {
+	const job = jobs.get(id);
+	if (!job) {
+		return { found: false, text: `no such job: ${id}` };
+	}
+	const header = `job ${job.id} · ${statusOf(job)} · ${job.command}`;
+	const out = job.stdout ? tailLines(job.stdout, tailLinesCount) : '(no stdout yet)';
+	const err = job.stderr ? `\n\nstderr:\n${tailLines(job.stderr, tailLinesCount)}` : '';
+	return { found: true, text: `${header}\n\nstdout:\n${out}${err}` };
+}
+
+/** Terminate a running job from the UI. Safe to call on finished jobs. */
+export function killJobById(id: string): { found: boolean; killed: boolean; message: string } {
+	const job = jobs.get(id);
+	if (!job) {
+		return { found: false, killed: false, message: `no such job: ${id}` };
+	}
+	if (job.finishedAt) {
+		return { found: true, killed: false, message: `already ${statusOf(job)}` };
+	}
+	job.killed = true;
+	job.child?.kill('SIGTERM');
+	emitJob('updated', job);
+	setTimeout(() => {
+		if (!job.finishedAt && job.child) {
+			job.child.kill('SIGKILL');
+		}
+	}, 3000);
+	return { found: true, killed: true, message: `SIGTERM sent to ${job.id}` };
+}
 
 function attach(job: ShellJob, child: ChildProcess): void {
 	job.child = child;
@@ -47,21 +172,25 @@ function attach(job: ShellJob, child: ChildProcess): void {
 		if (job.stdout.length < MAX_BUFFER) {
 			job.stdout += chunk.toString('utf8');
 		}
+		emitJob('updated', job, UPDATE_THROTTLE_MS);
 	});
 	child.stderr?.on('data', (chunk: Buffer) => {
 		if (job.stderr.length < MAX_BUFFER) {
 			job.stderr += chunk.toString('utf8');
 		}
+		emitJob('updated', job, UPDATE_THROTTLE_MS);
 	});
 	child.on('error', (err) => {
 		job.stderr += `\n${err.message}`;
 		job.finishedAt = Date.now();
 		job.child = null;
+		emitJob('finished', job);
 	});
 	child.on('close', (code) => {
 		job.finishedAt = Date.now();
 		job.exitCode = code;
 		job.child = null;
+		emitJob('finished', job);
 	});
 }
 
@@ -81,6 +210,7 @@ function register(command: string, cwd: string, child: ChildProcess, seedOut = '
 	attach(job, child);
 	jobs.set(job.id, job);
 	pruneJobs();
+	emitJob('created', job);
 	return job;
 }
 
@@ -229,14 +359,10 @@ export async function executeJobTool(
 ): Promise<ToolExecResult | undefined> {
 	switch (name) {
 		case 'job_list': {
-			const rows = [...jobs.values()]
-				.sort((a, b) => b.startedAt - a.startedAt)
-				.slice(0, 30)
-				.map(j => {
-					const secs = Math.round(((j.finishedAt ?? Date.now()) - j.startedAt) / 1000);
-					const cmd = j.command.length > 80 ? `${j.command.slice(0, 79)}…` : j.command;
-					return `${j.id}\t${statusOf(j)}\t${secs}s\t${cmd}`;
-				});
+			const rows = getJobsSnapshot().map(j => {
+				const cmd = j.command.length > 80 ? `${j.command.slice(0, 79)}…` : j.command;
+				return `${j.id}\t${j.status}\t${j.elapsedSec}s\t${cmd}`;
+			});
 			return {
 				summary: `${jobs.size} job(s)`,
 				content: rows.length ? rows.join('\n') : 'No background jobs.',
@@ -256,12 +382,10 @@ export async function executeJobTool(
 			if (waitSeconds > 0 && !job.finishedAt) {
 				await waitForActivity(job, waitSeconds, job.stdout.length + job.stderr.length);
 			}
-			const header = `job ${job.id} · ${statusOf(job)} · ${job.command}`;
-			const out = job.stdout ? tailLines(job.stdout, tail) : '(no stdout yet)';
-			const err = job.stderr ? `\n\nstderr:\n${tailLines(job.stderr, tail)}` : '';
+			const { text } = readJobOutput(id, tail);
 			return {
 				summary: `job ${job.id} ${statusOf(job)}`,
-				content: `${header}\n\nstdout:\n${out}${err}`,
+				content: text,
 			};
 		}
 		case 'job_kill': {
@@ -269,21 +393,14 @@ export async function executeJobTool(
 			if (!id) {
 				return { summary: 'job id required', content: 'Error: job_id is required' };
 			}
-			const job = jobs.get(id);
-			if (!job) {
+			const result = killJobById(id);
+			if (!result.found) {
 				return { summary: `job ${id} not found`, content: `Error: no such job: ${id}. See job_list.` };
 			}
-			if (job.finishedAt) {
-				return { summary: `job ${id} already ${statusOf(job)}`, content: `Job ${id} already ${statusOf(job)}.` };
+			if (!result.killed) {
+				return { summary: `job ${id} ${result.message}`, content: `Job ${id} ${result.message}.` };
 			}
-			job.killed = true;
-			job.child?.kill('SIGTERM');
-			setTimeout(() => {
-				if (!job.finishedAt && job.child) {
-					job.child.kill('SIGKILL');
-				}
-			}, 3000);
-			return { summary: `killed job ${id}`, content: `Sent SIGTERM to job ${id} (${job.command}).` };
+			return { summary: `killed job ${id}`, content: `Sent SIGTERM to job ${id}.` };
 		}
 		default:
 			return undefined;

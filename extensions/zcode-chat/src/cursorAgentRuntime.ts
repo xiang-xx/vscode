@@ -14,6 +14,7 @@ import {
 } from './askUser';
 import { getCursorAgentMode, getCursorModel } from './brains';
 import type { ChatMessage } from './bridge';
+import { getAgentPace, type AgentPace } from './agentPace';
 import type { TodoItem, TodoStatus } from './conversation';
 import {
 	buildIdeBrowserMcpServers,
@@ -45,6 +46,10 @@ export interface CursorAgentRunOptions {
 	askUser?: AskUserHandler;
 	sessionAwareness?: SessionAwareness;
 	promptPreamble?: string;
+	/** Explore-vs-edit bias, mirrored into the prompt like the ZCode brain. */
+	agentPace?: AgentPace;
+	/** Thinking intensity preference ("low"/"high"/…), same wording as ZCode. */
+	reasoningLevel?: string;
 }
 
 export interface CursorAgentRunResult {
@@ -293,7 +298,13 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 	try {
 		options.onProgress?.({ type: 'status', text: `Cursor Agent · ${root}` });
 
-		const originalPrompt = buildPrompt(options.messages, options.sessionAwareness, options.promptPreamble);
+		const originalPrompt = buildPrompt(
+			options.messages,
+			options.sessionAwareness,
+			options.promptPreamble,
+			options.agentPace ?? getAgentPace(),
+			options.reasoningLevel,
+		);
 		let promptText = originalPrompt;
 		let sessionId: string | undefined;
 		options.onProgress?.({ type: 'status', text: 'Cursor Agent is working…' });
@@ -374,6 +385,82 @@ const CURSOR_RESUME_NOTE = [
 	'Continue the same task from the last completed step.',
 	'Do not repeat work that already finished on disk.',
 ].join(' ');
+
+/**
+ * Behavior contract mirroring the ZCode brain's system-prompt lines (edit
+ * discipline, verification, asking before guessing). ACP `session/prompt`
+ * has no system-message channel, so these ride the user prompt right after
+ * the AGENTS.md preamble — without them Cursor follows only its own system
+ * prompt and the working style diverges from the ZCode brain.
+ */
+const CURSOR_BEHAVIOR_CONTRACT = [
+	'Working style (follow exactly; mirrors the ZCode brain in this IDE):',
+	'- Prefer targeted edits over full-file rewrites; read the file before editing when you lack exact text.',
+	"- Use the terminal for git, tests, and builds instead of guessing outcomes; after substantive edits, verify with the project's typecheck/lint/tests.",
+	'- When blocked on a decision only the user can make, ask one focused question and wait for their answer.',
+].join('\n');
+
+/**
+ * Tool-agnostic mirror of buildPaceSystemLines (agentPace.ts). Cursor CLI has
+ * its own tool names, so ZCode-specific ones (str_replace/TodoWrite/grep) are
+ * reworded while keeping the same pacing intent per level.
+ */
+function cursorPaceLines(pace: AgentPace): string[] {
+	switch (pace) {
+		case 'fast':
+			return [
+				'Pace: FAST. Bias hard toward making edits quickly.',
+				'If the user named a file/symbol/path, go there first — do not survey the repo.',
+				'At most 1–2 exploration steps (search/read) before your first edit.',
+				'Skip the todo list unless the task clearly has 4+ independent steps.',
+				'Do not open the browser or run broad searches unless the user asked.',
+				'Keep the final summary to 1–3 short sentences.',
+			];
+		case 'thorough':
+			return [
+				'Pace: THOROUGH. Prefer understanding before large edits.',
+				'Search for call sites when changing shared APIs.',
+				'The todo list is encouraged for multi-step work.',
+			];
+		default:
+			return [
+				'Pace: BALANCED. Explore briefly, then edit.',
+				'Prefer focused searches before reading broadly; avoid multi-file sightseeing tours.',
+				'Use the todo list for multi-step tasks; skip it for single-file tweaks.',
+			];
+	}
+}
+
+/**
+ * Output contract mirroring the ZCode brain's system-prompt tail (plain-language
+ * summary, deliverables card, no log dumps). ACP `session/prompt` has no
+ * system-message channel, so this rides the user prompt right after the
+ * AGENTS.md preamble — without it Cursor follows only its own system prompt and
+ * the reply loses the readable closing format ZCode produces.
+ */
+const CURSOR_OUTPUT_CONTRACT = [
+	'Output contract (follow exactly; the ZCode brain produces the same format):',
+	'- Keep the final answer scannable: short paragraphs, bullet lists for files and steps.',
+	'- After finishing, briefly summarize what you changed in plain language.',
+	'- When the task created or changed files, close the final answer with a deliverables section in exactly this markdown shape (1-4 files, one line each; omit the section entirely for pure Q&A with no file changes):',
+	'---',
+	'',
+	'**📦 Deliverables**',
+	'',
+	'1. `relative/path/to/file` — one-line note about what this file delivers',
+	'',
+	'- Do not dump raw tool logs, command output, or reasoning in the final answer; the UI shows those separately.',
+].join('\n');
+
+/** Full contract block injected into every Cursor prompt: behavior + pace + thinking + output. */
+function buildCursorContract(pace: AgentPace | undefined, reasoningLevel?: string): string {
+	return [
+		CURSOR_BEHAVIOR_CONTRACT,
+		...(pace ? cursorPaceLines(pace) : []),
+		reasoningLevel ? `Thinking intensity preference: ${reasoningLevel}.` : '',
+		CURSOR_OUTPUT_CONTRACT,
+	].filter(Boolean).join('\n');
+}
 
 function transportRetryDelayMs(attempt: number): number {
 	return Math.min(30_000, 1500 * (2 ** (attempt - 1)));
@@ -474,7 +561,13 @@ async function reopenCursorSession(
 	return { client, sessionId: created, resumed: false };
 }
 
-function buildPrompt(messages: ChatMessage[], awareness?: SessionAwareness, preamble?: string): string {
+function buildPrompt(
+	messages: ChatMessage[],
+	awareness?: SessionAwareness,
+	preamble?: string,
+	pace?: AgentPace,
+	reasoningLevel?: string,
+): string {
 	const lastUser = [...messages].reverse().find(m => m.role === 'user');
 	if (!lastUser) {
 		return '';
@@ -489,7 +582,8 @@ function buildPrompt(messages: ChatMessage[], awareness?: SessionAwareness, prea
 	const body = !prior.trim()
 		? lastUser.content
 		: `Prior conversation (shared IDE history):\n${prior}\n\nUSER:\n${lastUser.content}`;
-	const parts = [preamble, header, IDE_BROWSER_PROMPT_HINT, body].filter(Boolean);
+	const contract = buildCursorContract(pace, reasoningLevel);
+	const parts = [preamble, contract, header, IDE_BROWSER_PROMPT_HINT, body].filter(Boolean);
 	return parts.join('\n\n');
 }
 

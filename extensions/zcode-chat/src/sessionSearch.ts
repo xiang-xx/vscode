@@ -4,11 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
+import { ideChatRootDir } from './runtimeEnv';
 
 /**
- * Full-text search over the global IDE chat history (`~/.zcode/v2/ide-chat`),
+ * Full-text search over this runtime's IDE chat history
+ * (installed: `~/.zcode/v2/ide-chat`, DEV: `~/.zcode/v2/ide-chat-dev`),
  * ported from DeepSeek Harness's `session_search` / `session_event_search`
  * tools: every past session stays retrievable — not only the open tabs — and a
  * hit jumps straight back into that conversation.
@@ -58,7 +59,7 @@ const DEFAULT_MAX_FILE_BYTES = 8 * 1024 * 1024;
 const SNIPPET_RADIUS = 70;
 
 function storeRoot(): string {
-	return path.join(os.homedir(), '.zcode', 'v2', 'ide-chat');
+	return ideChatRootDir();
 }
 
 function flattenText(value: unknown): string {

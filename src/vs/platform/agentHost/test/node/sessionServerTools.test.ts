@@ -1824,10 +1824,10 @@ suite('SessionServerTools', () => {
 		let n = 0;
 		const group = createSessionServerToolGroup(createAccessor({ createSession: async () => URI.parse(`copilot:/s${n++}`) }), () => true, () => 0);
 		const args = { relationship: 'independent', workspace: workspace.toString(), prompt: 'go', title: 'Spawned Task' };
-		for (let i = 0; i < 50; i++) {
+		for (let i = 0; i < 65; i++) {
 			await group.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, args);
 		}
-		await assert.rejects(async () => { await group.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, args); }, /Refusing to create more sessions: this session already used 50 of 50 .*Retry after 3600 seconds/);
+		await assert.rejects(async () => { await group.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, args); }, /Refusing to create more sessions: this session already used 65 of 65 .*Retry after 3600 seconds/);
 		store.dispose();
 	});
 
@@ -1847,11 +1847,11 @@ suite('SessionServerTools', () => {
 		const messageArgs = { session: 'copilot:/s1', message: 'status' };
 		const run = async (caller: string, tool: SessionServerToolName, args: object) => group.execute(stateManager, executionContext(caller), tool, args);
 
-		for (let i = 0; i < 50; i++) {
+		for (let i = 0; i < 65; i++) {
 			await run('copilot:/busy', SessionServerToolName.CreateSession, sessionArgs);
 			await run('copilot:/busy', SessionServerToolName.CreateSession, chatArgs);
 		}
-		for (let i = 0; i < 100; i++) {
+		for (let i = 0; i < 130; i++) {
 			await run('copilot:/busy', SessionServerToolName.SendMessage, messageArgs);
 		}
 		const exhausted = async () => {
@@ -1889,10 +1889,10 @@ suite('SessionServerTools', () => {
 			createSession: async () => URI.parse(`copilot:/created-${createdSessions++}`),
 		}), () => sessionLimitsEnabled, () => 0);
 		const independentArgs = { relationship: 'independent', workspace: workspace.toString(), prompt: 'go', title: 'Spawned Task' };
-		for (let i = 0; i < 50; i++) {
+		for (let i = 0; i < 65; i++) {
 			await sessionGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, independentArgs);
 		}
-		await assert.rejects(async () => { await sessionGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, independentArgs); }, /Refusing to create more sessions: this session already used 50 of 50 .*Retry after 3600 seconds/);
+		await assert.rejects(async () => { await sessionGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, independentArgs); }, /Refusing to create more sessions: this session already used 65 of 65 .*Retry after 3600 seconds/);
 		depths.set('copilot:/deep', 3);
 		sessionLimitsEnabled = false;
 		await sessionGroup.execute(stateManager, executionContext('copilot:/deep'), SessionServerToolName.CreateSession, independentArgs);
@@ -1903,10 +1903,10 @@ suite('SessionServerTools', () => {
 			createChat: async () => { createdChats++; },
 		}), () => chatLimitsEnabled, () => 0);
 		const chatArgs = { relationship: 'currentSession', prompt: 'go', title: 'Peer Task' };
-		for (let i = 0; i < 50; i++) {
+		for (let i = 0; i < 65; i++) {
 			await chatGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, chatArgs);
 		}
-		await assert.rejects(async () => { await chatGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, chatArgs); }, /Refusing to create more chats: this session already used 50 of 50 .*Retry after 3600 seconds/);
+		await assert.rejects(async () => { await chatGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, chatArgs); }, /Refusing to create more chats: this session already used 65 of 65 .*Retry after 3600 seconds/);
 		chatLimitsEnabled = false;
 		await chatGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.CreateSession, chatArgs);
 
@@ -1916,10 +1916,10 @@ suite('SessionServerTools', () => {
 			startPrompt: async () => { sentMessages++; },
 		}), () => messageLimitsEnabled, () => 0);
 		const messageArgs = { session: 'copilot:/s1', message: 'status' };
-		for (let i = 0; i < 100; i++) {
+		for (let i = 0; i < 130; i++) {
 			await messageGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.SendMessage, messageArgs);
 		}
-		await assert.rejects(async () => { await messageGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.SendMessage, messageArgs); }, /Refusing to send more messages: this session already used 100 of 100 .*Retry after 3600 seconds/);
+		await assert.rejects(async () => { await messageGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.SendMessage, messageArgs); }, /Refusing to send more messages: this session already used 130 of 130 .*Retry after 3600 seconds/);
 		assert.strictEqual(JSON.parse(await messageGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.SendMessage, {
 			operation: 'cancel', session: 'copilot:/s1', messageId: 'missing', expectedRevision: 1,
 		})).reason, 'messageNotFound');
@@ -1927,10 +1927,10 @@ suite('SessionServerTools', () => {
 		messageLimitsEnabled = false;
 		await messageGroup.execute(stateManager, executionContext('copilot:/caller'), SessionServerToolName.SendMessage, messageArgs);
 
-		assert.deepStrictEqual({ createdSessions, createdChats, sentMessages, spawnedDepth: depths.get('copilot:/created-50') }, {
-			createdSessions: 51,
-			createdChats: 51,
-			sentMessages: 102,
+		assert.deepStrictEqual({ createdSessions, createdChats, sentMessages, spawnedDepth: depths.get('copilot:/created-65') }, {
+			createdSessions: 66,
+			createdChats: 66,
+			sentMessages: 132,
 			spawnedDepth: 4,
 		});
 		store.dispose();

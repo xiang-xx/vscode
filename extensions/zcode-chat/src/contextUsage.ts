@@ -9,8 +9,8 @@ import { deepseekContextWindow } from './deepseekProvider';
 /**
  * Context windows in tokens.
  * GLM rows mirror ZCode builtin specs.
- * Cursor rows are the default window for that model id (Cursor docs):
- * Grok 4.7 is 256K, and the separate "Grok 4.7 500k" model is 500K.
+ * Cursor rows are the window this VS Code setup actually runs:
+ * Grok 4.7 is 500K (the 256K row compacted the transcript too early).
  * Grok 4.5 is 256K. GPT-5.6 Luna / Terra / Sol are 272K.
  * Ids that do not match stay on the 200K default.
  */
@@ -22,7 +22,7 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 	'GLM-5': 200_000,
 	'grok-4.7-500000': 500_000,
 	'grok-4.7-500k': 500_000,
-	'grok-4.7': 256_000,
+	'grok-4.7': 500_000,
 	'grok-4.5': 256_000,
 	'gpt-5.6': 272_000,
 	'deepseek-flash': 1_048_576,

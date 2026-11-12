@@ -79,15 +79,6 @@
 	let historyOpen = false;
 	let sceneKey = '';
 	let sceneChoices = [];
-	let chatMascot = null;
-	// Live card handles for the mascot roster, so download progress can patch
-	// badges in place instead of rebuilding the grid (which resets scrolling).
-	let mascotCardRefs = new Map();
-// Last structural mascot signature seen by render(): trash/queue/recent/
-// download-completion changes force a roster rebuild, progress ticks do not.
-let lastMascotSig = '';
-	// Trash bin expanded state: user toggled, survives roster re-renders.
-	let mascotTrashOpen = false;
 	let contextPanelOpen = false;
 	const CONTEXT_RING_R = 10;
 	const CONTEXT_RING_C = 2 * Math.PI * CONTEXT_RING_R;
@@ -334,10 +325,19 @@ let lastMascotSig = '';
 		return draft;
 	}
 
+	/** Content signature of a question card; handlers stay bound while it is unchanged. */
+	function questionSig(item) {
+		const qs = (item.questions || [])
+			.map((q) => `${q.id || ''}:${(q.options || []).map((o) => o.id).join('.')}|${q.allowMultiple ? 1 : 0}${q.allowFreeform ? 1 : 0}`)
+			.join(',');
+		return `${item.status || ''}|${JSON.stringify(item.answers || '')}|${qs}`;
+	}
+
 	function renderQuestion(item, host) {
 		const card = document.createElement('div');
 		card.className = 'question-card' + (item.status === 'pending' ? ' pending' : ' settled');
 		card.setAttribute('data-ask-id', item.id);
+		card.setAttribute('data-question-sig', questionSig(item));
 
 		const title = document.createElement('div');
 		title.className = 'question-card-title';
@@ -803,6 +803,28 @@ let lastMascotSig = '';
 		scrollTimelineToBottom();
 	}
 
+	/** Entering a worker transcript from the Router home: land on where the
+	 * latest task begins — the user's own dispatch message — so the context
+	 * is immediately visible instead of dropping the view at the bottom. */
+	function revealLatestTaskStart() {
+		const rows = timelineEl.querySelectorAll('.user-row');
+		if (!rows.length) {
+			return;
+		}
+		const target = rows[rows.length - 1];
+		// Anchor there: stop bottom-follow so streaming output grows below
+		// without yanking the view away.
+		releaseTimelineStick();
+		timelineSuppressRepinUntil = performance.now() + 400;
+		const place = () => {
+			const delta = target.getBoundingClientRect().top - timelineEl.getBoundingClientRect().top;
+			writeTimelineScrollTop(Math.max(0, timelineEl.scrollTop + delta - 12));
+		};
+		place();
+		// Second pass after layout settles (markdown/images may resize rows).
+		requestAnimationFrame(place);
+	}
+
 	function bindToggle(el, message) {
 		el.addEventListener('pointerdown', (event) => {
 			if (event.button !== 0) {
@@ -1049,8 +1071,17 @@ let lastMascotSig = '';
 			top: body.scrollTop,
 			stickBottom: isNearBottom(body, 24),
 		};
-		if (body.textContent !== (item.text || '')) {
-			body.textContent = item.text || '';
+		// Mutate the SAME text node (`node.data`) instead of re-setting
+		// textContent: replacing the node is what kills an in-progress
+		// selection anchored inside streaming reasoning text.
+		const nextReasoning = item.text || '';
+		let textNode = (body.firstChild === body.lastChild && body.firstChild && body.firstChild.nodeType === Node.TEXT_NODE)
+			? body.firstChild
+			: null;
+		if (!textNode) {
+			body.replaceChildren(document.createTextNode(nextReasoning));
+		} else if (textNode.data !== nextReasoning) {
+			textNode.data = nextReasoning;
 		}
 		if (saved.stickBottom) {
 			body.scrollTop = body.scrollHeight;
@@ -1077,10 +1108,13 @@ let lastMascotSig = '';
 		}
 		const glyph = row.querySelector('.tool-header .glyph');
 		if (glyph) {
-			glyph.innerHTML = toolIcon(item.toolName, item.status);
+			const icon = toolIcon(item.toolName, item.status);
+			if (glyph.innerHTML !== icon) {
+				glyph.innerHTML = icon;
+			}
 		}
 		const name = row.querySelector('.tool-header .name');
-		if (name) {
+		if (name && name.textContent !== toolTitle(item.toolName)) {
 			name.textContent = toolTitle(item.toolName);
 		}
 		const summary = row.querySelector('.tool-header .summary');
@@ -1396,9 +1430,30 @@ let lastMascotSig = '';
 		if (body.className !== nextClass) {
 			body.className = nextClass;
 		}
-		const html = renderMarkdown(item.text || '');
-		if (body.innerHTML !== html) {
-			body.innerHTML = html;
+		if (item.streaming) {
+			// Streaming fast path: update the SAME text node (`node.data`) instead
+			// of rewriting innerHTML per chunk. Rebuilding markdown nodes mid-drag
+			// destroyed the selection anchor — Chromium then "repaired" the
+			// selection by anchoring it at the top of the timeline. Raw text while
+			// streaming, full markdown render once when the turn completes.
+			body.style.whiteSpace = 'pre-wrap';
+			let textNode = (body.firstChild === body.lastChild && body.firstChild && body.firstChild.nodeType === Node.TEXT_NODE)
+				? body.firstChild
+				: null;
+			if (!textNode) {
+				body.replaceChildren(document.createTextNode(''));
+				textNode = body.firstChild;
+			}
+			const next = item.text || '';
+			if (textNode.data !== next) {
+				textNode.data = next;
+			}
+		} else {
+			body.style.whiteSpace = '';
+			const html = renderMarkdown(item.text || '');
+			if (body.innerHTML !== html) {
+				body.innerHTML = html;
+			}
 		}
 		syncRowActions(el, actions.retry.has(item.id) ? ['retry'] : [], false);
 		return true;
@@ -1607,7 +1662,17 @@ let lastMascotSig = '';
 		if (item.kind === 'summary') {
 			return patchSummaryRow(el, item);
 		}
-		// Questions keep interactive controls — recreate that one row only.
+		if (item.kind === 'question') {
+			// Interactive controls live on this row. Keep the existing DOM and
+			// its click handlers while the question itself is unchanged — the
+			// old "always rebuild" behavior ate option/提交 clicks whenever any
+			// snapshot arrived (streaming text, duration ticks, other workers).
+			if (el.classList.contains('question-card') && el.getAttribute('data-question-sig') === questionSig(item)) {
+				return true;
+			}
+			return false;
+		}
+		// Unknown kinds: rebuild that one row only.
 		return false;
 	}
 
@@ -2071,6 +2136,11 @@ let lastMascotSig = '';
 	 * monospace, replaced by the final reply when the turn completes.
 	 */
 	function applyDispatchLive(sessionId, text) {
+		if (timelineDragActive) {
+			// Mid-drag DOM writes kill the selection anchor; the next snapshot
+			// re-applies the live preview right after the drag ends.
+			return;
+		}
 		if (!state || !state.items) {
 			return;
 		}
@@ -2226,7 +2296,17 @@ let lastMascotSig = '';
 		open.textContent = '↗';
 		open.addEventListener('click', (e) => {
 			e.stopPropagation();
-			vscode.postMessage({ type: 'openDispatch', workerId: item.workerId });
+			const row = open.closest('[data-item-id]');
+			const itemId = row && row.getAttribute('data-item-id');
+			const live = itemId && state && Array.isArray(state.items)
+				? state.items.find(rowItem => rowItem && rowItem.id === itemId)
+				: undefined;
+			const source = live || item;
+			vscode.postMessage({
+				type: 'openDispatch',
+				workerId: source.workerId || '',
+				workerSessionId: source.workerSessionId || '',
+			});
 		});
 		return open;
 	}
@@ -2375,6 +2455,23 @@ let lastMascotSig = '';
 		return 't:' + item.id;
 	}
 
+	// fw- ids are a phone-bridge stand-in. presentWorker only opens router ids,
+	// so a later synthetic stamp must not cover a real one already on the group.
+	function preferWorkerId(current, incoming) {
+		if (!incoming) {
+			return current || '';
+		}
+		if (!current) {
+			return incoming;
+		}
+		const currentSynthetic = current.startsWith('fw-');
+		const incomingSynthetic = incoming.startsWith('fw-');
+		if (currentSynthetic !== incomingSynthetic) {
+			return currentSynthetic ? incoming : current;
+		}
+		return incoming;
+	}
+
 	/**
 	 * Flatten Router items into Worker groups.
 	 * Grouping is render-only (workerSessionId → workerId → item id).
@@ -2404,7 +2501,7 @@ let lastMascotSig = '';
 				groups.set(key, group);
 			} else {
 				if (item.workerId) {
-					group.workerId = item.workerId;
+					group.workerId = preferWorkerId(group.workerId, item.workerId);
 				}
 				if (item.workerSessionId) {
 					group.workerSessionId = item.workerSessionId;
@@ -2437,14 +2534,22 @@ let lastMascotSig = '';
 		strip.title = '打开该 Worker 详情页，查看完整聊天流';
 		strip.addEventListener('click', (e) => {
 			e.stopPropagation();
-			if (!group.workerId) {
+			// The strip is created once and kept. Reconcile replaces the group
+			// object, so the closure's group goes stale — a workerId that
+			// arrived later (or a synthetic fw- stamp) never reached the click.
+			const card = strip.closest('.worker-card');
+			const live = (card && card._boardGroup) || group;
+			if (!live.workerId && !live.workerSessionId) {
 				return;
 			}
-			const card = strip.closest('.worker-card');
 			if (card && card._boardGroup) {
-				markBoardWorkerRead(group, card);
+				markBoardWorkerRead(live, card);
 			}
-			vscode.postMessage({ type: 'openDispatch', workerId: group.workerId });
+			vscode.postMessage({
+				type: 'openDispatch',
+				workerId: live.workerId || '',
+				workerSessionId: live.workerSessionId || '',
+			});
 		});
 		return strip;
 	}
@@ -3612,7 +3717,42 @@ let lastMascotSig = '';
 		quotaChip.title = parts.filter(Boolean).join(' · ');
 	}
 
+	// ── Selection-safe timeline rendering ─────────────────────────────────
+	// A left-button press inside the timeline means the user is selecting text
+	// (or clicking a control). Mutating the timeline DOM mid-drag used to
+	// destroy the text node under the selection anchor — Chromium then "fixed
+	// up" the selection by extending it from the top of the timeline, and
+	// clicks whose mousedown and mouseup straddled a rebuild (复制 / 选项 /
+	// 提交) never fired on the replacement element. While the button is down
+	// we therefore hold the newest snapshot untouched and render it as soon
+	// as the drag/click ends.
+	let timelineDragActive = false;
+	let timelineHeldItems = null;
+	function releaseTimelineDragRender() {
+		if (!timelineDragActive) {
+			return;
+		}
+		timelineDragActive = false;
+		const held = timelineHeldItems;
+		timelineHeldItems = null;
+		if (held) {
+			renderTimeline(held);
+		}
+	}
+	timelineEl.addEventListener('pointerdown', (e) => {
+		if (e.button === 0) {
+			timelineDragActive = true;
+		}
+	});
+	window.addEventListener('pointerup', releaseTimelineDragRender);
+	window.addEventListener('pointercancel', releaseTimelineDragRender);
+	window.addEventListener('blur', releaseTimelineDragRender);
+
 	function renderTimeline(items) {
+		if (timelineDragActive) {
+			timelineHeldItems = items || [];
+			return;
+		}
 		try {
 			if (tryPatchElapsed(items)) {
 				return;
@@ -4352,8 +4492,6 @@ let lastMascotSig = '';
 			src,
 			choices.map((item) => `${item.id}|${item.thumb}|${item.label}`).join(','),
 			usedPicks.map((item) => `${item.id}|${item.thumb}`).join(','),
-			mascotMenuKey(chatMascot),
-			mascotTrashOpen ? 'trash-open' : '',
 		].join('::');
 		if (key === sceneKey) {
 			if (sceneBtn) {
@@ -4406,7 +4544,6 @@ let lastMascotSig = '';
 		remoteMount.id = 'unsplashMount';
 		sceneMenu.appendChild(remoteMount);
 		paintUnsplash();
-		renderMascotSection(sceneMenu);
 		sceneMenu.scrollTop = keptScroll;
 		if (sceneBtn) {
 			sceneBtn.setAttribute('aria-expanded', openMenu === 'scene' ? 'true' : 'false');
@@ -4475,508 +4612,18 @@ let lastMascotSig = '';
 		return btn;
 	}
 
-	function mascotMenuKey(mascot) {
-		if (!mascot) {
-			return 'none';
-		}
-		return JSON.stringify({
-			e: mascot.enabled,
-			s: mascot.sizePx ?? mascot.size,
-			l: (mascot.slots || []).map((slot) => (slot
-				? slot.id + '/' + (slot.persona || '') + (slot.pos ? `@${Math.round(slot.pos.x * 100)},${Math.round(slot.pos.y * 100)}` : '')
-				: '')),
-			c: (mascot.catalog || []).map((entry) => `${entry.id}:${entry.downloaded ? 1 : 0}:${entry.hidden ? 1 : 0}`),
-		});
-	}
 
-	/**
-	 * Mascot manager inside the background menu: a toggle, size chips, and
-	 * character chips. A chip click toggles that character in the queue;
-	 * picking an undownloaded one downloads it first. Queue order = chip
-	 * pick order, slot 0 sits closest to the composer.
-	 */
-	function renderMascotSection(menu) {
-		const mascot = chatMascot;
-		const title = document.createElement('div');
-		title.className = 'scene-section';
-		title.textContent = '精灵';
-		menu.appendChild(title);
-
-		const toggle = sceneTileButton('scene-key mascot-toggle' + (mascot && mascot.enabled ? ' on' : ''));
-		toggle.textContent = mascot && mascot.enabled ? '已开启（点击关闭）' : '显示输入框旁的小精灵';
-		toggle.title = '在输入框右侧显示会动的 Live2D 小家伙';
-		toggle.onclick = () => {
-			vscode.postMessage({ type: 'setMascot', patch: { enabled: !(mascot && mascot.enabled) } });
-		};
-		menu.appendChild(toggle);
-
-		if (!mascot) {
-			return;
-		}
-		const catalog = Array.isArray(mascot.catalog) ? mascot.catalog : [];
-		const slots = Array.isArray(mascot.slots) ? mascot.slots : [];
-		const queuedIds = slots.filter((slot) => slot && slot.id).map((slot) => slot.id);
-
-		const sizeRow = document.createElement('div');
-		sizeRow.className = 'mascot-size-row';
-		const sizeRange = mascot.sizeRange || {};
-		const sizeMin = typeof sizeRange.min === 'number' ? sizeRange.min : 160;
-		const sizeMax = typeof sizeRange.max === 'number' ? sizeRange.max : 1000;
-		const sizeStep = typeof sizeRange.step === 'number' ? sizeRange.step : 10;
-		const sizeNow = typeof mascot.sizePx === 'number' ? mascot.sizePx : 300;
-		const slider = document.createElement('input');
-		slider.type = 'range';
-		slider.min = String(sizeMin);
-		slider.max = String(sizeMax);
-		slider.step = String(sizeStep);
-		slider.value = String(sizeNow);
-		slider.className = 'mascot-size-slider';
-		slider.title = '拖动调整精灵大小';
-		const sizeLabel = document.createElement('span');
-		sizeLabel.className = 'mascot-size-value';
-		sizeLabel.textContent = `${sizeNow}px`;
-		// Live label + throttled apply, so dragging the slider resizes smoothly.
-		let sizeTimer = 0;
-		slider.oninput = () => {
-			const v = Math.round(Number(slider.value) || sizeNow);
-			sizeLabel.textContent = `${v}px`;
-			window.clearTimeout(sizeTimer);
-			sizeTimer = window.setTimeout(() => {
-				vscode.postMessage({ type: 'setMascot', patch: { sizePx: v } });
-			}, 120);
-		};
-		sizeRow.appendChild(slider);
-		sizeRow.appendChild(sizeLabel);
-		menu.appendChild(sizeRow);
-
-		// Current squad, one row per queued character with its OWN size slider.
-		// The global slider above only sets the default height for newcomers;
-		// models differ a lot in native size, so each keeps its own here.
-		const squadSlots = (mascot.slots || []).filter((slot) => slot && slot.id);
-		const catById = new Map(catalog.map((entry) => [entry.id, entry]));
-		if (squadSlots.length) {
-			const squadLabel = document.createElement('div');
-			squadLabel.className = 'mascot-section-label';
-			squadLabel.textContent = '当前小队（大小和人设按角色记）';
-			menu.appendChild(squadLabel);
-			const personaList = Array.isArray(mascot.personas) ? mascot.personas : [];
-			squadSlots.forEach((slot) => {
-				const entry = catById.get(slot.id) || { id: slot.id, label: slot.label || slot.id };
-				const row = document.createElement('div');
-				row.className = 'mascot-squad-row';
-				const top = document.createElement('div');
-				top.className = 'mascot-squad-top';
-				const thumb = document.createElement('span');
-				thumb.className = 'mascot-squad-thumb';
-				if (entry.preview) {
-					const img = document.createElement('img');
-					img.alt = '';
-					img.src = entry.preview;
-					img.onerror = () => { img.remove(); };
-					thumb.appendChild(img);
-				} else {
-					thumb.textContent = (entry.label || '?').slice(0, 1);
-				}
-				top.appendChild(thumb);
-				const name = document.createElement('span');
-				name.className = 'mascot-squad-name';
-				name.textContent = entry.label || slot.id;
-				name.title = entry.source || '';
-				top.appendChild(name);
-				const kick = document.createElement('span');
-				kick.className = 'mascot-squad-kick';
-				kick.setAttribute('role', 'button');
-				kick.title = '移出小队';
-				kick.textContent = '✕';
-				kick.onclick = (event) => {
-					event.stopPropagation();
-					event.preventDefault();
-					vscode.postMessage({ type: 'setMascot', patch: { removeId: slot.id } });
-				};
-				top.appendChild(kick);
-				row.appendChild(top);
-				const sizeLine = document.createElement('div');
-				sizeLine.className = 'mascot-squad-size';
-				const range = document.createElement('input');
-				range.type = 'range';
-				range.className = 'mascot-squad-range';
-				const bounds = mascot.sizeRange || {};
-				range.min = String(bounds.min ?? 160);
-				range.max = String(bounds.max ?? 480);
-				range.step = String(bounds.step ?? 8);
-				const own = typeof slot.size === 'number' && slot.size > 0 ? slot.size : sizeNow;
-				range.value = String(Math.round(own));
-				const px = document.createElement('span');
-				px.className = 'mascot-squad-px';
-				px.textContent = `${Math.round(own)}px`;
-				// Debounced: the label tracks the thumb live, the model resizes
-				// shortly after the drag settles (one state round-trip).
-				let sizeTimer = null;
-				range.addEventListener('input', () => {
-					px.textContent = `${range.value}px`;
-					if (sizeTimer) { clearTimeout(sizeTimer); }
-					sizeTimer = setTimeout(() => {
-						vscode.postMessage({ type: 'setMascot', patch: { setSize: { id: slot.id, sizePx: Number(range.value) } } });
-					}, 200);
-				});
-				sizeLine.appendChild(range);
-				sizeLine.appendChild(px);
-				row.appendChild(sizeLine);
-				if (personaList.length) {
-					const personaRow = document.createElement('label');
-					personaRow.className = 'mascot-squad-persona';
-					const personaTag = document.createElement('span');
-					personaTag.textContent = '人设';
-					const select = document.createElement('select');
-					select.className = 'mascot-squad-select';
-					const currentId = slot.persona || personaList[0].id;
-					let currentHint = '';
-					const groups = [];
-					personaList.forEach((persona) => {
-						const groupName = persona.group || '性格';
-						let group = groups.find((item) => item.name === groupName);
-						if (!group) {
-							group = { name: groupName, items: [] };
-							groups.push(group);
-						}
-						group.items.push(persona);
-						if (persona.id === currentId) {
-							currentHint = persona.hint || '';
-						}
-					});
-					groups.forEach((group) => {
-						const optgroup = document.createElement('optgroup');
-						optgroup.label = group.name;
-						group.items.forEach((persona) => {
-							const opt = document.createElement('option');
-							opt.value = persona.id;
-							opt.textContent = persona.label;
-							opt.title = persona.hint || '';
-							if (persona.id === currentId) {
-								opt.selected = true;
-							}
-							optgroup.appendChild(opt);
-						});
-						select.appendChild(optgroup);
-					});
-					select.title = currentHint;
-					select.addEventListener('change', () => {
-						const picked = personaList.find((persona) => persona.id === select.value);
-						select.title = picked && picked.hint ? picked.hint : '';
-						const hintEl = row.querySelector('.mascot-squad-hint');
-						if (hintEl) {
-							hintEl.textContent = select.title;
-						}
-						vscode.postMessage({
-							type: 'setMascot',
-							patch: { setPersona: { id: slot.id, persona: select.value } },
-						});
-					});
-					personaRow.appendChild(personaTag);
-					personaRow.appendChild(select);
-					row.appendChild(personaRow);
-					const hint = document.createElement('div');
-					hint.className = 'mascot-squad-hint';
-					hint.textContent = currentHint;
-					row.appendChild(hint);
-				}
-				menu.appendChild(row);
-			});
-		}
-
-		// Recently used: everything the user has queued before, one click to
-		// re-summon. ✕ here only edits history, the roster below is untouched.
-		const recentEntries = (mascot.recent || []).filter((entry) => {
-			const full = catById.get(entry.id);
-			return !full || !full.hidden;
-		});
-		if (recentEntries.length) {
-			const recentLabel = document.createElement('div');
-			recentLabel.className = 'mascot-section-label';
-			recentLabel.textContent = '最近使用';
-			menu.appendChild(recentLabel);
-			const strip = document.createElement('div');
-			strip.className = 'mascot-roster recent';
-			const queuedIds = squadSlots.map((slot) => slot.id);
-			recentEntries.forEach((entry) => {
-				const full = catById.get(entry.id) || entry;
-				const queued = queuedIds.indexOf(entry.id) >= 0;
-				const card = document.createElement('button');
-				card.type = 'button';
-				card.className = 'mascot-card recent' + (queued ? ' selected' : '');
-				const thumb = document.createElement('span');
-				thumb.className = 'mascot-card-thumb';
-				if (full.preview) {
-					const img = document.createElement('img');
-					img.alt = '';
-					img.src = full.preview;
-					img.onerror = () => { img.remove(); };
-					thumb.appendChild(img);
-				} else {
-					thumb.textContent = (full.label || '?').slice(0, 1);
-				}
-				if (queued) {
-					const on = document.createElement('b');
-					on.className = 'mascot-card-on';
-					on.textContent = '●';
-					thumb.appendChild(on);
-				}
-				card.appendChild(thumb);
-				const name = document.createElement('span');
-				name.className = 'mascot-card-name';
-				name.textContent = full.label || entry.id;
-				card.appendChild(name);
-				card.title = queued ? '点击移出小队' : '点击加入小队';
-				card.onclick = () => {
-					if (queued) {
-						vscode.postMessage({ type: 'setMascot', patch: { removeId: entry.id } });
-						return;
-					}
-					if (!full.downloaded) {
-						vscode.postMessage({ type: 'downloadMascot', id: entry.id });
-					}
-					vscode.postMessage({ type: 'setMascot', patch: { appendId: entry.id } });
-				};
-				const forget = document.createElement('span');
-				forget.className = 'mascot-card-forget';
-				forget.setAttribute('role', 'button');
-				forget.title = '从最近使用中移除';
-				forget.textContent = '✕';
-				forget.onclick = (event) => {
-					event.stopPropagation();
-					event.preventDefault();
-					vscode.postMessage({ type: 'setMascot', patch: { forgetId: entry.id } });
-				};
-				card.appendChild(forget);
-				strip.appendChild(card);
-			});
-			menu.appendChild(strip);
-		}
-
-		const roster = document.createElement('div');
-		roster.className = 'mascot-roster';
-		mascotCardRefs = new Map();
-		const hiddenOnes = catalog.filter((entry) => entry.hidden);
-		catalog.filter((entry) => !entry.hidden).forEach((entry) => {
-			const queued = queuedIds.indexOf(entry.id) >= 0;
-			const downloading = !!entry.downloading;
-			const card = document.createElement('button');
-			card.type = 'button';
-			card.className = 'mascot-card' + (queued ? ' selected' : '') + (downloading ? ' busy' : '');
-
-			// Thumbnail: shipped render snapshot when we have one, initial
-			// letter tile as fallback so every model stays recognizable.
-			const thumb = document.createElement('span');
-			thumb.className = 'mascot-card-thumb';
-			if (entry.preview) {
-				const img = document.createElement('img');
-				img.alt = '';
-				img.src = entry.preview;
-				img.onerror = () => { img.remove(); };
-				thumb.appendChild(img);
-			} else {
-				thumb.textContent = (entry.label || '?').slice(0, 1);
-			}
-			if (downloading) {
-				const bar = document.createElement('i');
-				bar.className = 'mascot-card-progress';
-				bar.style.width = `${Math.max(4, Math.round((entry.progress || 0) * 100))}%`;
-				thumb.appendChild(bar);
-			} else if (!entry.downloaded && !queued) {
-				const dl = document.createElement('b');
-				dl.className = 'mascot-card-dl';
-				dl.textContent = '↓';
-				thumb.appendChild(dl);
-			} else if (queued) {
-				const on = document.createElement('b');
-				on.className = 'mascot-card-on';
-				on.textContent = '●';
-				thumb.appendChild(on);
-			}
-			card.appendChild(thumb);
-
-			const name = document.createElement('span');
-			name.className = 'mascot-card-name';
-			name.textContent = entry.label;
-			card.appendChild(name);
-
-			// Trash bin entry point: tuck ugly/broken models away without
-			// deleting the downloaded files (restorable from the bin).
-			const hide = document.createElement('span');
-			hide.className = 'mascot-card-hide';
-			hide.setAttribute('role', 'button');
-			hide.title = '收进垃圾篓（不再默认展示，可随时恢复）';
-			hide.textContent = '✕';
-			hide.onclick = (event) => {
-				event.stopPropagation();
-				event.preventDefault();
-				vscode.postMessage({ type: 'setMascot', patch: { hideId: entry.id } });
-			};
-			card.appendChild(hide);
-
-			const origin = entry.note || 'Live2D 官方样例';
-			card.title = queued
-				? `${entry.source}（${origin}）— 点击移出队列`
-				: entry.downloaded
-					? `${entry.source}（${origin}）— 点击加入队列`
-					: `${entry.source}（${origin}）· 约 ${entry.sizeMB}MB — 点击下载并加入队列`;
-			card.disabled = downloading || (!queued && queuedIds.length >= 3);
-			card.onclick = () => {
-				if (queued) {
-					// Id-based removal: slot indices in the webview (holes
-					// filtered out) do not line up with host-side slots.
-					vscode.postMessage({ type: 'setMascot', patch: { removeId: entry.id } });
-					return;
-				}
-				if (!entry.downloaded) {
-					vscode.postMessage({ type: 'downloadMascot', id: entry.id });
-				}
-				vscode.postMessage({ type: 'setMascot', patch: { appendId: entry.id } });
-			};
-			roster.appendChild(card);
-			mascotCardRefs.set(entry.id, { card, thumb });
-		});
-		menu.appendChild(roster);
-		if (hiddenOnes.length) {
-			appendMascotTrash(menu, hiddenOnes);
-		}
-
-		const note = document.createElement('div');
-		note.className = 'scene-note';
-		note.textContent = mascot.enabled
-			? '点角色加入或移出小队（最多三个）；「当前小队」里可单独调每个角色的大小（悬停角色上滚轮也行）；按住可拖到任意位置，右键复位；点它会做动作说话。'
-			: '开启后，小家伙会蹲在输入框右边，会动、会看你、会搭话。';
-		menu.appendChild(note);
-	}
-
-	/** Trash bin: hidden models listed under a collapsed toggle. Clicking a
-	 *  card restores it to the default roster. */
-	function appendMascotTrash(menu, hiddenOnes) {
-		const toggle = document.createElement('button');
-		toggle.type = 'button';
-		toggle.className = 'mascot-trash-toggle' + (mascotTrashOpen ? ' open' : '');
-		toggle.textContent = mascotTrashOpen
-			? `垃圾篓（${hiddenOnes.length}）— 点击收起`
-			: `垃圾篓（${hiddenOnes.length}）`;
-		toggle.title = '被你收起来的模型放在这里，点击卡片可恢复展示';
-		toggle.onclick = () => {
-			mascotTrashOpen = !mascotTrashOpen;
-			sceneKey = '';
-			if (state) {
-				renderScene(state.scene);
-			}
-		};
-		menu.appendChild(toggle);
-		if (!mascotTrashOpen) {
-			return;
-		}
-		const bin = document.createElement('div');
-		bin.className = 'mascot-roster trash';
-		hiddenOnes.forEach((entry) => {
-			const card = document.createElement('button');
-			card.type = 'button';
-			card.className = 'mascot-card trashed';
-			const thumb = document.createElement('span');
-			thumb.className = 'mascot-card-thumb';
-			if (entry.preview) {
-				const img = document.createElement('img');
-				img.alt = '';
-				img.src = entry.preview;
-				img.onerror = () => { img.remove(); };
-				thumb.appendChild(img);
-			} else {
-				thumb.textContent = (entry.label || '?').slice(0, 1);
-			}
-			card.appendChild(thumb);
-			const name = document.createElement('span');
-			name.className = 'mascot-card-name';
-			name.textContent = `↩ ${entry.label}`;
-			card.appendChild(name);
-			card.title = `${entry.source} — 点击恢复展示`;
-			card.onclick = () => {
-				vscode.postMessage({ type: 'setMascot', patch: { unhideId: entry.id } });
-			};
-			bin.appendChild(card);
-		});
-		menu.appendChild(bin);
-	}
-
-	/** Structural mascot signature: everything the roster lays out positions
-	 *  for. Downloading/progress flags are deliberately excluded — they change
-	 *  every few files and must never trigger a rebuild (scroll preservation),
-	 *  the in-place patcher covers their visuals. */
-	function mascotStructureSig(m) {
-		if (!m) {
-			return '';
-		}
-		const slots = (m.slots || []).map((slot) => (slot && slot.id) || '-').join(',');
-		const cat = (m.catalog || []).map((entry) => `${entry.id}:${entry.downloaded ? 1 : 0}${entry.hidden ? 'h' : ''}`).join(',');
-		const recent = (m.recent || []).map((entry) => entry.id).join(',');
-		return `${m.enabled ? 1 : 0}|${slots}|${cat}|${recent}`;
-	}
-
-	/** Patches roster cards for download progress/queue state without a DOM
-	 *  rebuild, so the grid keeps its scroll position while downloading. */
-	function updateMascotRosterLive() {
-		if (!mascotCardRefs.size || !chatMascot) {
-			return;
-		}
-		const slots = Array.isArray(chatMascot.slots) ? chatMascot.slots : [];
-		const queuedIds = slots.filter((slot) => slot && slot.id).map((slot) => slot.id);
-		const byId = new Map((chatMascot.catalog || []).map((entry) => [entry.id, entry]));
-		mascotCardRefs.forEach((ref, id) => {
-			const entry = byId.get(id);
-			if (!entry || !ref.card || !ref.thumb) {
-				return;
-			}
-			const queued = queuedIds.indexOf(id) >= 0;
-			ref.card.classList.toggle('selected', queued);
-			ref.card.classList.toggle('busy', !!entry.downloading);
-			ref.card.disabled = !!entry.downloading || (!queued && queuedIds.length >= 3);
-			const badge = ref.thumb.querySelector('.mascot-card-progress, .mascot-card-dl, .mascot-card-on');
-			if (badge) {
-				badge.remove();
-			}
-			if (entry.downloading) {
-				const bar = document.createElement('i');
-				bar.className = 'mascot-card-progress';
-				bar.style.width = `${Math.max(4, Math.round((entry.progress || 0) * 100))}%`;
-				ref.thumb.appendChild(bar);
-			} else if (!entry.downloaded && !queued) {
-				const dl = document.createElement('b');
-				dl.className = 'mascot-card-dl';
-				dl.textContent = '↓';
-				ref.thumb.appendChild(dl);
-			} else if (queued) {
-				const on = document.createElement('b');
-				on.className = 'mascot-card-on';
-				on.textContent = '●';
-				ref.thumb.appendChild(on);
-			}
-		});
-	}
-
-	/** Task lifecycle feedback for the mascots: dispatch when a run starts,
-	 * complete when it ends. Purely decorative — never throws into render. */
-	function notifyMascots(kind) {
-		try {
-			if (window.ZCodeMascots && typeof window.ZCodeMascots.react === 'function') {
-				window.ZCodeMascots.react(kind);
-			}
-		} catch (e) { /* ignore */ }
-	}
 
 	function render(next) {
 		const wasBusy = busy;
+		const prevState = state;
 		state = next;
 		applyFontSize(next.fontSize);
 		applyLineHeight(next.lineHeight);
 		setBusy(!!next.busy);
 		if (next.busy && !wasBusy) {
 			pinTimelineToBottom();
-			notifyMascots('dispatch');
 		} else if (!next.busy && wasBusy) {
-			notifyMascots('complete');
 		}
 		if (next.clearDraft) {
 			inputEl.value = '';
@@ -5013,6 +4660,18 @@ let lastMascotSig = '';
 			renderTimeline(next.items || []);
 		} catch (err) {
 			console.error('[zcode] renderTimeline failed', err);
+		}
+
+		// Router home → worker detail: land on the start of the latest task
+		// (the user's dispatch message), not wherever scroll state left us.
+		if (prevState && prevState.isRouter && !next.isRouter) {
+			requestAnimationFrame(() => {
+				try {
+					revealLatestTaskStart();
+				} catch (err) {
+					console.error('[zcode] revealLatestTaskStart failed', err);
+				}
+			});
 		}
 
 		try {
@@ -5060,28 +4719,10 @@ let lastMascotSig = '';
 		historyOpen = !!next.historyOpen;
 		document.body.classList.toggle('router-session', !!next.isRouter);
 		document.body.classList.toggle('worker-session', !next.isRouter && !!next.isWorker);
-		chatMascot = next.mascot || null;
-		// Mascot state must be in place BEFORE renderScene — the roster inside
-		// the scene menu reads it. Structural changes (trash/queue/recent/
-		// download finished) invalidate the scene key so the menu rebuilds;
-		// progress-only ticks fall through to the in-place patch below.
-		const mascotSig = mascotStructureSig(chatMascot);
-		if (mascotSig !== lastMascotSig) {
-			lastMascotSig = mascotSig;
-			sceneKey = '';
-		}
+		// Chat background (scene) must render on every state snapshot: it
+		// applies the wallpaper layer and rebuilds the 背景 menu when the
+		// choices change (sceneKey guards no-op ticks).
 		renderScene(next.scene);
-		// Download progress changes every few files; a full roster rebuild on
-		// each tick resets scrolling mid-browse. Patch the live cards instead.
-		updateMascotRosterLive();
-		if (window.ZCodeMascots) {
-			window.ZCodeMascots.apply(chatMascot);
-			// Speech, drag-to-place, and right-click-reset report back through these hooks.
-			window.ZCodeMascots.onSpeak = (voice) => vscode.postMessage({ type: 'mascotSpeak', voice });
-			window.ZCodeMascots.onMove = (move) => vscode.postMessage({ type: 'setMascot', patch: { move } });
-			window.ZCodeMascots.onReset = (id) => vscode.postMessage({ type: 'setMascot', patch: { resetPos: id } });
-			window.ZCodeMascots.onSize = (id, sizePx) => vscode.postMessage({ type: 'setMascot', patch: { setSize: { id, sizePx } } });
-		}
 		if (inputEl) {
 			inputEl.placeholder = next.isRouter
 				? (next.dispatchTarget
@@ -5387,7 +5028,7 @@ let lastMascotSig = '';
 		}
 	}
 	// Right-click page menu. Webview devtools are not exposed by this build,
-	// and mascot/background failures need a way to be inspected without them.
+	// and background failures need a way to be inspected without them.
 	// Editable fields keep the native cut/copy/paste context menu.
 	let webviewMenuEl = null;
 	const closeWebviewMenu = () => {
@@ -5397,22 +5038,6 @@ let lastMascotSig = '';
 		}
 	};
 	// alert() is blocked in webviews without allow-modals; render in-page instead.
-	const showMascotStatusPanel = (status) => {
-		const prev = document.querySelector('.mascot-status-panel');
-		if (prev) prev.remove();
-		const panel = document.createElement('div');
-		panel.className = 'mascot-status-panel';
-		const close = document.createElement('button');
-		close.type = 'button';
-		close.className = 'mascot-status-close';
-		close.textContent = '关闭';
-		close.addEventListener('click', () => panel.remove());
-		const pre = document.createElement('pre');
-		pre.textContent = JSON.stringify(status, null, 2);
-		panel.appendChild(close);
-		panel.appendChild(pre);
-		document.body.appendChild(panel);
-	};
 	document.addEventListener('contextmenu', (event) => {
 		const target = event.target instanceof Element ? event.target : null;
 		if (target && target.closest('textarea, input, select, [contenteditable="true"]')) {
@@ -5425,15 +5050,6 @@ let lastMascotSig = '';
 		const items = [
 			{ label: '打开开发者工具', run: () => vscode.postMessage({ type: 'openDevTools' }) },
 			{ label: '重新加载聊天页面', run: () => location.reload() },
-			{
-				label: '精灵状态',
-				run: () => {
-					const status = window.ZCodeMascots && window.ZCodeMascots.status
-						? window.ZCodeMascots.status()
-						: { error: 'ZCodeMascots 未加载（mascotView.js 没有执行）' };
-					showMascotStatusPanel(status);
-				},
-			},
 		];
 		for (const item of items) {
 			const btn = document.createElement('button');
@@ -5492,16 +5108,36 @@ let lastMascotSig = '';
 		const codeEl = block && block.querySelector('pre code');
 		if (!codeEl) return;
 		const text = codeEl.innerText.replace(/\n$/, '');
+		let done = false;
 		try {
-			await navigator.clipboard.writeText(text);
+			if (navigator.clipboard && navigator.clipboard.writeText) {
+				// In webviews the clipboard permission can reject or hang the
+				// promise; race it so the button still finishes inside the
+				// user-gesture window and the execCommand fallback stays usable.
+				await Promise.race([
+					navigator.clipboard.writeText(text),
+					new Promise((_, reject) => setTimeout(() => reject(new Error('clipboard timeout')), 400)),
+				]);
+				done = true;
+			}
 		} catch {
+			// fall through to the textarea fallback below
+		}
+		if (!done) {
 			const ta = document.createElement('textarea');
 			ta.value = text;
+			ta.setAttribute('readonly', '');
 			ta.style.position = 'fixed';
 			ta.style.left = '-9999px';
 			document.body.appendChild(ta);
+			ta.focus();
 			ta.select();
-			document.execCommand('copy');
+			ta.setSelectionRange(0, ta.value.length);
+			try {
+				document.execCommand('copy');
+			} catch {
+				// no clipboard access at all — keep the old silent behavior
+			}
 			ta.remove();
 		}
 		btn.classList.add('copied');
@@ -5677,39 +5313,59 @@ let lastMascotSig = '';
 		pill.hidden = false;
 	}
 
-	// ---- Task-completion chime. Only fired by the host when a real agent turn
-	// finishes successfully; no other sounds exist in this view. The visible
-	// reminder is the editor's system notification, not in-page UI. ----
+	// ---- Task-end chime. The host fires this when an agent turn completes,
+	// fails, or is cancelled. One shared context, unlocked on a user gesture:
+	// closing it after each chime made the next turn silent (autoplay). ----
+	let doneAudioCtx = null;
+	function unlockDoneAudio() {
+		try {
+			const Ctx = window.AudioContext || window.webkitAudioContext;
+			if (!Ctx) return;
+			if (!doneAudioCtx || doneAudioCtx.state === 'closed') {
+				doneAudioCtx = new Ctx();
+			}
+			if (doneAudioCtx.state === 'suspended' && doneAudioCtx.resume) {
+				void doneAudioCtx.resume();
+			}
+		} catch { /* audio unavailable */ }
+	}
+	document.addEventListener('pointerdown', unlockDoneAudio, true);
+	document.addEventListener('keydown', unlockDoneAudio, true);
 	function playDoneChime() {
 		try {
 			const Ctx = window.AudioContext || window.webkitAudioContext;
 			if (!Ctx) return;
-			const ctx = new Ctx();
-			if (ctx.state === 'suspended' && ctx.resume) void ctx.resume();
-			const now = ctx.currentTime;
-			const gain = ctx.createGain();
-			gain.connect(ctx.destination);
-			gain.gain.setValueAtTime(0.0001, now);
-			gain.gain.exponentialRampToValueAtTime(0.09, now + 0.02);
-			gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
-			[784, 1046.5].forEach((freq, i) => {
-				const osc = ctx.createOscillator();
-				osc.type = 'sine';
-				osc.frequency.value = freq;
-				osc.connect(gain);
-				osc.start(now + i * 0.14);
-				osc.stop(now + 0.55);
-			});
-			setTimeout(() => { ctx.close().catch(() => {}); }, 900);
-		} catch { /* audio unavailable — the system notification still fires */ }
+			if (!doneAudioCtx || doneAudioCtx.state === 'closed') {
+				doneAudioCtx = new Ctx();
+			}
+			const ctx = doneAudioCtx;
+			const start = () => {
+				const now = ctx.currentTime;
+				const gain = ctx.createGain();
+				gain.connect(ctx.destination);
+				gain.gain.setValueAtTime(0.0001, now);
+				gain.gain.exponentialRampToValueAtTime(0.09, now + 0.02);
+				gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.55);
+				[784, 1046.5].forEach((freq, i) => {
+					const osc = ctx.createOscillator();
+					osc.type = 'sine';
+					osc.frequency.value = freq;
+					osc.connect(gain);
+					osc.start(now + i * 0.14);
+					osc.stop(now + 0.55);
+				});
+			};
+			if (ctx.state === 'suspended' && ctx.resume) {
+				ctx.resume().then(start).catch(() => {});
+			} else {
+				start();
+			}
+		} catch { /* audio unavailable */ }
 	}
 
 	window.addEventListener('message', (event) => {
 		const data = event.data;
 		if (!data) return;
-		if (data.type === 'mascotLine' && window.ZCodeMascots && typeof window.ZCodeMascots.hear === 'function') {
-			window.ZCodeMascots.hear(data.seq, data.line, !!data.skipped);
-		}
 		if (data.type === 'state') {
 			render(data);
 			syncDonePill();
@@ -5718,7 +5374,9 @@ let lastMascotSig = '';
 		if (data.type === 'contextUsage') renderContextUsage(data.contextUsage);
 		if (data.type === 'turnCompleted') {
 			playDoneChime();
-			showDonePill(data.sessionId, data.title);
+			if (data.outcome !== 'failed' && data.outcome !== 'cancelled') {
+				showDonePill(data.sessionId, data.title);
+			}
 		}
 		if (data.type === 'dispatchLive') applyDispatchLive(data.sessionId, data.text);
 		if (data.type === 'cycleBoardColumns') cycleBoardColumns();
@@ -5739,4 +5397,293 @@ let lastMascotSig = '';
 		}
 	});
 	vscode.postMessage({ type: 'ready' });
+})();
+
+/* ============================================================
+ * 后台进程面板：Worker 拉起的后台进程（超时转后台的 job、常驻终端）。
+ * 自包含模块：独立监听 jobsState/jobsOutput，自建 DOM，不依赖上文结构。
+ * ============================================================ */
+(function () {
+	'use strict';
+
+	var state = {
+		open: false,
+		jobs: [],
+		terminals: [],
+		outputs: {},      // jobId -> 输出文本
+		expanded: {},     // jobId -> Boolean
+		loading: {}       // jobId -> Boolean
+	};
+	var els = null;
+
+	function ensureDom() {
+		if (els) { return; }
+		var root = document.createElement('div');
+		root.id = 'zc-jobs-root';
+		root.style.display = 'none';
+		var chip = document.createElement('button');
+		chip.type = 'button';
+		chip.className = 'zc-jobs-chip';
+		chip.title = 'Worker 拉起的后台进程';
+		var drawer = document.createElement('div');
+		drawer.className = 'zc-jobs-drawer';
+		drawer.style.display = 'none';
+		root.appendChild(chip);
+		root.appendChild(drawer);
+		document.body.appendChild(root);
+		els = { root: root, chip: chip, drawer: drawer };
+		chip.addEventListener('click', function () { setOpen(!state.open); });
+	}
+
+	function setOpen(open) {
+		state.open = open;
+		if (open) {
+			vscode.postMessage({ type: 'jobsRequest' });
+		}
+		render();
+	}
+
+	function fmtElapsed(sec) {
+		if (sec < 60) { return sec + 's'; }
+		var m = Math.floor(sec / 60);
+		var s = sec % 60;
+		if (m < 60) { return m + 'm' + (s ? s + 's' : ''); }
+		var h = Math.floor(m / 60);
+		return h + 'h' + (m % 60) + 'm';
+	}
+
+	function jobBadge(job) {
+		if (job.running) {
+			return job.killed
+				? { text: '终止中', cls: 'zc-badge zc-kill' }
+				: { text: '运行中', cls: 'zc-badge zc-run' };
+		}
+		if (job.exitCode === 0) { return { text: '退出 0', cls: 'zc-badge zc-ok' }; }
+		if (job.exitCode === null || job.exitCode === undefined) { return { text: '已结束', cls: 'zc-badge zc-fail' }; }
+		return { text: '退出 ' + job.exitCode, cls: 'zc-badge zc-fail' };
+	}
+
+	function termBadge(t) {
+		return t.running
+			? { text: '运行中', cls: 'zc-badge zc-run' }
+			: { text: '已退出 ' + (t.exitCode === null || t.exitCode === undefined ? 'null' : t.exitCode), cls: 'zc-badge zc-fail' };
+	}
+
+	function mkBtn(label, className, title, onClick) {
+		var b = document.createElement('button');
+		b.type = 'button';
+		b.className = className;
+		b.textContent = label;
+		if (title) { b.title = title; }
+		b.addEventListener('click', function (e) {
+			e.stopPropagation();
+			onClick();
+		});
+		return b;
+	}
+
+	function appendJobRow(body, job) {
+		var row = document.createElement('div');
+		row.className = 'zc-job';
+
+		var top = document.createElement('div');
+		top.className = 'zc-job-top';
+		var badge = jobBadge(job);
+		var badgeEl = document.createElement('span');
+		badgeEl.className = badge.cls;
+		badgeEl.textContent = badge.text;
+		var idEl = document.createElement('span');
+		idEl.className = 'zc-job-id';
+		idEl.textContent = job.id;
+		var meta = document.createElement('span');
+		meta.className = 'zc-job-meta';
+		var elapsed = document.createElement('span');
+		elapsed.textContent = fmtElapsed(job.elapsedSec || 0);
+		var io = document.createElement('span');
+		io.textContent = 'out ' + (job.stdoutLen || 0) + ' / err ' + (job.stderrLen || 0);
+		io.title = 'stdout / stderr 字节数';
+		meta.appendChild(elapsed);
+		meta.appendChild(io);
+		meta.appendChild(mkBtn(state.expanded[job.id] ? '收起' : '输出', 'zc-jobs-btn', '查看输出', function () {
+			toggleOutput(job.id);
+		}));
+		if (job.running) {
+			meta.appendChild(mkBtn('终止', 'zc-jobs-btn zc-danger', '发送 SIGTERM 终止该后台任务', function () {
+				vscode.postMessage({ type: 'jobsKill', id: job.id });
+			}));
+		}
+		top.appendChild(badgeEl);
+		top.appendChild(idEl);
+		top.appendChild(meta);
+
+		var cmd = document.createElement('div');
+		cmd.className = 'zc-job-cmd';
+		cmd.textContent = '$ ' + job.command;
+		cmd.title = job.command;
+
+		var cwd = document.createElement('div');
+		cwd.className = 'zc-job-cwd';
+		cwd.textContent = job.cwd;
+
+		row.appendChild(top);
+		row.appendChild(cmd);
+		row.appendChild(cwd);
+
+		if (state.expanded[job.id]) {
+			var out = document.createElement('pre');
+			out.className = 'zc-job-out';
+			if (state.loading[job.id]) {
+				out.textContent = '加载中…';
+			} else if (state.outputs[job.id] !== undefined) {
+				out.textContent = state.outputs[job.id];
+			} else {
+				out.textContent = '(暂无输出)';
+			}
+			row.appendChild(out);
+		}
+		body.appendChild(row);
+	}
+
+	function appendTermRow(body, t) {
+		var row = document.createElement('div');
+		row.className = 'zc-job';
+		var top = document.createElement('div');
+		top.className = 'zc-job-top';
+		var badge = termBadge(t);
+		var badgeEl = document.createElement('span');
+		badgeEl.className = badge.cls;
+		badgeEl.textContent = badge.text;
+		var nameEl = document.createElement('span');
+		nameEl.className = 'zc-job-id';
+		nameEl.textContent = t.name;
+		var meta = document.createElement('span');
+		meta.className = 'zc-job-meta';
+		var elapsed = document.createElement('span');
+		elapsed.textContent = fmtElapsed(t.elapsedSec || 0);
+		meta.appendChild(elapsed);
+		if (t.running) {
+			meta.appendChild(mkBtn('显示', 'zc-jobs-btn', '在 VS Code 终端面板中显示该 shell', function () {
+				vscode.postMessage({ type: 'jobsShowTerminal', name: t.name });
+			}));
+		}
+		top.appendChild(badgeEl);
+		top.appendChild(nameEl);
+		top.appendChild(meta);
+		var cwd = document.createElement('div');
+		cwd.className = 'zc-job-cwd';
+		cwd.textContent = t.cwd;
+		row.appendChild(top);
+		row.appendChild(cwd);
+		body.appendChild(row);
+	}
+
+	function appendSection(body, title, count) {
+		var head = document.createElement('div');
+		head.className = 'zc-jobs-section';
+		head.textContent = title + '（' + count + '）';
+		body.appendChild(head);
+	}
+
+	function render() {
+		ensureDom();
+		var runningJobs = state.jobs.filter(function (j) { return j.running; });
+		var runningTerms = state.terminals.filter(function (t) { return t.running; });
+		var total = state.jobs.length + state.terminals.length;
+		var doneRecently = state.jobs.some(function (j) {
+			return !j.running && j.finishedAt && (Date.now() - j.finishedAt) < 8000;
+		});
+
+		// 完全没有后台进程且面板收起时，整体隐藏，不占界面。
+		if (total === 0 && !state.open) {
+			els.root.style.display = 'none';
+			return;
+		}
+		els.root.style.display = '';
+
+		var running = runningJobs.length + runningTerms.length;
+		els.chip.textContent = '⚙ 后台进程 ' + running;
+		els.chip.className = 'zc-jobs-chip' + (doneRecently ? ' zc-done' : '') + (state.open ? ' zc-active' : '');
+
+		els.drawer.style.display = state.open ? '' : 'none';
+		if (!state.open) { return; }
+
+		els.drawer.textContent = '';
+		var head = document.createElement('div');
+		head.className = 'zc-jobs-head';
+		var title = document.createElement('span');
+		title.textContent = '后台进程 · ' + running + ' 运行中 / ' + total + ' 总计';
+		var close = mkBtn('×', 'zc-jobs-close', '收起面板', function () { setOpen(false); });
+		head.appendChild(title);
+		head.appendChild(close);
+
+		var body = document.createElement('div');
+		body.className = 'zc-jobs-body';
+		if (total === 0) {
+			var empty = document.createElement('div');
+			empty.className = 'zc-jobs-empty';
+			empty.textContent = '当前没有后台进程。';
+			body.appendChild(empty);
+		} else {
+			if (state.jobs.length) {
+				appendSection(body, '后台任务', state.jobs.length);
+				state.jobs.forEach(function (j) { appendJobRow(body, j); });
+			}
+			if (state.terminals.length) {
+				appendSection(body, '常驻终端', state.terminals.length);
+				state.terminals.forEach(function (t) { appendTermRow(body, t); });
+			}
+		}
+		var hint = document.createElement('div');
+		hint.className = 'zc-jobs-hint';
+		hint.textContent = '命令超过前台超时后自动转为后台任务；常驻终端由 terminal_open 创建。';
+		body.appendChild(hint);
+
+		els.drawer.appendChild(head);
+		els.drawer.appendChild(body);
+	}
+
+	function toggleOutput(id) {
+		if (state.expanded[id]) {
+			state.expanded[id] = false;
+			render();
+			return;
+		}
+		state.expanded[id] = true;
+		if (state.outputs[id] === undefined && !state.loading[id]) {
+			state.loading[id] = true;
+			vscode.postMessage({ type: 'jobsOutput', id: id, tailLines: 120 });
+		}
+		render();
+	}
+
+	window.addEventListener('message', function (event) {
+		var data = event && event.data;
+		if (!data || typeof data !== 'object') { return; }
+		if (data.type === 'jobsState') {
+			state.jobs = Array.isArray(data.jobs) ? data.jobs : [];
+			state.terminals = Array.isArray(data.terminals) ? data.terminals : [];
+			// 已结束且被清掉的 job 不保留展开态。
+			var live = {};
+			state.jobs.forEach(function (j) { live[j.id] = true; });
+			Object.keys(state.expanded).forEach(function (id) {
+				if (!live[id]) { delete state.expanded[id]; delete state.outputs[id]; }
+			});
+			render();
+		} else if (data.type === 'jobsOutput' && typeof data.id === 'string') {
+			state.loading[data.id] = false;
+			state.outputs[data.id] = typeof data.text === 'string' ? data.text : '(无输出)';
+			render();
+		}
+	});
+
+	function boot() {
+		render();
+		vscode.postMessage({ type: 'jobsRequest' });
+	}
+
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', boot);
+	} else {
+		boot();
+	}
 })();

@@ -6,11 +6,13 @@
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { toErrorMessage } from '../../../../../base/common/errorMessage.js';
 import { KeyCode, KeyMod } from '../../../../../base/common/keyCodes.js';
+import { getActiveElement } from '../../../../../base/browser/dom.js';
+import { EditorContextKeys } from '../../../../../editor/common/editorContextKeys.js';
 import { localize, localize2 } from '../../../../../nls.js';
 import { Action2, registerAction2 } from '../../../../../platform/actions/common/actions.js';
 import { ServicesAccessor } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
-import { ContextKeyExpr, RawContextKey } from '../../../../../platform/contextkey/common/contextkey.js';
+import { ContextKeyExpr, IContextKeyService, RawContextKey } from '../../../../../platform/contextkey/common/contextkey.js';
 import { KeybindingWeight } from '../../../../../platform/keybinding/common/keybindingsRegistry.js';
 import { INotificationService } from '../../../../../platform/notification/common/notification.js';
 import { IQuickInputService } from '../../../../../platform/quickinput/common/quickInput.js';
@@ -261,6 +263,14 @@ export class BackToSuperAgentRouterAction extends Action2 {
 	}
 
 	override run(accessor: ServicesAccessor): Promise<unknown> {
+		// Same `editorTextFocus` gate as the keybinding above, applied to the
+		// callers the `when` clause never sees (mouse back side button,
+		// webview-forwarded clicks): a text editor that owns the caret keeps
+		// the back gesture for its own Go Back navigation. Resolved against
+		// the focused element because the key is editor-scoped.
+		if (accessor.get(IContextKeyService).getContext(getActiveElement()).getValue(EditorContextKeys.editorTextFocus.key) === true) {
+			return Promise.resolve();
+		}
 		return accessor.get(ICommandService).executeCommand(ZCODE_INTERNAL_SUPERAGENT_SHOW_ROUTER);
 	}
 }

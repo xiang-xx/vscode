@@ -5,7 +5,8 @@
 
 import { Disposable } from '../../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../../base/common/observable.js';
-import { addDisposableListener, EventType } from '../../../../../base/browser/dom.js';
+import { addDisposableListener, EventType, getActiveElement } from '../../../../../base/browser/dom.js';
+import { EditorContextKeys } from '../../../../../editor/common/editorContextKeys.js';
 import { ICommandService } from '../../../../../platform/commands/common/commands.js';
 import { IContextKey, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
 import { IWorkbenchContribution } from '../../../../common/contributions.js';
@@ -42,7 +43,7 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 		@IChatRouterService private readonly routerService: IChatRouterService,
 		@IPaneCompositePartService private readonly paneCompositeService: IPaneCompositePartService,
 		@ICommandService private readonly commandService: ICommandService,
-		@IContextKeyService contextKeyService: IContextKeyService,
+		@IContextKeyService private readonly contextKeyService: IContextKeyService,
 	) {
 		super();
 		this.workerViewable = SuperAgentWorkerViewable.bindTo(contextKeyService);
@@ -72,10 +73,16 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 		// Mouse back / forward side buttons (Chromium buttons 3 / 4) mirror the
 		// ⌘[ / ⌘] chords from anywhere in the workbench window — same gates as
 		// the keybindings (back needs an open worker detail, forward something
-		// viewable). Clicks landing inside the webview iframe are handled
-		// webview-side instead (superAgentKeys.js) and never reach this
-		// listener. XButtons only deliver mouseup, so that is the event to own.
+		// viewable). While the caret sits in a text editor the side buttons stay
+		// with the editor's own Go Back / Go Forward navigation, mirroring the
+		// keybindings' `!editorTextFocus` clause. Clicks landing inside the
+		// webview iframe are handled webview-side instead (superAgentKeys.js)
+		// and never reach this listener. XButtons only deliver mouseup, so
+		// that is the event to own.
 		this._register(addDisposableListener(window, EventType.MOUSE_UP, e => {
+			if (this.textEditorHasFocus()) {
+				return; // text editor keeps the side buttons (Go Back / Go Forward)
+			}
 			if (e.button === 3 /* back */) {
 				if (this.workerDetailOpen.get()) {
 					void this.commandService.executeCommand(BackToSuperAgentRouterAction.ID);
@@ -86,6 +93,16 @@ export class SuperAgentPresentationUiContribution extends Disposable implements 
 				}
 			}
 		}));
+	}
+
+	/**
+	 * True while the caret lives in a text editor — the same `editorTextFocus`
+	 * gate the ⌘[ / ⌘] keybindings carry. The key is bound on the editor's
+	 * scoped context, so resolve it against the focused element (root-service
+	 * lookups cannot see scoped keys).
+	 */
+	private textEditorHasFocus(): boolean {
+		return this.contextKeyService.getContext(getActiveElement()).getValue(EditorContextKeys.editorTextFocus.key) === true;
 	}
 
 	private refresh(): void {
