@@ -2628,7 +2628,7 @@ export class ChatService extends Disposable implements IChatService {
 		request.response?.complete();
 	}
 
-	async cancelCurrentRequestForSession(sessionResource: URI, source?: string): Promise<void> {
+	async cancelCurrentRequestForSession(sessionResource: URI, source?: string, options?: { settleTimeoutMs?: number }): Promise<void> {
 		this.trace('cancelCurrentRequestForSession', `session: ${sessionResource}`);
 		const pendingRequest = this._pendingRequests.get(sessionResource);
 		if (!pendingRequest) {
@@ -2661,7 +2661,7 @@ export class ChatService extends Disposable implements IChatService {
 		this.telemetryService.publicLog2<ChatPendingRequestChangeEvent, ChatPendingRequestChangeClassification>(ChatPendingRequestChangeEventName, { action: 'remove', source: source ?? 'cancelRequest', requestId, ...sessionTelemetry });
 
 		if (responseCompletePromise) {
-			await raceTimeout(responseCompletePromise, 1000);
+			await raceTimeout(responseCompletePromise, Math.max(0, options?.settleTimeoutMs ?? 1000));
 		}
 	}
 

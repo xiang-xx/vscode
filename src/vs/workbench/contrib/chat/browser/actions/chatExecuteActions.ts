@@ -986,7 +986,7 @@ export class CancelAction extends Action2 {
 
 		const chatService = accessor.get(IChatService);
 		if (widget.viewModel) {
-			await chatService.cancelCurrentRequestForSession(widget.viewModel.sessionResource, 'cancelAction');
+			await chatService.cancelCurrentRequestForSession(widget.viewModel.sessionResource, 'cancelAction', { settleTimeoutMs: 0 });
 		} else {
 			telemetryService.publicLog2<ChatStopCancellationNoopEvent, ChatStopCancellationNoopClassification>(ChatStopCancellationNoopEventName, {
 				source: 'cancelAction',

@@ -2224,7 +2224,7 @@ export interface IChatService {
 	resendRequest(request: IChatRequestModel, options?: IChatSendRequestOptions, preserveRequestId?: boolean): Promise<void>;
 	adoptRequest(sessionResource: URI, request: IChatRequestModel): Promise<void>;
 	removeRequest(sessionResource: URI, requestId: string): Promise<void>;
-	cancelCurrentRequestForSession(sessionResource: URI, source?: string): Promise<void>;
+	cancelCurrentRequestForSession(sessionResource: URI, source?: string, options?: { settleTimeoutMs?: number }): Promise<void>;
 	/**
 	 * Migrates all in-flight and queued pending requests from one session to another.
 	 * Cancels the in-flight request on the original session, removes queued requests,

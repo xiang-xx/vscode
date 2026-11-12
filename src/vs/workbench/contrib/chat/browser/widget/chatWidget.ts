@@ -3957,7 +3957,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 
 		const model = this.viewModel.model;
 		if (options.cancelCurrentRequest && model.hasActiveRequest.get() && !cancelledCurrentRequest) {
-			await this.chatService.cancelCurrentRequestForSession(this.viewModel.sessionResource, 'acceptInput-stopAndSend');
+			await this.chatService.cancelCurrentRequestForSession(this.viewModel.sessionResource, 'acceptInput-stopAndSend', { settleTimeoutMs: 250 });
 			cancelledCurrentRequest = true;
 			options.queue = undefined;
 		}
@@ -3969,7 +3969,7 @@ export class ChatWidget extends Disposable implements IChatWidget {
 		// which could be a surprising behavior if the user finishes typing a steering
 		// request just as confirmation is triggered.
 		if (!options.cancelCurrentRequest && model.requestNeedsInput.get() && !model.getPendingRequests().length) {
-			await this.chatService.cancelCurrentRequestForSession(this.viewModel.sessionResource, 'acceptInput-needsInput');
+			await this.chatService.cancelCurrentRequestForSession(this.viewModel.sessionResource, 'acceptInput-needsInput', { settleTimeoutMs: 100 });
 			options.queue ??= ChatRequestQueueKind.Queued;
 		}
 		if (requestInProgress && !options.cancelCurrentRequest) {
