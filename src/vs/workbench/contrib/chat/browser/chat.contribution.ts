@@ -9,6 +9,8 @@ import { WorkbenchPhase, registerWorkbenchContribution2 } from '../../../common/
 import { ExportAgentHostDebugLogsAction } from './actions/exportAgentHostDebugLogsAction.js';
 import { ForkConversationAction } from './actions/chatForkActions.js';
 import { ContinueChatInCopilotAction } from './actions/chatContinueInAction.js';
+import { OpenChatTokenUsageLedgerAction, ShowChatTokenUsageReportAction } from './actions/chatTokenUsageActions.js';
+import { ChatTokenUsageService, IChatTokenUsageService } from '../common/chatTokenUsageService.js';
 import { IChatResponseFileChangesService } from './chatResponseFileChangesService.js';
 import { EditorChatResponseFileChangesService } from './editorChatResponseFileChangesService.js';
 import { IAgentHostPolicyContinuationPresenter } from './agentSessions/agentHost/agentHostPolicyContinuation.js';
@@ -27,6 +29,10 @@ import { SuperAgentRouterDispatcher } from './superAgent/superAgentRouterDispatc
 registerAction2(ForkConversationAction);
 registerAction2(ContinueChatInCopilotAction);
 registerAction2(ExportAgentHostDebugLogsAction);
+registerAction2(ShowChatTokenUsageReportAction);
+registerAction2(OpenChatTokenUsageLedgerAction);
+// Eager so the module-level store slot is installed before any chat response reports usage.
+registerSingleton(IChatTokenUsageService, ChatTokenUsageService, InstantiationType.Eager);
 registerSingleton(IChatResponseFileChangesService, EditorChatResponseFileChangesService, InstantiationType.Delayed);
 registerSingleton(IAgentHostPolicyContinuationPresenter, EditorAgentHostPolicyContinuationPresenter, InstantiationType.Delayed);
 

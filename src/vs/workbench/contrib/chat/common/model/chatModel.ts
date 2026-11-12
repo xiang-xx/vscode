@@ -37,6 +37,7 @@ import { migrateLegacyTerminalToolSpecificData } from '../chat.js';
 import { formatChatToolError } from '../chatProgressFormatting.js';
 import { IChatRequestOrigin, ISerializableChatRequestOrigin, reviveChatRequestOrigin, serializeChatRequestOrigin } from '../chatRequestOrigin.js';
 import { ChatPerfMark, markChat } from '../chatPerf.js';
+import { getChatTokenUsageStore } from '../chatTokenUsageService.js';
 import { ChatAgentVoteDirection, ChatRequestQueueKind, ChatResponseClearToPreviousToolInvocationReason, ElicitationState, IChatAgentMarkdownContentWithVulnerability, IChatAutoModeResolutionPart, IChatClearToPreviousToolInvocation, IChatCodeCitation, IChatCommandButton, IChatConfirmation, IChatContentInlineReference, IChatContentReference, IChatDisabledClaudeHooksPart, IChatEditingSessionAction, IChatElicitationRequest, IChatElicitationRequestSerialized, IChatExternalEdit, IChatExternalToolInvocationUpdate, IChatExtensionsContent, IChatFollowup, IChatHookPart, IChatInfoMessage, IChatLocationData, IChatMarkdownContent, IChatMcpAuthenticationRequired, IChatMcpServersStarting, IChatMcpServersStartingSerialized, IChatMcpServersStartingSlow, IChatModelReference, IChatMultiDiffData, IChatMultiDiffDataSerialized, IChatNotebookEdit, IChatPlanReview, IChatProgress, IChatProgressMessage, IChatPullRequestContent, IChatQuestionCarousel, IChatResponseCodeblockUriPart, IChatResponseProgressFileTreeData, IChatSendRequestOptions, IChatService, IChatSessionTiming, IChatSystemNotificationPart, IChatTask, IChatTaskSerialized, IChatTextEdit, IChatThinkingPart, IChatToolInvocation, IChatToolInvocationSerialized, IChatTreeData, IChatUndoStop, IChatUsage, IChatUsageModelTotal, IChatUsagePromptTokenDetail, IChatUsedContext, IChatVoiceProgressPart, IChatWarningMessage, IChatWorkspaceEdit, ResponseModelState, ToolConfirmKind, isIUsedContext } from '../chatService/chatService.js';
 import { ChatAgentLocation, SessionTypeSelectionReason, ChatModeKind, ChatPermissionLevel } from '../constants.js';
 import { ChatToolInvocation } from './chatProgressTypes/chatToolInvocation.js';
@@ -1795,7 +1796,7 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 
 	setUsage(usage: IChatUsage): void {
 		this._parentUsage = usage;
-		this._setUsage(this._withSubagentCopilotCredits(usage), true);
+		this._setUsage(this._withSubagentCopilotCredits(usage), true, true);
 	}
 
 	/** Replaces settled history metadata without recreating the response or accumulating replayed usage. */
@@ -1806,7 +1807,10 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 			this._completionTokenCountObs.set(undefined, tx);
 			for (const part of parts) {
 				if (part.kind === 'usage') {
-					this.setUsage(part);
+					this._parentUsage = part;
+					// Replayed settled history is not a live usage report — update the stored
+					// usage, but record nothing in the token usage ledger.
+					this._setUsage(this._withSubagentCopilotCredits(part), true, false);
 				}
 			}
 			this._response.replaceAutoModeResolutions(parts.filter(part => part.kind === 'autoModeResolution'));
@@ -1821,7 +1825,7 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 		}
 		this._subagentCopilotCredits.set(subagentCallId, copilotCredits);
 		const usage = this._parentUsage ?? { kind: 'usage', promptTokens: 0, completionTokens: 0 };
-		this._setUsage(this._withSubagentCopilotCredits(usage), false);
+		this._setUsage(this._withSubagentCopilotCredits(usage), false, false);
 	}
 
 	private _withSubagentCopilotCredits(usage: IChatUsage): IChatUsage {
@@ -1834,7 +1838,7 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 			: { ...usage, copilotCredits: (usage.copilotCredits ?? 0) + subagentCopilotCredits };
 	}
 
-	private _setUsage(usage: IChatUsage, countCompletionTokens: boolean): void {
+	private _setUsage(usage: IChatUsage, countCompletionTokens: boolean, recordTokenUsage: boolean): void {
 		const currentUsage = this._usageObs.get();
 		if (currentUsage && this.isSameUsage(currentUsage, usage)) {
 			return;
@@ -1866,6 +1870,15 @@ export class ChatResponseModel extends Disposable implements IChatResponseModel 
 		} else if (countCompletionTokens && isNewCall) {
 			const previousCompletionTokens = this._completionTokenCountObs.get() ?? 0;
 			this._completionTokenCountObs.set(previousCompletionTokens + usage.completionTokens, undefined);
+		}
+		if (recordTokenUsage) {
+			getChatTokenUsageStore()?.recordTurnUsage({
+				sessionId: this.session.sessionId,
+				sessionTitle: this.session.title,
+				responseId: this.id,
+				timestamp: this.timestamp,
+				usage,
+			}, isNewCall);
 		}
 		this._onDidChange.fire(defaultChatResponseModelChangeReason);
 	}
