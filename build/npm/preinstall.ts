@@ -240,6 +240,16 @@ function installHeadersFromNpmmirror(target: string): void {
 	fs.rmSync(cacheRoot, { recursive: true, force: true });
 	fs.mkdirSync(cacheRoot, { recursive: true });
 	fs.cpSync(extractedInclude, path.join(cacheRoot, 'include'), { recursive: true });
+	if (process.platform === 'win32') {
+		// Windows native addons also link against node.lib; npm's bundled node-gyp
+		// expects it inside the devdir cache next to the headers.
+		fs.mkdirSync(path.join(cacheRoot, 'win-x64'), { recursive: true });
+		try {
+			child_process.execFileSync('curl', ['-fsSL', '--max-time', '120', '-o', path.join(cacheRoot, 'win-x64', 'node.lib'), `https://cdn.npmmirror.com/binaries/electron/v${target}/win-x64/node.lib`], { stdio: 'inherit' });
+		} catch {
+			console.warn(`Failed to pre-seed node.lib for ${target}; node-gyp will fetch it itself.`);
+		}
+	}
 	fs.writeFileSync(path.join(cacheRoot, 'installVersion'), '11\n');
 	fs.rmSync(tmp, { recursive: true, force: true });
 	console.log(`Installed Electron headers to ${cacheRoot}`);
