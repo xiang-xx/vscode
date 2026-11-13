@@ -16,6 +16,7 @@ import { getAgentPace, type AgentPace } from './agentPace';
 import type { SessionAwareness } from './sessionAwareness';
 import { resolveDeepseekApiKey } from './deepseekProvider';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
+import { resolveBigModelCodingApiKey } from './bigmodelCodingPlan';
 
 export type BridgeMode = 'agent' | 'stub' | 'http' | 'cursor-acp';
 
@@ -281,6 +282,7 @@ async function resolveHttpApiKey(provider: ProviderMode): Promise<string | undef
 	}
 	if (provider === 'bigmodel') {
 		return (await loadCodingPlanApiKey('bigmodel'))
+			?? (await resolveBigModelCodingApiKey().catch(() => undefined))
 			?? emptyToUndefined(safeSession()?.accessToken);
 	}
 	return emptyToUndefined(safeSession()?.zcodeJwtToken);

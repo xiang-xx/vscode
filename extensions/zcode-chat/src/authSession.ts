@@ -13,6 +13,7 @@ import {
 	type ZCodeOAuthProvider,
 	type ZCodeStoredSession,
 } from './zcodeCredentialsStore';
+import { resetBigModelCodingPlanCache } from './bigmodelCodingPlan';
 
 const SECRET_KEY = 'zcode.session.v1';
 
@@ -52,6 +53,9 @@ export class ZCodeAuthService {
 
 	async signIn(provider?: ZCodeOAuthProvider): Promise<ZCodeStoredSession> {
 		await this.waitUntilReady();
+		// A new login (possibly a different account) must not keep serving the
+		// previous account's cached Coding Plan project token.
+		resetBigModelCodingPlanCache();
 
 		// Prefer already-logged-in ZCode desktop credentials on this machine.
 		const existing = await loadZCodeDesktopSession().catch(() => undefined);
@@ -92,6 +96,7 @@ export class ZCodeAuthService {
 	async signOut(options?: { clearDesktop?: boolean }): Promise<void> {
 		await this.waitUntilReady();
 		this.session = undefined;
+		resetBigModelCodingPlanCache();
 		await this.secrets.delete(SECRET_KEY);
 		if (options?.clearDesktop) {
 			await clearZCodeDesktopSession().catch(() => undefined);

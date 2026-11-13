@@ -9,6 +9,7 @@ import { getAuthService } from './authSession';
 import { defaultMascotPersonaId, findMascotPersona, type MascotPersona } from './mascotPersona';
 import { getProviderMode } from './providers';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
+import { resolveBigModelCodingApiKey } from './bigmodelCodingPlan';
 
 /**
  * Corner-mascot lines. Always GLM-5.3-Flash at its lowest thinking level
@@ -364,7 +365,8 @@ async function resolveVoiceAuth(): Promise<VoiceAuth | undefined> {
 	const mode = getProviderMode();
 	if (mode === 'bigmodel' || mode === 'deepseek') {
 		try {
-			const apiKey = await loadCodingPlanApiKey('bigmodel');
+			const apiKey = await loadCodingPlanApiKey('bigmodel')
+				?? await resolveBigModelCodingApiKey();
 			if (apiKey) {
 				return { api: 'openai', url: BIGMODEL_CODING_CHAT_URL, apiKey };
 			}

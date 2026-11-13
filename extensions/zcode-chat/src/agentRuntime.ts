@@ -41,6 +41,7 @@ import { cachedPluginToolDefs, callPluginTool, refreshPluginTools } from './chat
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 import { normalizeToolArgs, normalizeToolName } from './toolNormalize';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
+import { resolveBigModelCodingApiKey } from './bigmodelCodingPlan';
 import {
 	applyDeepseekStreamEvent,
 	buildDeepseekBody,
@@ -876,13 +877,16 @@ async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKe
 		);
 	}
 
-	const codingKey = await loadCodingPlanApiKey('bigmodel');
+	// Standalone pasted API key first; otherwise the OAuth project-token
+	// exchange the ZCode desktop itself uses for Coding Plan requests.
+	const codingKey = await loadCodingPlanApiKey('bigmodel')
+		?? await resolveBigModelCodingApiKey().catch(() => undefined);
 	if (codingKey) {
 		return { url: BIGMODEL_CODING_CHAT_URL, apiKey: codingKey, api: 'openai' };
 	}
 
 	throw new Error(
-		'No BigModel Coding Plan API key found in ~/.zcode/v2/credentials.json. Sign in with BigModel in ZCode desktop (or this IDE) and ensure Coding Plan is connected.',
+		'No BigModel Coding Plan credential found: no standalone API key in ~/.zcode/v2/credentials.json, and the OAuth project-token exchange failed. Sign in with BigModel in ZCode desktop (or this IDE) and ensure Coding Plan is connected.',
 	);
 }
 
