@@ -654,6 +654,15 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				clearInterval(this.scheduleTipTimer);
 				this.scheduleTipTimer = undefined;
 			}
+			if (this.pushCoalesceTimer) {
+				clearTimeout(this.pushCoalesceTimer);
+				this.pushCoalesceTimer = undefined;
+				this.pushCoalescePending = false;
+			}
+			if (this.draftUsageTimer) {
+				clearTimeout(this.draftUsageTimer);
+				this.draftUsageTimer = undefined;
+			}
 			for (const sessionId of [...this.routerTurnKeepalives.keys()]) {
 				this.clearRouterTurnKeepalive(sessionId);
 			}
@@ -798,9 +807,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 		// Park whatever is currently open, then create a persisted Router session.
 		if (this.sessionId && (this.isRunning(this.sessionId) || !this.isSessionEmpty() || this.sessionPersisted)) {
+			const leavingId = this.sessionId;
+			const leavingChat = this.captureView();
 			this.parkCurrent();
 			if (!this.isSessionEmpty() || this.sessionPersisted) {
-				await this.persistSession(true);
+				// Background-save the leaving chat (openSession/closeTab pattern):
+				// minting the Router must not wait on that disk flush.
+				void this.persistChat(leavingId, leavingChat, false, { background: true })
+					.catch(err => console.warn('[zcode-chat] persist leaving session failed:', err));
 			}
 		}
 		const session = await this.ideChat.createSession({
@@ -812,7 +826,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// Router+Worker mode: no session tab strip. Keep the Router as the
 		// focused surface under the Workers rail without open-tab bookkeeping.
 		this.routerSessionId = session.id;
-		await this.refreshSessionList();
+		void this.refreshSessionList().then(() => this.pushState()).catch(() => undefined);
 		this.pushAfterSessionSwitch({ focusInput: true });
 		return session.id;
 	}
@@ -1329,6 +1343,74 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
+	 * Land a Router dispatch card in the in-memory chat (active tab or parked)
+	 * and persist it — idempotent by card id.
+	 *
+	 * The phone bridge used to write its stamped card straight to the store:
+	 * the open board renders the in-memory chat, so the stamp never showed and
+	 * markRouterDispatchRunning minted a duplicate receipt card without a
+	 * workerId. The webview only renders the ✕ remove button for groups that
+	 * carry a workerId, so the phone-dispatched task could not be deleted from
+	 * the desktop (again). Desktop dispatches are memory-first; phone stamps
+	 * take the same path now, merging into an existing card of the same worker
+	 * instead of adding a second turn.
+	 */
+	async upsertRouterDispatchCard(routerId: string, card: ConversationItem): Promise<void> {
+		if (!routerId || !card || card.kind !== 'dispatch') {
+			return;
+		}
+		if (this.sessionId !== routerId && !this.parked.has(routerId)) {
+			const session = await this.ideChat.getSession(routerId);
+			if (!session) {
+				return;
+			}
+			this.parked.set(routerId, {
+				items: [...(session.timeline ?? [])],
+				todos: [...(session.todos ?? [])],
+				persisted: true,
+				draftText: '',
+				attachments: [],
+				queue: [],
+				queuePaused: false,
+			});
+		}
+		const workerSessionId = card.workerSessionId;
+		const applied = this.mutateChat(routerId, chat => {
+			const byId = chat.items.findIndex(row => row.id === card.id);
+			if (byId >= 0) {
+				chat.items[byId] = card;
+				return;
+			}
+			if (workerSessionId) {
+				for (let i = chat.items.length - 1; i >= 0; i--) {
+					const row = chat.items[i];
+					if (row.kind !== 'dispatch' || row.workerSessionId !== workerSessionId) {
+						continue;
+					}
+					row.workerId = card.workerId;
+					row.badge = row.badge || card.badge;
+					row.accent = row.accent || card.accent;
+					if (!row.status || row.status === 'pending' || row.status === 'starting') {
+						row.status = card.status;
+						row.receipt = card.receipt ?? row.receipt;
+					}
+					row.startedAt = row.startedAt ?? card.startedAt;
+					return;
+				}
+			}
+			chat.items.push(card);
+		});
+		if (!applied) {
+			return;
+		}
+		if (this.sessionId === routerId) {
+			this.startDispatchElapsedTimer();
+			this.pushState();
+		}
+		await this.persistSessionById(routerId);
+	}
+
+	/**
 	 * Self-heal: drop Router board cards whose worker session no longer exists.
 	 * Deleting a session (history list) used to leave its dispatch receipt on
 	 * the home board forever, pinned at the bottom by newest-activity ordering.
@@ -1767,7 +1849,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (msg.type === 'draft' && typeof msg.draft === 'string') {
 			this.draftText = msg.draft;
-			this.pushContextUsage();
+			this.scheduleDraftContextUsage();
 			return;
 		}
 		if (msg.type === 'openPlus') {
@@ -2977,7 +3059,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			// The card must be on disk before the workbench opens the homepage
 			// again — that reload rebuilds the board from the session file, and
 			// a memory-only card disappears until the worker's first turn ends.
-			await this.persistSessionById(sessionId).catch(err => console.warn('[zcode-chat] persist dispatch card failed:', err));
+			await this.persistSessionById(sessionId, { deferListRefresh: true }).catch(err => console.warn('[zcode-chat] persist dispatch card failed:', err));
 			void vscode.commands.executeCommand('zcode.internal.superAgent.routerSubmit', {
 				sessionId,
 				text: prepared.modelText,
@@ -3348,6 +3430,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			} else {
 				this.unreadDoneIds.delete(runSessionId);
 			}
+			// Paint the terminal state (已停止 / 完成回复 / work 行) BEFORE the
+			// disk flush: the full-timeline save + session-list rescan below used
+			// to gate the last frame, so stopping a busy worker looked stuck.
+			this.pushState();
 			await this.persistSessionById(runSessionId);
 			// Mirror the finished turn's reply + working set onto its Router
 			// dispatch card before the state push so Root shows the outcome at once.
@@ -3491,12 +3577,18 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (this.sessionId && (this.isRunning(this.sessionId) || !this.isSessionEmpty() || this.sessionPersisted)) {
+			const leavingId = this.sessionId;
+			const leavingChat = this.captureView();
 			this.parkCurrent();
-			if (this.isSessionEmpty() && this.sessionPersisted && !this.isRunning(this.sessionId) && this.sessionId !== this.routerSessionId) {
-				await this.ideChat.deleteSession(this.sessionId);
-				this.parked.delete(this.sessionId);
+			if (this.isSessionEmpty() && this.sessionPersisted && !this.isRunning(leavingId) && leavingId !== this.routerSessionId) {
+				await this.ideChat.deleteSession(leavingId);
+				this.parked.delete(leavingId);
 			} else if (!this.isSessionEmpty()) {
-				await this.persistSession(true);
+				// Background-save the leaving chat (openSession/closeTab pattern)
+				// so the blank draft appears immediately, not after a full
+				// timeline write + session-list rescan.
+				void this.persistChat(leavingId, leavingChat, false, { background: true })
+					.catch(err => console.warn('[zcode-chat] persist leaving session failed:', err));
 			}
 		}
 		const draft = this.ideChat.createDraftSession(this.draftSessionOptions());
@@ -3504,7 +3596,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (this.sessionId && !this.openTabIds.includes(this.sessionId)) {
 			this.openTabIds = [...this.openTabIds, this.sessionId];
 		}
-		await this.refreshSessionList();
+		void this.refreshSessionList().then(() => this.pushState()).catch(() => undefined);
 		this.pushAfterSessionSwitch();
 	}
 
@@ -3515,9 +3607,19 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		if (this.sessionId) {
+			// Snapshot the leaving chat BEFORE any id switch: persistSession()
+			// reads this.sessionId at run time, so a deferred save must carry its
+			// own snapshot or it would write the NEXT session's view.
+			const leavingId = this.sessionId;
+			const leavingChat = this.captureView();
 			this.parkCurrent();
 			if (!this.isSessionEmpty() || this.sessionPersisted) {
-				await this.persistSession(true);
+				// The leaving chat's save is a whole-timeline write plus a
+				// session-list rescan. Awaiting it gated the view switch — that
+				// disk round-trip is what made returning to the home board feel
+				// frozen. closeTab already background-saves the same way.
+				void this.persistChat(leavingId, leavingChat, false, { background: true })
+					.catch(err => console.warn('[zcode-chat] persist leaving session failed:', err));
 			}
 		}
 		this.historyOpen = false;
@@ -3532,7 +3634,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			this.syncDispatchRunState(sessionId);
 			await this.ideChat.setActiveSession(sessionId).catch(() => undefined);
-			await this.refreshSessionList();
+			// List refresh is a disk index rescan; painting the parked chat must
+			// not wait for it. The refreshed list rides the next pushState.
+			void this.refreshSessionList().then(() => this.pushState()).catch(() => undefined);
 			this.pushAfterSessionSwitch();
 			if (!this.runs.has(sessionId)) {
 				void this.flushQueue(sessionId);
@@ -3545,7 +3649,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		this.applySession(session.id, session.timeline ?? [], session.todos ?? [], true);
-		await this.refreshSessionList();
+		void this.refreshSessionList().then(() => this.pushState()).catch(() => undefined);
 		this.pushAfterSessionSwitch();
 	}
 
@@ -3933,7 +4037,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		await this.persistChat(this.sessionId, this.captureView(), true);
 	}
 
-	private async persistSessionById(sessionId: string): Promise<void> {
+	private async persistSessionById(sessionId: string, opts?: { deferListRefresh?: boolean }): Promise<void> {
 		const chat = sessionId === this.sessionId
 			? this.captureView()
 			: this.parked.get(sessionId);
@@ -3944,10 +4048,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// nor steal the active marker from the visible session.
 		await this.persistChat(sessionId, chat, sessionId === this.sessionId, {
 			background: sessionId !== this.sessionId,
+			deferListRefresh: opts?.deferListRefresh,
 		});
 	}
 
-	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean; titleOverride?: string }): Promise<void> {
+	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean; titleOverride?: string; deferListRefresh?: boolean }): Promise<void> {
 		if (sessionId === this.routerSessionId) {
 			await this.preserveForeignDispatchCards(sessionId, chat);
 		}
@@ -3996,7 +4101,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (adoptPersistedFlag) {
 			this.sessionPersisted = true;
 		}
-		await this.refreshSessionList();
+		// The session-list rescan is metadata-only. The dispatch submit path
+		// defers it so the card write — which must precede routerSubmit's
+		// homepage reload — is the only disk round-trip gating the send.
+		if (opts?.deferListRefresh) {
+			void this.refreshSessionList().then(() => this.safePushState()).catch(() => undefined);
+		} else {
+			await this.refreshSessionList();
+		}
 	}
 
 	/** In-flight AI title jobs, keyed by session id (prevents duplicate side calls). */
@@ -4301,7 +4413,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.pinAssistantBeforeWorkOn(chat);
 			}
 		});
-		this.pushState();
+		// A full pushState per streaming segment used to saturate the
+		// extension host (whole-timeline serialize + scene stat calls +
+		// token estimation, dozens of times per second) — user actions
+		// (send / stop / back to board) queued behind that work and felt
+		// stuck. Hidden sessions already stream through dispatchLive and
+		// the 1s board timer; visible ones coalesce streaming pushes.
+		if (sessionId !== this.sessionId) {
+			return;
+		}
+		if (event.type === 'assistant' || event.type === 'reasoning'
+			|| event.type === 'status' || event.type === 'tool_update') {
+			this.pushStateCoalesced();
+		} else {
+			this.pushState();
+		}
 	}
 
 	/** Keep text already shown. The next answer segment starts a new row. */
@@ -4596,6 +4722,46 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		chat.activeStatusId = undefined;
 	}
 
+	private pushCoalesceTimer: ReturnType<typeof setTimeout> | undefined;
+	private pushCoalescePending = false;
+	private draftUsageTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/**
+	 * Coalesced pushState for streaming progress events (assistant/reasoning/
+	 * status/tool_update — dozens per second while a turn streams). Each event
+	 * used to run a full state build: whole-timeline serialize, scene stat
+	 * calls, token estimation. That saturated the extension host and made
+	 * other webview actions (send, stop, back to board) feel stuck behind it.
+	 * Leading edge schedules, later events in the window only mark a trailing
+	 * flush; the flush always reads current state, so nothing is lost.
+	 */
+	private pushStateCoalesced(intervalMs = 120): void {
+		if (this.pushCoalesceTimer) {
+			this.pushCoalescePending = true;
+			return;
+		}
+		this.pushCoalesceTimer = setTimeout(() => {
+			this.pushCoalesceTimer = undefined;
+			const pending = this.pushCoalescePending;
+			this.pushCoalescePending = false;
+			this.safePushState();
+			if (pending) {
+				this.pushStateCoalesced(intervalMs);
+			}
+		}, intervalMs);
+	}
+
+	/** Draft typing recomputes token usage over the whole timeline — throttle it. */
+	private scheduleDraftContextUsage(): void {
+		if (this.draftUsageTimer) {
+			return;
+		}
+		this.draftUsageTimer = setTimeout(() => {
+			this.draftUsageTimer = undefined;
+			this.pushContextUsage();
+		}, 150);
+	}
+
 	/**
 	 * pushState that can never take the whole update down with it: if building
 	 * the full payload throws (model/auth/quota fields), post a minimal state
@@ -4759,7 +4925,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			insertText: extra?.insertText,
 			openPlus: extra?.openPlus ?? false,
 			focusInput: extra?.focusInput ?? false,
-			scene: this.view ? this.buildSceneState(this.view.webview) : undefined,
+			scene: this.view ? this.sceneStateFor(this.view.webview) : undefined,
 		});
 		this.shareActivityWithDesktopPet();
 	}
@@ -4821,6 +4987,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async saveChatScene(): Promise<void> {
+		this.sceneStateVersion++;
 		await this.globalState.update(CHAT_SCENE_STATE_KEY, this.scenePersisted);
 	}
 
@@ -5099,6 +5266,26 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		await vscode.env.openExternal(vscode.Uri.parse(url.toString()));
+	}
+
+	private sceneStateVersion = 0;
+	private sceneStateCache: { webview: vscode.Webview; version: number; value: object } | undefined;
+
+	/**
+	 * buildSceneState stats every scene file/URI on disk; running it inside
+	 * every pushState (i.e. per streaming token) hammered statSync and froze
+	 * the host thread. Cache per (webview, scene version) — every scene
+	 * mutation bumps the version via saveChatScene, wallpaper backfill
+	 * included, so picks still flip to their local cache promptly.
+	 */
+	private sceneStateFor(webview: vscode.Webview): object {
+		if (this.sceneStateCache && this.sceneStateCache.webview === webview
+			&& this.sceneStateCache.version === this.sceneStateVersion) {
+			return this.sceneStateCache.value;
+		}
+		const value = this.buildSceneState(webview);
+		this.sceneStateCache = { webview, version: this.sceneStateVersion, value };
+		return value;
 	}
 
 	private buildSceneState(webview: vscode.Webview): {

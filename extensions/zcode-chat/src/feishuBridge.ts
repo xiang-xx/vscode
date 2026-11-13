@@ -112,6 +112,12 @@ export interface FeishuPanelAdapter {
 	runs?: Map<string, unknown>;
 	/** Resolves a pending askUser prompt — same call the webview's option buttons make. */
 	resolveAsk?(id: string, result: FeishuAskResult): void;
+	/**
+	 * Lands a Router dispatch card in the panel's in-memory chat and persists
+	 * it (idempotent by card id; merges into an existing card of the same
+	 * worker). Store-only stamps never reach an open board.
+	 */
+	upsertRouterDispatchCard?(routerId: string, card: ConversationItem): Promise<void>;
 }
 
 // ---------------------------------------------------------------- tiny utils
@@ -1423,6 +1429,11 @@ class FeishuBridge implements vscode.Disposable {
 	 * the board but with no ✕. Write the exact shape the desktop submit path
 	 * writes, then bind the super-agent service to the card the same way
 	 * mirrorWorkerFollowUpToRouter does, so live status lands on it too.
+	 *
+	 * The stamp must land in the panel's in-memory Router chat FIRST: the open
+	 * board renders memory, and a store-only write used to leave
+	 * markRouterDispatchRunning minting its identity-less duplicate anyway —
+	 * the regression that made phone tasks undeletable from the desktop again.
 	 */
 	private async stampDispatchCard(routerId: string, sessionId: string, task: string, title: string): Promise<void> {
 		const workerId = FeishuBridge.phoneWorkerId(sessionId);
@@ -1438,7 +1449,11 @@ class FeishuBridge implements vscode.Disposable {
 			status: 'running',
 			startedAt: Date.now(),
 		};
-		await this.store!.upsertDispatchCards(routerId, [card as ConversationItem]);
+		if (this.panel?.upsertRouterDispatchCard) {
+			await this.panel.upsertRouterDispatchCard(routerId, card as ConversationItem);
+		} else {
+			await this.store!.upsertDispatchCards(routerId, [card as ConversationItem]);
+		}
 		void vscode.commands.executeCommand('zcode.internal.superAgent.bindRouterDispatch', {
 			sessionId: routerId,
 			dispatchItemId: card.id,
@@ -1492,6 +1507,14 @@ class FeishuBridge implements vscode.Disposable {
 		}
 		if (!patches.length) {
 			return;
+		}
+		// Route through the panel hook when available so an OPEN board also
+		// picks the healed identity up — the ✕ button renders from memory, and
+		// a store-only patch leaves the visible card undeletable until reload.
+		if (this.panel?.upsertRouterDispatchCard) {
+			for (const patch of patches) {
+				await this.panel.upsertRouterDispatchCard(routerId, patch).catch(() => undefined);
+			}
 		}
 		await this.store!.upsertDispatchCards(routerId, patches).catch(err =>
 			this.log(`identity backfill failed: ${errText(err)}`));

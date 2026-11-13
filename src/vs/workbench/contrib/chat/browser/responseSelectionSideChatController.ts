@@ -112,6 +112,12 @@ export class ResponseSelectionSideChatController extends Disposable {
 	private readonly _selectionChangeScheduler: dom.AnimationFrameScheduler;
 	private _pointerSelectionId: number | undefined;
 	private _pointerSelectionChanged = false;
+	/**
+	 * Whether `_resolved` still stands for the user's selection. The browser
+	 * collapses the document selection when focus moves, so a collapsed
+	 * selection alone must not drop the captured range.
+	 */
+	private _selectionCaptured = false;
 	private _verticalPlacement: 'above' | 'below' | undefined;
 	private _lastFocusRect: { top: number; bottom: number; left: number } | undefined;
 	private _lastTranscriptBounds: { top: number; bottom: number } | undefined;
@@ -272,6 +278,7 @@ export class ResponseSelectionSideChatController extends Disposable {
 		this._selectionChangeScheduler.cancel();
 		this._pointerSelectionId = event.pointerId;
 		this._pointerSelectionChanged = false;
+		this._selectionCaptured = false;
 	}
 
 	private _finishPointerSelection(pointerId?: number): void {
@@ -325,12 +332,25 @@ export class ResponseSelectionSideChatController extends Disposable {
 			this._dismiss();
 			return;
 		}
+		const nativeSelection = dom.getWindow(this._widget.domNode).getSelection();
+		const nativeSelectionEmpty = !nativeSelection || nativeSelection.isCollapsed || !nativeSelection.toString().trim();
+		if (nativeSelectionEmpty && this._selectionCaptured && this._resolved && this._selectionStillOwned()) {
+			// The browser collapses the document selection as soon as focus moves
+			// into certain elements, and transient collapses would otherwise drop
+			// the captured range and its painted highlight right after the mouse
+			// is released. Keep the captured selection until a new pointer
+			// interaction starts or focus leaves the transcript and affordance.
+			this._showFor();
+			return;
+		}
 		const resolved = resolveResponseSelection(this._widget);
 		if (!resolved) {
+			this._selectionCaptured = false;
 			this._dismiss();
 			return;
 		}
 		this._resolved = resolved;
+		this._selectionCaptured = true;
 		this._showFor();
 	}
 
@@ -360,6 +380,19 @@ export class ResponseSelectionSideChatController extends Disposable {
 		// chat view (a banner, the input) says nothing about wanting the
 		// transcript to hold still.
 		return this._widget.transcriptDomNode.contains(range.commonAncestorContainer);
+	}
+
+	/**
+	 * Whether a collapsed document selection is still ours to keep: the user
+	 * has not moved focus out of the transcript and the affordance, which is
+	 * the point where the selection is genuinely gone.
+	 */
+	private _selectionStillOwned(): boolean {
+		if (this._hasAffordanceFocus()) {
+			return true;
+		}
+		const activeElement = dom.getActiveElement();
+		return !!activeElement && this._widget.transcriptDomNode.contains(activeElement);
 	}
 
 	/**
