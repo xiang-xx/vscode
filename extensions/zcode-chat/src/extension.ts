@@ -9,7 +9,7 @@ import { registerAuthStatusBar } from './authStatusBar';
 import { setAuthService, ZCodeAuthService } from './authSession';
 import { disposeBrowserBridge, ensureBrowserBridge } from './browserBridgeHttp';
 import { setBrowserMcpExtensionRoot } from './browserMcp';
-import { BRAIN_LABELS, getActiveBrain } from './brains';
+import { BRAIN_LABELS, getActiveBrain, setActiveBrain } from './brains';
 import { getBridgeStatusText } from './bridge';
 import { registerChatParticipant, switchModelCommand, switchReasoningLevelCommand } from './chatParticipant';
 import { registerChatPanel } from './chatPanel';
@@ -23,8 +23,8 @@ import {
 	IdeChatStore,
 	type IdeChatExtensionApi,
 } from './ideChatStore';
-import { getSelectedModelId, getSelectedReasoningLevel } from './models';
-import { bindDeepseekSecrets, promptDeepseekApiKey } from './deepseekProvider';
+import { ensureModelForProvider, ensureReasoningLevelForModel, getSelectedModelId, getSelectedReasoningLevel } from './models';
+import { bindDeepseekSecrets, isRetiredDeepseekModel, prepareDeepseekProvider, promptDeepseekApiKey } from './deepseekProvider';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
 import { stampZcodeRuntime } from './runtimeEnv';
 import { searchChatSessions, type SessionSearchMatch } from './sessionSearch';
@@ -80,15 +80,41 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 	);
 
 	// Migrate legacy providerMode values (`zcode`, `glm`) onto Start Plan / BigModel.
-	// `deepseek` is the official DeepSeek provider and is left as-is.
+	// The pre-peer-brain `deepseek` sub-provider setting migrates onto the
+	// DeepSeek brain, so nobody loses their provider by upgrading.
 	const configuredMode = vscode.workspace.getConfiguration('zcode').get<string>('providerMode');
-	if (configuredMode && !isProviderMode(configuredMode)) {
+	if (configuredMode === 'deepseek') {
+		await setProviderMode('startPlan');
+		if (getActiveBrain() === 'zcode') {
+			await setActiveBrain('deepseek');
+		}
+	} else if (configuredMode && !isProviderMode(configuredMode)) {
 		await setProviderMode(getProviderMode());
 	}
 	// Users who still have the old default `stub` should get real agent runs.
 	const bridgeMode = vscode.workspace.getConfiguration('zcode').get<string>('bridge.mode');
 	if (bridgeMode === 'stub') {
 		await vscode.workspace.getConfiguration('zcode').update('bridge.mode', 'agent', vscode.ConfigurationTarget.Global);
+	}
+
+	// A model id left over from another brain (for example the retired harness id
+	// `deepseek-flash` → "DeepSeek-V4.1-Flash") must never be sent to
+	// api.deepseek.com: pin an official catalog id before the first turn, even if
+	// the user never re-picks a brain. A custom `zcode.deepseek.baseUrl` proxy may
+	// legitimately serve other ids, so only retired ids are rewritten there.
+	if (getActiveBrain() === 'deepseek') {
+		const stored = vscode.workspace.getConfiguration('zcode').get<string>('model')?.trim();
+		const customBaseUrl = !!vscode.workspace.getConfiguration('zcode').get<string>('deepseek.baseUrl')?.trim();
+		const retired = isRetiredDeepseekModel(stored);
+		if (stored && (retired || !customBaseUrl)) {
+			const modelId = await ensureModelForProvider('deepseek');
+			await ensureReasoningLevelForModel('deepseek', modelId);
+			if (retired && modelId !== stored) {
+				void vscode.window.showInformationMessage(
+					`DeepSeek 模型已改为 ${modelId}：${stored} 不是官方 API 模型（官方只有 deepseek-chat / deepseek-reasoner）。`,
+				);
+			}
+		}
 	}
 
 	const panel = registerChatPanel(context, ideChat, fileEdits);
@@ -108,6 +134,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 		if (brain === 'cursor') {
 			providerStatus.text = `$(hubot) Cursor`;
 			providerStatus.tooltip = `${BRAIN_LABELS.cursor}\n${getBridgeStatusText()}`;
+		} else if (brain === 'deepseek') {
+			const model = getSelectedModelId('deepseek');
+			const thinking = getSelectedReasoningLevel('deepseek', model);
+			providerStatus.text = `$(sparkle) DeepSeek · ${model}`;
+			providerStatus.tooltip = `${BRAIN_LABELS.deepseek} · thinking ${thinking}\n${getBridgeStatusText()}`;
 		} else {
 			const mode = getProviderMode();
 			const model = getSelectedModelId(mode);
@@ -284,6 +315,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			const key = await promptDeepseekApiKey();
 			if (key) {
 				void vscode.window.showInformationMessage('DeepSeek API Key 已保存。');
+				// Pull the official model listing with the fresh key, then repaint.
+				await prepareDeepseekProvider().catch(() => undefined);
 				panel.refresh();
 			}
 		}),
@@ -324,8 +357,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			await vscode.window.showInformationMessage(getBridgeStatusText(), { modal: false });
 		}),
 		vscode.commands.registerCommand('zcode.manageAccount', async () => {
-			if (getActiveBrain() === 'cursor') {
+			const brain = getActiveBrain();
+			if (brain === 'cursor') {
 				await vscode.commands.executeCommand('zcode.showBridgeStatus');
+				return;
+			}
+			if (brain === 'deepseek') {
+				// The DeepSeek brain's "account" is its API key.
+				await vscode.commands.executeCommand('zcode.setDeepseekApiKey');
 				return;
 			}
 			await auth.showAccountMenu();

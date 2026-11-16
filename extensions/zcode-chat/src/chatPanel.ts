@@ -23,10 +23,12 @@ import {
 	getActiveBrain,
 	getCursorAgentMode,
 	getCursorModel,
+	isActiveBrain,
 	pickActiveBrain,
 	setActiveBrain,
 	setCursorAgentMode,
 	setCursorModel,
+	type ActiveBrain,
 	type CursorAgentMode,
 } from './brains';
 import { completeChatTurn, getBridgeMode, getCursorBrainStatusLine, workspaceRoot, type ChatMessage } from './bridge';
@@ -90,7 +92,7 @@ import {
 	type ClaimOffer,
 } from './planBilling';
 import { buildPromptPreamble } from './promptContext';
-import { prepareDeepseekProvider } from './deepseekProvider';
+import { prepareDeepseekProvider, resolveDeepseekApiKey } from './deepseekProvider';
 import {
 	getProviderMode,
 	isProviderMode,
@@ -107,6 +109,7 @@ import {
 } from './fileEditSession';
 import {
 	IDE_CHAT_SOURCE_CURSOR,
+	IDE_CHAT_SOURCE_DEEPSEEK,
 	IDE_CHAT_SOURCE_ZCODE,
 	IdeChatStore,
 	isProvisionalSessionTitle,
@@ -564,10 +567,49 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState();
 	}
 
+	/** DeepSeek brain account chip: whether an API key is configured. */
+	private deepseekAccountLabel = 'DeepSeek · 未设置 API Key';
+
+	private async refreshDeepseekMeta(): Promise<void> {
+		const key = await resolveDeepseekApiKey();
+		this.deepseekAccountLabel = key ? 'DeepSeek · API Key 已设置' : 'DeepSeek · 未设置 API Key';
+	}
+
+	/** Resolve the provider a brain runs on: DeepSeek brain pins the official API. */
+	private brainProvider(brain: ActiveBrain): ProviderMode {
+		return brain === 'deepseek' ? 'deepseek' : getProviderMode();
+	}
+
+	/** Resolve the effective model a brain runs on. */
+	private brainModel(brain: ActiveBrain): string {
+		if (brain === 'cursor') {
+			return getCursorModel();
+		}
+		return getSelectedModelId(this.brainProvider(brain));
+	}
+
+	/**
+	 * Switch onto the DeepSeek brain: prompt for an API key when none is set
+	 * (secret storage → DEEPSEEK_API_KEY → zcode.deepseek.apiKey), refresh the
+	 * official model listing, and pin a valid model / thinking level.
+	 */
+	private async applyDeepseekBrain(): Promise<void> {
+		await prepareDeepseekProvider();
+		await this.refreshDeepseekMeta();
+		const modelId = await ensureModelForProvider('deepseek');
+		await ensureReasoningLevelForModel('deepseek', modelId);
+	}
+
 	// ===== 后台进程面板（Worker 拉起的后台 job / 常驻终端对用户可见） =====
 	// shell 命令超时会转成后台 job（backgroundJobs），terminal_open 会建常驻
 	// 终端（persistentTerminal）。这里把两者的实时状态推给 webview 右下角的
 	// 「后台进程」面板，用户随时能看到 worker 起了哪些进程、跑得怎么样。
+
+	// Backgrounded whole-session saves (leaving a tab / closing a tab) queue up
+	// here: each save stringifies the full timeline, rewrites the store index
+	// and rescans the session list — heavy bursts that must not land on the
+	// extension host thread inside the click that switched views.
+	private backgroundSaveChain: Promise<void> = Promise.resolve();
 
 	private jobsFeedStarted = false;
 	private lastJobsPayload = '';
@@ -811,10 +853,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			const leavingChat = this.captureView();
 			this.parkCurrent();
 			if (!this.isSessionEmpty() || this.sessionPersisted) {
-				// Background-save the leaving chat (openSession/closeTab pattern):
-				// minting the Router must not wait on that disk flush.
-				void this.persistChat(leavingId, leavingChat, false, { background: true })
-					.catch(err => console.warn('[zcode-chat] persist leaving session failed:', err));
+				// Background-save the leaving chat (openSession pattern): minting
+				// the Router must not wait on that disk flush — and the flush
+				// itself must not freeze the freshly minted board either.
+				this.queueBackgroundSave(leavingId, leavingChat);
 			}
 		}
 		const session = await this.ideChat.createSession({
@@ -1086,8 +1128,66 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (!applied || !changed) {
 			return;
 		}
+		void this.healDispatchWorkerIdentity(routerId, workerSessionId);
 		if (this.sessionId === routerId) {
 			this.startDispatchElapsedTimer();
+			this.pushState();
+		}
+		void this.persistSessionById(routerId);
+	}
+
+	/** Attempted-heal markers for healDispatchWorkerIdentity (routerId:workerSessionId). */
+	private readonly dispatchIdentityHealTried = new Set<string>();
+
+	/**
+	 * Stamp the REAL super-agent worker id onto a dispatch card that lacks
+	 * one. The phone bridge stamps fw- ids itself, but a store-only stamp
+	 * from an older bridge build — or a stamp that landed in another
+	 * window's Router — leaves the receipt card identity-less and the
+	 * webview hides its ✕ (undeletable). Reverse-lookup the roster (the
+	 * same command the remove path uses) and patch the newest card for
+	 * that worker; retried on later turns while the lookup misses.
+	 */
+	private async healDispatchWorkerIdentity(routerId: string, workerSessionId: string): Promise<void> {
+		if (!routerId || !workerSessionId || routerId === workerSessionId) {
+			return;
+		}
+		const key = `${routerId}:${workerSessionId}`;
+		if (this.dispatchIdentityHealTried.has(key)) {
+			return;
+		}
+		this.dispatchIdentityHealTried.add(key);
+		let workerId: string | undefined;
+		try {
+			const rows = await vscode.commands.executeCommand<{ sessionId?: string; workerId?: string }[]>(
+				'zcode.internal.superAgent.listWorkerChatSessions');
+			workerId = Array.isArray(rows) ? rows.find(row => row?.sessionId === workerSessionId)?.workerId : undefined;
+		} catch {
+			workerId = undefined;
+		}
+		if (!workerId) {
+			// Roster not ready yet — allow a retry on the next turn.
+			this.dispatchIdentityHealTried.delete(key);
+			return;
+		}
+		let changed = false;
+		this.mutateChat(routerId, chat => {
+			for (let i = chat.items.length - 1; i >= 0; i--) {
+				const row = chat.items[i];
+				if (row.kind !== 'dispatch' || row.workerSessionId !== workerSessionId) {
+					continue;
+				}
+				if (row.workerId !== workerId) {
+					row.workerId = workerId;
+					changed = true;
+				}
+				return;
+			}
+		});
+		if (!changed) {
+			return;
+		}
+		if (this.sessionId === routerId) {
 			this.pushState();
 		}
 		void this.persistSessionById(routerId);
@@ -1646,8 +1746,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		return {
 			source: this.sessionSource(),
 			workspaceRoot: workspaceRoot(),
-			provider: getActiveBrain() === 'cursor' ? 'cursor' : getProviderMode(),
-			model: getActiveBrain() === 'cursor' ? getCursorModel() : getSelectedModelId(getProviderMode()),
+			provider: getActiveBrain() === 'cursor' ? 'cursor' : this.brainProvider(getActiveBrain()),
+			model: this.brainModel(getActiveBrain()),
 		};
 	}
 
@@ -1675,7 +1775,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	async switchProvider(): Promise<void> {
-		if (getActiveBrain() === 'cursor') {
+		const brain = getActiveBrain();
+		if (brain === 'cursor' || brain === 'deepseek') {
+			// Cursor and DeepSeek have no sub-providers — the pill opens the brain picker.
 			await this.switchBrain();
 			return;
 		}
@@ -1692,10 +1794,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (!next) {
 			return;
 		}
-		await setActiveBrain(next);
-		await this.refreshCursorMeta();
+		await this.applyBrain(next);
 		void vscode.window.setStatusBarMessage(`AI brain: ${BRAIN_LABELS[next]}`, 2500);
-		this.pushState();
+	}
+
+	/** Activate a brain and pull whatever that brain needs (models, auth state). */
+	private async applyBrain(brain: ActiveBrain): Promise<void> {
+		await setActiveBrain(brain);
+		if (brain === 'deepseek') {
+			await this.applyDeepseekBrain();
+		}
+		await this.refreshCursorMeta();
 	}
 
 	refresh(): void {
@@ -1704,10 +1813,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async applyProvider(provider: ProviderMode): Promise<void> {
-		await setProviderMode(provider);
 		if (provider === 'deepseek') {
-			await prepareDeepseekProvider();
+			// Legacy message from an old webview/build: deepseek is a brain now.
+			await this.applyBrain('deepseek');
+			this.pushState();
+			return;
 		}
+		await setProviderMode(provider);
 		const modelId = await ensureModelForProvider(provider);
 		await ensureReasoningLevelForModel(provider, modelId);
 		this.pushState();
@@ -1859,9 +1971,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushState({ openPlus: true });
 			return;
 		}
-		if (msg.type === 'setBrain' && (msg.brain === 'zcode' || msg.brain === 'cursor')) {
-			await setActiveBrain(msg.brain);
-			await this.refreshCursorMeta();
+		if (msg.type === 'setBrain' && isActiveBrain(msg.brain)) {
+			await this.applyBrain(msg.brain);
+			return;
+		}
+		if (msg.type === 'setDeepseekApiKey') {
+			await vscode.commands.executeCommand('zcode.setDeepseekApiKey');
+			await this.refreshDeepseekMeta();
 			this.pushState();
 			return;
 		}
@@ -1885,16 +2001,26 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.pushState();
 				return;
 			}
-			const provider = getProviderMode();
-			if (modelsForProvider(provider).some(m => m.id === msg.model)) {
+			const provider = this.brainProvider(getActiveBrain());
+			const catalog = modelsForProvider(provider);
+			if (catalog.some(m => m.id === msg.model)) {
 				await setSelectedModelId(msg.model);
 				await ensureReasoningLevelForModel(provider, msg.model);
 				this.pushState();
+				return;
 			}
+			// A stale webview can post an id that no longer exists (the retired
+			// harness `deepseek-flash`). Snap to the catalog instead of ignoring
+			// the click, then repaint so the pill shows what will actually run.
+			const fallback = catalog[0]!.id;
+			await setSelectedModelId(fallback);
+			await ensureReasoningLevelForModel(provider, fallback);
+			void vscode.window.showWarningMessage(`${msg.model} 不在当前模型列表里，已切换为 ${fallback}。`);
+			this.pushState();
 			return;
 		}
 		if (msg.type === 'setReasoningLevel' && typeof msg.reasoningLevel === 'string') {
-			const provider = getProviderMode();
+			const provider = this.brainProvider(getActiveBrain());
 			const model = modelsForProvider(provider).find(m => m.id === getSelectedModelId(provider));
 			if (model?.reasoningLevels.includes(msg.reasoningLevel)) {
 				await setSelectedReasoningLevel(msg.reasoningLevel);
@@ -2940,7 +3066,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const brain = getActiveBrain();
 		const model = brain === 'cursor'
 			? (getCursorModel() || undefined)
-			: getSelectedModelId(getProviderMode());
+			: getSelectedModelId(this.brainProvider(brain));
 		const next = compactConversation(chat.items, model);
 		if (!next.compacted) {
 			return false;
@@ -3290,11 +3416,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		const brain = getActiveBrain();
-		const provider = getProviderMode();
+		const provider = this.brainProvider(brain);
 		const model = brain === 'cursor'
 			? (getCursorModel() || undefined)
 			: getSelectedModelId(provider);
-		const reasoningLevel = getSelectedReasoningLevel(provider, getSelectedModelId(provider));
+		const reasoningLevel = getSelectedReasoningLevel(provider, model ?? getSelectedModelId(provider));
 		const history: ChatMessage[] = snapshot.items
 			.filter((item): item is Extract<ConversationItem, { kind: 'user' | 'assistant' | 'summary' }> =>
 				item.kind === 'user'
@@ -3489,15 +3615,22 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.pushState();
 	}
 
-	private sessionSource(): typeof IDE_CHAT_SOURCE_ZCODE | typeof IDE_CHAT_SOURCE_CURSOR {
-		return getActiveBrain() === 'cursor' ? IDE_CHAT_SOURCE_CURSOR : IDE_CHAT_SOURCE_ZCODE;
+	private sessionSource(): typeof IDE_CHAT_SOURCE_ZCODE | typeof IDE_CHAT_SOURCE_CURSOR | typeof IDE_CHAT_SOURCE_DEEPSEEK {
+		const brain = getActiveBrain();
+		if (brain === 'cursor') {
+			return IDE_CHAT_SOURCE_CURSOR;
+		}
+		if (brain === 'deepseek') {
+			return IDE_CHAT_SOURCE_DEEPSEEK;
+		}
+		return IDE_CHAT_SOURCE_ZCODE;
 	}
 
 	private buildContextUsage(): ContextUsageSnapshot {
 		const brain = getActiveBrain();
 		const modelId = brain === 'cursor'
 			? (getCursorModel() || undefined)
-			: getSelectedModelId(getProviderMode());
+			: getSelectedModelId(this.brainProvider(brain));
 		return computeContextUsage({
 			items: this.items,
 			draftText: this.draftText,
@@ -3584,11 +3717,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				await this.ideChat.deleteSession(leavingId);
 				this.parked.delete(leavingId);
 			} else if (!this.isSessionEmpty()) {
-				// Background-save the leaving chat (openSession/closeTab pattern)
-				// so the blank draft appears immediately, not after a full
-				// timeline write + session-list rescan.
-				void this.persistChat(leavingId, leavingChat, false, { background: true })
-					.catch(err => console.warn('[zcode-chat] persist leaving session failed:', err));
+				// Background-save the leaving chat (openSession pattern) so the
+				// blank draft appears immediately — and off the switch tick so
+				// the stringify/write bursts cannot freeze it right after.
+				this.queueBackgroundSave(leavingId, leavingChat);
 			}
 		}
 		const draft = this.ideChat.createDraftSession(this.draftSessionOptions());
@@ -3614,12 +3746,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			const leavingChat = this.captureView();
 			this.parkCurrent();
 			if (!this.isSessionEmpty() || this.sessionPersisted) {
-				// The leaving chat's save is a whole-timeline write plus a
-				// session-list rescan. Awaiting it gated the view switch — that
-				// disk round-trip is what made returning to the home board feel
-				// frozen. closeTab already background-saves the same way.
-				void this.persistChat(leavingId, leavingChat, false, { background: true })
-					.catch(err => console.warn('[zcode-chat] persist leaving session failed:', err));
+				// The leaving chat's save is a whole-timeline stringify + write,
+				// a store-index rewrite and a session-list rescan. Awaiting it
+				// used to gate the view switch; merely un-awaiting it still let
+				// those bursts freeze the freshly painted view. Queue it off the
+				// click tick, serialized with other background saves.
+				this.queueBackgroundSave(leavingId, leavingChat);
 			}
 		}
 		this.historyOpen = false;
@@ -4052,6 +4184,21 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
+	/**
+	 * Run a backgrounded session save off the current tick. Even un-awaited,
+	 * persistChat's stringify/write continuation still executes on this same
+	 * single thread — firing it inside a view switch is what kept "back to
+	 * home" frozen. The short macrotask delay lets the switched-to view paint
+	 * first, and chaining keeps concurrent whole-file saves from contending on
+	 * the store lock (overlapping saves lose the race and drop a write).
+	 */
+	private queueBackgroundSave(sessionId: string, chat: MutableChat): void {
+		this.backgroundSaveChain = this.backgroundSaveChain
+			.then(() => new Promise<void>(resolve => setTimeout(resolve, 120)))
+			.then(() => this.persistChat(sessionId, chat, false, { background: true }))
+			.catch(err => console.warn('[zcode-chat] background session save failed:', err));
+	}
+
 	private async persistChat(sessionId: string, chat: MutableChat, adoptPersistedFlag: boolean, opts?: { background?: boolean; titleOverride?: string; deferListRefresh?: boolean }): Promise<void> {
 		if (sessionId === this.routerSessionId) {
 			await this.preserveForeignDispatchCards(sessionId, chat);
@@ -4075,8 +4222,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 		const brain = getActiveBrain();
-		const provider = brain === 'cursor' ? 'cursor' : getProviderMode();
-		const model = brain === 'cursor' ? getCursorModel() : getSelectedModelId(getProviderMode());
+		const provider = brain === 'cursor' ? 'cursor' : this.brainProvider(brain);
+		const model = this.brainModel(brain);
 		const createdAt = this.sessionList.find(s => s.id === sessionId)?.createdAt ?? Date.now();
 		// A stored title that is not still provisional (first-message truncation /
 		// placeholder) is an AI-generated or user-chosen label — keep it.
@@ -4104,7 +4251,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// The session-list rescan is metadata-only. The dispatch submit path
 		// defers it so the card write — which must precede routerSubmit's
 		// homepage reload — is the only disk round-trip gating the send.
-		if (opts?.deferListRefresh) {
+		// Backgrounded saves (leaving/closing a tab) defer it too: the rescan
+		// used to run inline right after the write and froze the freshly
+		// switched view for the scan's duration.
+		if (opts?.deferListRefresh || opts?.background) {
 			void this.refreshSessionList().then(() => this.safePushState()).catch(() => undefined);
 		} else {
 			await this.refreshSessionList();
@@ -4155,7 +4305,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			.map(m => `${m.role === 'user' ? '用户' : '助手'}: ${m.content.replace(/\s+/g, ' ').slice(0, 400)}`)
 			.join('\n');
 		const brain = getActiveBrain();
-		const provider = getProviderMode();
+		const provider = this.brainProvider(brain);
 		const model = brain === 'cursor'
 			? (getCursorModel() || undefined)
 			: getSelectedModelId(provider);
@@ -4789,7 +4939,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private pushState(extra?: { clearDraft?: boolean; insertText?: string; openPlus?: boolean; focusInput?: boolean }): void {
 		const brain = getActiveBrain();
-		const provider = getProviderMode();
+		const provider = this.brainProvider(brain);
 		const modelId = getSelectedModelId(provider);
 		const reasoningLevel = getSelectedReasoningLevel(provider, modelId);
 		const agentPace = getAgentPace();
@@ -4820,6 +4970,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (brain === 'cursor') {
 			accountLabel = this.cursorAccountLabel;
 			signedIn = !/not logged in/i.test(this.cursorAccountLabel);
+		}
+		if (brain === 'deepseek') {
+			accountLabel = this.deepseekAccountLabel;
+			signedIn = !/未设置/.test(this.deepseekAccountLabel);
 		}
 
 		const items = this.items.map(item => {
@@ -4882,7 +5036,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			agentPace,
 			agentPaceLabel: AGENT_PACE_LABELS[agentPace],
 			agentPaces: AGENT_PACES.map(id => ({ id, label: AGENT_PACE_LABELS[id] })),
-			bridgeMode: brain === 'cursor' ? 'cursor-acp' : getBridgeMode(),
+			bridgeMode: brain === 'cursor' ? 'cursor-acp' : brain === 'deepseek' ? 'agent' : getBridgeMode(),
 			workspaceRoot: workspaceRoot(),
 			items,
 			todos: this.todos,
@@ -5496,6 +5650,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.scenePersisted.files.filter(file => fs.existsSync(file.path)),
 		);
 		const sceneUri = this.escapeAttr(resolvedScene.image || 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7');
+		// Brain names come from BRAIN_LABELS so the copy follows the brain list.
+		const brainNames = BRAINS.map(id => BRAIN_LABELS[id]);
+		const brainListText = brainNames.length > 1
+			? `${brainNames.slice(0, -1).join(', ')}, or ${brainNames[brainNames.length - 1]}`
+			: brainNames[0];
 		const highlightStyleUri = this.mediaUri(webview, 'media', 'highlight-vscode.css');
 		const markdownItUri = this.mediaUri(webview, 'media', 'markdown-it.min.js');
 		const highlightUri = this.mediaUri(webview, 'media', 'highlight.min.js');
@@ -5535,14 +5694,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		<div class="history-header">
 			<div class="history-header-text">
 				<span class="history-title">历史会话</span>
-				<span class="history-hint">ZCode 与 Cursor 共用</span>
+				<span class="history-hint">${brainNames.join(' / ')} 共用</span>
 			</div>
 			<button class="icon-btn" id="historyClose" type="button" title="关闭" aria-label="关闭">×</button>
 		</div>
 		<ul class="history-list" id="historyList"></ul>
 	</div>
 	<div class="timeline" id="timeline" data-brain="zcode">
-		<div class="empty">Ask ZCode or Cursor to edit, explain, or run something in this workspace.</div>
+		<div class="empty">Ask ${brainListText} to edit, explain, or run something in this workspace.</div>
 	</div>
 	<div class="todo-panel" id="todoPanel" hidden>
 		<div class="todo-header">
@@ -5598,12 +5757,15 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			<div class="toolbar-left">
 				<button class="icon-btn" id="plus" type="button" title="Add" aria-label="Add">+</button>
 				<button class="pill" id="sceneBtn" type="button" title="选择聊天背景" aria-label="聊天背景" aria-expanded="false" aria-haspopup="listbox"><span class="label">背景</span></button>
-				<button class="pill" id="brainBtn" type="button" title="ZCode / Cursor" aria-label="ZCode / Cursor" aria-expanded="false" aria-haspopup="listbox"><span class="label" id="brainLabel">ZCode</span><span class="chev">▾</span></button>
+				<button class="pill" id="brainBtn" type="button" title="ZCode / Cursor / DeepSeek" aria-label="ZCode / Cursor / DeepSeek" aria-expanded="false" aria-haspopup="listbox"><span class="label" id="brainLabel">ZCode</span><span class="chev">▾</span></button>
 				<span id="zcodePills" data-brain-chrome="zcode">
 					<button class="pill" id="providerBtn" type="button" title="Provider"><span class="label" id="providerLabel">Start Plan</span><span class="chev">▾</span></button>
 					<button class="pill" id="modelBtn" type="button" title="Model"><span class="label" id="modelLabel">Model</span><span class="chev">▾</span></button>
 					<button class="pill" id="paceBtn" type="button" title="Agent pace"><span class="label" id="paceLabel">快速</span><span class="chev">▾</span></button>
 					<button class="pill thought" id="thoughtBtn" type="button" title="Thinking intensity"><span class="brain">◎</span><span class="label" id="thoughtLabel">Low</span><span class="chev">▾</span></button>
+				</span>
+				<span id="deepseekKeyPill" hidden>
+					<button class="pill" id="deepseekKeyBtn" type="button" title="Set DeepSeek API Key" aria-label="Set DeepSeek API Key"><span class="label">设置 DeepSeek API Key</span></button>
 				</span>
 				<span id="cursorPills" data-brain-chrome="cursor" hidden>
 					<button class="pill" id="cursorModeBtn" type="button" title="Cursor mode"><span class="label" id="cursorModeLabel">Agent</span><span class="chev">▾</span></button>

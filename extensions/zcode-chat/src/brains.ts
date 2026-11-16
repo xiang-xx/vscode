@@ -5,18 +5,19 @@
 
 import * as vscode from 'vscode';
 
-/** Top-level AI brain — ZCode and Cursor are peers. */
-export type ActiveBrain = 'zcode' | 'cursor';
+/** Top-level AI brain — ZCode, Cursor, and DeepSeek are peers. */
+export type ActiveBrain = 'zcode' | 'cursor' | 'deepseek';
 
-export const BRAINS: readonly ActiveBrain[] = ['zcode', 'cursor'];
+export const BRAINS: readonly ActiveBrain[] = ['zcode', 'cursor', 'deepseek'];
 
 export const BRAIN_LABELS: Record<ActiveBrain, string> = {
 	zcode: 'ZCode',
 	cursor: 'Cursor',
+	deepseek: 'DeepSeek',
 };
 
 export function isActiveBrain(value: unknown): value is ActiveBrain {
-	return value === 'zcode' || value === 'cursor';
+	return value === 'zcode' || value === 'cursor' || value === 'deepseek';
 }
 
 export function getActiveBrain(): ActiveBrain {
@@ -36,10 +37,12 @@ export async function pickActiveBrain(current?: ActiveBrain): Promise<ActiveBrai
 			description: brain === active ? 'current' : undefined,
 			detail: brain === 'zcode'
 				? 'Start Plan / BigModel via ZCode credentials'
-				: 'Official Cursor Agent CLI (ACP)',
+				: brain === 'cursor'
+					? 'Official Cursor Agent CLI (ACP)'
+					: 'Official DeepSeek API (api.deepseek.com) with your API key',
 			brain,
 		})),
-		{ title: 'AI brain', placeHolder: 'ZCode and Cursor are peers' },
+		{ title: 'AI brain', placeHolder: 'ZCode, Cursor, and DeepSeek are peers' },
 	);
 	return picked?.brain;
 }

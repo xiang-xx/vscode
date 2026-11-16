@@ -76,6 +76,17 @@ export function getBridgeStatusText(): string {
 			'Auth: Cursor CLI (`agent login` / CURSOR_API_KEY)',
 		].join('\n');
 	}
+	if (brain === 'deepseek') {
+		const model = getSelectedModelId('deepseek');
+		const reasoningLevel = getSelectedReasoningLevel('deepseek', model);
+		return [
+			`Brain: ${BRAIN_LABELS.deepseek}`,
+			`Model: ${model} · thinking ${reasoningLevel}`,
+			`Bridge: agent (official DeepSeek API, ${'https://api.deepseek.com'})`,
+			'Auth: x-api-key — ZCode: Set DeepSeek API Key, zcode.deepseek.apiKey, or DEEPSEEK_API_KEY',
+			PROVIDER_HINTS.deepseek,
+		].join('\n');
+	}
 	const provider = getProviderMode();
 	const model = getSelectedModelId(provider);
 	const reasoningLevel = getSelectedReasoningLevel(provider, model);
@@ -97,7 +108,8 @@ export function getBridgeStatusText(): string {
 
 /**
  * Routes by top-level brain. ZCode uses BigModel/Start Plan tool loop (or stub/http);
- * Cursor uses official `agent acp`.
+ * Cursor uses official `agent acp`; DeepSeek runs the same tool loop against the
+ * official DeepSeek API with the deepseek provider pinned.
  */
 export async function completeChatTurn(
 	request: ChatTurnRequest,
@@ -106,6 +118,9 @@ export async function completeChatTurn(
 	const brain = request.brain ?? getActiveBrain();
 	if (brain === 'cursor') {
 		return completeViaCursorAcp(request, token);
+	}
+	if (brain === 'deepseek') {
+		return completeViaAgent({ ...request, provider: 'deepseek' }, token, 'deepseek');
 	}
 	const bridgeMode = getBridgeMode();
 	if (bridgeMode === 'http') {
@@ -148,6 +163,7 @@ async function completeViaCursorAcp(
 async function completeViaAgent(
 	request: ChatTurnRequest,
 	token: vscode.CancellationToken,
+	brain: ActiveBrain = 'zcode',
 ): Promise<ChatTurnResult> {
 	const provider = request.provider;
 	const model = request.model ?? getSelectedModelId(provider);
@@ -155,6 +171,7 @@ async function completeViaAgent(
 	const result = await runWorkspaceAgent({
 		messages: request.messages,
 		provider,
+		brain,
 		model,
 		reasoningLevel,
 		workspaceRoot: request.workspaceRoot,
@@ -169,7 +186,7 @@ async function completeViaAgent(
 	return {
 		content: result.text,
 		provider,
-		brain: 'zcode',
+		brain,
 		bridgeMode: 'agent',
 		todos: result.todos,
 	};

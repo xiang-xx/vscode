@@ -8,7 +8,12 @@ import * as vscode from 'vscode';
 /** Start Plan, BigModel Coding Plan, and the official DeepSeek Messages API. */
 export type ProviderMode = 'startPlan' | 'bigmodel' | 'deepseek';
 
-export const PROVIDER_MODES: readonly ProviderMode[] = ['startPlan', 'bigmodel', 'deepseek'];
+/**
+ * Picker list for the ZCode brain. DeepSeek is a peer brain now (zcode.activeBrain),
+ * so it is not offered as a ZCode sub-provider anymore; the id stays in the type so
+ * stored sessions (and the deepseek brain) keep resolving.
+ */
+export const PROVIDER_MODES: readonly ProviderMode[] = ['startPlan', 'bigmodel'];
 
 export const PROVIDER_LABELS: Record<ProviderMode, string> = {
 	startPlan: 'ZCode Start Plan',
@@ -26,16 +31,20 @@ export function isProviderMode(value: unknown): value is ProviderMode {
 	return value === 'startPlan' || value === 'bigmodel' || value === 'deepseek';
 }
 
-/** Map legacy settings (`zcode`, `glm`) onto the current modes. `deepseek` is the official API. */
+/**
+ * Map legacy settings (`zcode`, `glm`, and the pre-peer-brain `deepseek` sub-provider)
+ * onto the current modes. The activation step additionally flips a legacy
+ * `deepseek` providerMode over to the DeepSeek brain.
+ */
 export function normalizeProviderMode(value: unknown): ProviderMode {
-	if (isProviderMode(value)) {
-		return value;
-	}
 	if (value === 'zcode') {
 		return 'startPlan';
 	}
 	if (value === 'glm') {
 		return 'bigmodel';
+	}
+	if (value === 'startPlan' || value === 'bigmodel') {
+		return value;
 	}
 	return 'startPlan';
 }

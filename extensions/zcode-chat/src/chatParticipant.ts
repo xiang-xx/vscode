@@ -18,7 +18,13 @@ import {
 	setSelectedReasoningLevel,
 } from './models';
 import { prepareDeepseekProvider } from './deepseekProvider';
-import { getProviderMode, pickProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
+import { getActiveBrain } from './brains';
+import { getProviderMode, pickProviderMode, PROVIDER_LABELS, setProviderMode, type ProviderMode } from './providers';
+
+/** Provider the active brain runs on: the DeepSeek brain pins the official API. */
+function brainProvider(): ProviderMode {
+	return getActiveBrain() === 'deepseek' ? 'deepseek' : getProviderMode();
+}
 
 type ChatResponseStreamEx = vscode.ChatResponseStream & {
 	externalEdit?(target: vscode.Uri | vscode.Uri[], callback: () => Thenable<unknown>): Thenable<string>;
@@ -42,7 +48,7 @@ export function registerChatParticipant(context: vscode.ExtensionContext): void 
 			return {};
 		}
 
-		const provider = getProviderMode();
+		const provider = brainProvider();
 		const model = getSelectedModelId(provider);
 		const reasoningLevel = getSelectedReasoningLevel(provider, model);
 		response.markdown(`_ZCode · ${PROVIDER_LABELS[provider]} · ${model} · thinking ${reasoningLevel}_`);
@@ -115,7 +121,7 @@ export function registerChatParticipant(context: vscode.ExtensionContext): void 
 }
 
 export async function switchModelCommand(): Promise<void> {
-	const provider = getProviderMode();
+	const provider = brainProvider();
 	const next = await pickModel(provider);
 	if (!next) {
 		return;
@@ -125,7 +131,7 @@ export async function switchModelCommand(): Promise<void> {
 }
 
 export async function switchReasoningLevelCommand(): Promise<void> {
-	const provider = getProviderMode();
+	const provider = brainProvider();
 	const next = await pickReasoningLevel(provider);
 	if (!next) {
 		return;

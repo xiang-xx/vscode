@@ -2818,12 +2818,19 @@
 		if (statusEl && statusEl.textContent !== statusText) {
 			statusEl.textContent = statusText;
 		}
-		if (group.workerId && !removeBtn) {
+		// Removable = ANY removal key. The extension-side removeWorkerCard
+		// handler matches by workerId OR workerSessionId OR card id (and
+		// reverse-looks-up the roster when workerId is missing), so gating
+		// the ✕ on workerId alone left bridge/legacy receipt cards visible
+		// but undeletable.
+		const removable = !!(group.workerId || group.workerSessionId
+			|| (group.turns && group.turns[0] && group.turns[0].id));
+		if (removable && !removeBtn) {
 			const head = card.querySelector(':scope > .worker-card-head');
 			if (head) {
 				head.appendChild(createWorkerRemoveButton(group));
 			}
-		} else if (!group.workerId && removeBtn) {
+		} else if (!removable && removeBtn) {
 			removeBtn.remove();
 		}
 	}
@@ -3770,9 +3777,10 @@
 			timelineEl.replaceChildren();
 			const empty = document.createElement('div');
 			empty.className = 'empty';
+			const brainName = state && state.brain === 'deepseek' ? 'DeepSeek' : state && state.brain === 'cursor' ? 'Cursor' : 'ZCode';
 			empty.textContent = state && state.isRouter
 				? '描述任务并派发；任务会按 Worker 出现在上方看板。'
-				: 'Ask ZCode to edit, explain, or run something in this workspace.';
+				: `Ask ${brainName} to edit, explain, or run something in this workspace.`;
 			timelineEl.appendChild(empty);
 			timelineContentKey = '';
 			return;
@@ -4678,11 +4686,18 @@
 		const brain = next.brain || 'zcode';
 		document.body.dataset.brain = brain;
 		if (timelineRoot) timelineRoot.dataset.brain = brain;
-		if (zcodePills) zcodePills.hidden = brain !== 'zcode';
+		// DeepSeek is a peer brain: it shares the ZCode toolbar (model / pace /
+		// thinking) but has no sub-providers, so the provider pill is hidden and
+		// an API-key shortcut appears until a key is configured.
+		if (zcodePills) zcodePills.hidden = brain !== 'zcode' && brain !== 'deepseek';
 		if (cursorPills) cursorPills.hidden = brain !== 'cursor';
+		if (providerBtn) providerBtn.style.display = brain === 'deepseek' ? 'none' : '';
+		const deepseekKeyPill = document.getElementById('deepseekKeyPill');
+		if (deepseekKeyPill) deepseekKeyPill.hidden = !(brain === 'deepseek' && next.signedIn === false);
 		if (brainLabel) {
 			const brainMatch = (next.brains || []).find((item) => item.id === brain);
-			brainLabel.textContent = (brainMatch && brainMatch.label) || (brain === 'cursor' ? 'Cursor' : 'ZCode');
+			brainLabel.textContent = (brainMatch && brainMatch.label)
+				|| (brain === 'cursor' ? 'Cursor' : brain === 'deepseek' ? 'DeepSeek' : 'ZCode');
 		}
 
 		providerLabel.textContent =
@@ -4700,7 +4715,9 @@
 			cursorModelLabel.textContent = next.model || 'Default';
 		}
 		if (accountBtn) {
-			accountBtn.textContent = next.signedIn ? next.accountLabel : (brain === 'cursor' ? 'Cursor login' : 'Sign in');
+			accountBtn.textContent = next.signedIn
+				? next.accountLabel
+				: (brain === 'cursor' ? 'Cursor login' : brain === 'deepseek' ? '设置 DeepSeek API Key' : 'Sign in');
 		}
 
 		if (scheduleTipEl) {
@@ -4804,10 +4821,18 @@
 			if (!state) return;
 			const brains = (state.brains && state.brains.length)
 				? state.brains
-				: [{ id: 'zcode', label: 'ZCode' }, { id: 'cursor', label: 'Cursor' }];
+				: [{ id: 'zcode', label: 'ZCode' }, { id: 'cursor', label: 'Cursor' }, { id: 'deepseek', label: 'DeepSeek' }];
 			openPicker('brain', brains, state.brain || 'zcode', (id) =>
 				vscode.postMessage({ type: 'setBrain', brain: id }),
 			);
+		});
+	}
+	const deepseekKeyBtn = document.getElementById('deepseekKeyBtn');
+	if (deepseekKeyBtn) {
+		deepseekKeyBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			closeMenus();
+			vscode.postMessage({ type: 'setDeepseekApiKey' });
 		});
 	}
 	providerBtn.addEventListener('click', (e) => {

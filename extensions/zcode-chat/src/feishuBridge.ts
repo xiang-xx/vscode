@@ -1619,9 +1619,18 @@ class FeishuBridge implements vscode.Disposable {
 		try {
 			// Make sure the Router exists first so this dispatch lands on the
 			// desktop board exactly like a home-panel dispatch (best effort —
-			// a missing Router must not block the spawn itself).
-			await this.panel!.ensureRouterSession?.().catch(err =>
-				this.log(`ensureRouterSession skipped: ${errText(err)}`));
+			// a missing Router must not block the spawn itself). The panel's
+			// return value IS the Router the board renders (workspace-root
+			// scoped); re-deriving it via findRouterId()'s unscoped store scan
+			// can pick another folder/window's newer "Router" — the stamp then
+			// lands in a chat this desktop never displays, and
+			// markRouterDispatchRunning mints its identity-less duplicate on
+			// the real board again (no ✕, undeletable).
+			const routerId = (await this.panel!.ensureRouterSession?.().catch(err => {
+				this.log(`ensureRouterSession skipped: ${errText(err)}`);
+				return undefined;
+			}))
+				?? await this.findRouterId();
 			// Spawn WITHOUT the message: createWorkerSession fires its first
 			// turn via `void startTurn(...)` — any throw there vanishes as an
 			// unhandled rejection and the phone waits forever. Starting the turn
@@ -1634,7 +1643,6 @@ class FeishuBridge implements vscode.Disposable {
 			// this, markRouterDispatchRunning's fallback card (no workerId)
 			// leaves the worker visible but undeletable. Best effort only: the
 			// run itself must never depend on the card.
-			const routerId = await this.findRouterId();
 			if (routerId) {
 				await this.stampDispatchCard(routerId, sessionId, task, title).catch(err =>
 					this.log(`dispatch card stamp failed: ${errText(err)}`));

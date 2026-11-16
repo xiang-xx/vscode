@@ -13,6 +13,7 @@ import {
 	type AskUserHandler,
 } from './askUser';
 import { getAuthService } from './authSession';
+import { BRAIN_LABELS, type ActiveBrain } from './brains';
 import type { ChatMessage } from './bridge';
 import { formatLineDiff, type TodoItem, type TodoStatus } from './conversation';
 import {
@@ -31,7 +32,7 @@ import {
 	spawnCapture,
 	truncatePreview,
 } from './processUtils';
-import type { ProviderMode } from './providers';
+import { PROVIDER_LABELS, type ProviderMode } from './providers';
 import { BROWSER_TOOL_DEFS, executeBrowserTool } from './browserTools';
 import { LSP_TOOL_DEFS, executeLspTool } from './lspTools';
 import { JOB_TOOL_DEFS, executeJobTool, runShellWithJobFallback } from './backgroundJobs';
@@ -446,9 +447,41 @@ function activeTools() {
 	return [...TOOLS, ...cachedPluginToolDefs()];
 }
 
+/**
+ * The first system line is the worker's identity. It is composed from live facts
+ * (the model id, the brain/provider label tables, and the endpoint actually in use)
+ * instead of per-brain literals, so a new brain, a renamed provider, or a custom
+ * base URL cannot leave the model describing itself as another product's agent.
+ */
+function providerEndpoint(brain: ActiveBrain | undefined, provider: ProviderMode): string | undefined {
+	if (brain !== 'deepseek' && provider !== 'deepseek') {
+		return undefined;
+	}
+	try {
+		return new URL(deepseekMessagesUrl()).host;
+	} catch {
+		// Invalid configured base URL is reported when the request is made.
+		return undefined;
+	}
+}
+
+function brainIdentityLines(brain: ActiveBrain | undefined, provider: ProviderMode, model: string): string[] {
+	const modelId = model.trim() || 'the configured model';
+	const label = brain && brain !== 'zcode' ? BRAIN_LABELS[brain] : PROVIDER_LABELS[provider];
+	const endpoint = providerEndpoint(brain, provider);
+	const served = endpoint ? `${label} at ${endpoint}` : label;
+	return [
+		`You are ${modelId}, served through ${served}, driving the chat agent inside this VS Code fork.`,
+		`When asked which model or agent you are, answer with the model id ${modelId} and the provider above, and nothing further about your origin. Do not present yourself as another product's built-in agent.`,
+		'Tool philosophy follows ZCode CLI.',
+	];
+}
+
 export async function runWorkspaceAgent(options: {
 	messages: ChatMessage[];
 	provider: ProviderMode;
+	/** Which peer brain drives this turn; it decides how the worker introduces itself. */
+	brain?: ActiveBrain;
 	model: string;
 	reasoningLevel: string;
 	workspaceRoot?: string;
@@ -489,7 +522,7 @@ export async function runWorkspaceAgent(options: {
 		{
 			role: 'system',
 			content: [
-				'You are ZCode agent inside a VS Code fork (same tool philosophy as ZCode CLI).',
+				...brainIdentityLines(options.brain, options.provider, options.model),
 				`Workspace root: ${root}`,
 				'Tools: read_file, write_file, str_replace, delete_file, list_dir, grep, glob, run_terminal_cmd, get_diagnostics, web_fetch, open_browser_page, browser_list_pages, browser_read_page, browser_click, browser_type, browser_hover, browser_screenshot, browser_navigate, browser_import_chrome_data, lsp_definition, lsp_references, lsp_implementation, lsp_type_definition, lsp_hover, lsp_document_symbols, lsp_workspace_symbols, job_list, job_output, job_kill, terminal_open, terminal_send, terminal_read, terminal_list, terminal_kill, present, TodoWrite, AskUserQuestion.',
 				'ZCode CLI names also work (Read/Write/Edit/Bash/Grep/Glob/WebFetch).',

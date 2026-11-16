@@ -25,9 +25,8 @@ const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
 	'grok-4.7': 500_000,
 	'grok-4.5': 256_000,
 	'gpt-5.6': 272_000,
-	'deepseek-flash': 1_048_576,
-	'deepseek-v4-pro': 1_048_576,
-	'deepseek-v4-flash': 1_048_576,
+	'deepseek-chat': 128_000,
+	'deepseek-reasoner': 128_000,
 };
 
 const DEFAULT_CONTEXT_WINDOW = 200_000;

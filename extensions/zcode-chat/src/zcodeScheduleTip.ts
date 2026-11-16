@@ -25,7 +25,7 @@ export function isZcodePeakHours(now: Date = new Date()): boolean {
  * - Off-peak + not on ZCode → nudge to prefer ZCode
  */
 export function getZcodeScheduleTip(
-	brain: 'zcode' | 'cursor',
+	brain: 'zcode' | 'cursor' | 'deepseek',
 	now: Date = new Date(),
 ): ZcodeScheduleTip | undefined {
 	const peak = isZcodePeakHours(now);

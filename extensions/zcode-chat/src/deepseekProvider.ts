@@ -6,8 +6,8 @@
 import * as vscode from 'vscode';
 
 /**
- * DeepSeek official Messages transport, following deepseek-harness
- * `@deepseek-ai/dsh-llm-deepseek`:
+ * DeepSeek official Messages transport (docs: https://api-docs.deepseek.com/zh-cn/),
+ * following deepseek-harness `@deepseek-ai/dsh-llm-deepseek`:
  *   POST {baseURL}/v1/messages
  *   header `x-api-key` (no Bearer), `anthropic-version: 2023-06-01`, redirects refused.
  * Thinking is `thinking.type` plus `output_config.effort` (`off` | `low` | `high` | `max`).
@@ -19,13 +19,14 @@ import * as vscode from 'vscode';
 
 const SECRET_KEY = 'zcode.deepseek.apiKey';
 const DEFAULT_BASE_URL = 'https://api.deepseek.com/anthropic';
-/** Official listing context window for V4 Flash / V4 Pro. */
-const DEFAULT_CONTEXT_WINDOW = 1_048_576;
+/** Official docs (api-docs.deepseek.com): 128K max context for both listed models. */
+const DEFAULT_CONTEXT_WINDOW = 128_000;
 /**
- * Per-request output ceiling. Harness defaults to 256000; this stays under that
- * so one agent turn cannot run away, while still leaving room for thinking plus tools.
+ * Per-request output ceiling. Official docs cap output at 8K tokens
+ * (deepseek-reasoner additionally budgets up to 32K thinking tokens server-side),
+ * so one agent turn cannot run away while still leaving room for tools.
  */
-export const DEEPSEEK_MAX_OUTPUT_TOKENS = 32_768;
+export const DEEPSEEK_MAX_OUTPUT_TOKENS = 8_192;
 const USER_AGENT = 'zcode-chat/0.1.0 (+https://zcode.z.ai)';
 
 const REASONING_LEVELS = ['off', 'low', 'high', 'max'] as const;
@@ -37,17 +38,21 @@ export interface DeepseekModelOption {
 	defaultReasoningLevel: string;
 }
 
-/** Advisory catalog from dsh-llm-deepseek `DEFAULT_MODELS`. Listing replaces this when it succeeds. */
+/**
+ * Advisory catalog from the official docs (api-docs.deepseek.com/quick_start/pricing):
+ * `deepseek-chat` (V3, non-thinking default) and `deepseek-reasoner` (R1, thinking).
+ * Listing (`GET /models`) replaces this when it succeeds.
+ */
 const DEFAULT_MODELS: readonly DeepseekModelOption[] = [
 	{
-		id: 'deepseek-flash',
-		label: 'DeepSeek-V4.1-Flash',
+		id: 'deepseek-chat',
+		label: 'DeepSeek-chat (V3)',
 		reasoningLevels: REASONING_LEVELS,
-		defaultReasoningLevel: 'high',
+		defaultReasoningLevel: 'off',
 	},
 	{
-		id: 'deepseek-v4-pro',
-		label: 'DeepSeek-V4-Pro',
+		id: 'deepseek-reasoner',
+		label: 'DeepSeek-reasoner (R1)',
 		reasoningLevels: REASONING_LEVELS,
 		defaultReasoningLevel: 'high',
 	},
@@ -107,6 +112,18 @@ export function bindDeepseekSecrets(storage: vscode.SecretStorage): void {
 
 export function deepseekCatalog(): readonly DeepseekModelOption[] {
 	return catalogOverride?.length ? catalogOverride : DEFAULT_MODELS;
+}
+
+/**
+ * Retired ZCode-harness DeepSeek ids (`deepseek-flash` → "DeepSeek-V4.1-Flash" and
+ * friends). They were never official API models, so api.deepseek.com rejects them
+ * and the UI must not keep advertising them.
+ */
+const RETIRED_HARNESS_MODELS = new Set(['deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4.1-flash']);
+
+export function isRetiredDeepseekModel(modelId: string | undefined): boolean {
+	const id = modelId?.trim().toLowerCase();
+	return !!id && RETIRED_HARNESS_MODELS.has(id);
 }
 
 export function deepseekContextWindow(modelId: string | undefined): number | undefined {

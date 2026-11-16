@@ -42,11 +42,13 @@
           "default": "zcode",
           "enum": [
             "zcode",
-            "cursor"
+            "cursor",
+            "deepseek"
           ],
           "enumDescriptions": [
             "%config.activeBrain.zcode%",
-            "%config.activeBrain.cursor%"
+            "%config.activeBrain.cursor%",
+            "%config.activeBrain.deepseek%"
           ],
           "description": "%config.activeBrain%"
         },
@@ -55,13 +57,11 @@
           "default": "startPlan",
           "enum": [
             "startPlan",
-            "bigmodel",
-            "deepseek"
+            "bigmodel"
           ],
           "enumDescriptions": [
             "%config.providerMode.startPlan%",
-            "%config.providerMode.bigmodel%",
-            "%config.providerMode.deepseek%"
+            "%config.providerMode.bigmodel%"
           ],
           "description": "%config.providerMode%"
         },
