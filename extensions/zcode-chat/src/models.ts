@@ -5,6 +5,7 @@
 
 import * as vscode from 'vscode';
 import { deepseekCatalog } from './deepseekProvider';
+import { addQianwenCustomModel, qianwenCatalog, refreshQianwenCatalogFromConfig } from './qianwenProvider';
 import type { ProviderMode } from './providers';
 
 /**
@@ -78,6 +79,9 @@ export function modelsForProvider(provider: ProviderMode): readonly ZCodeModelOp
 	if (provider === 'deepseek') {
 		return deepseekCatalog();
 	}
+	if (provider === 'qianwen') {
+		return qianwenCatalog();
+	}
 	return START_PLAN_MODELS;
 }
 
@@ -131,18 +135,65 @@ export async function ensureReasoningLevelForModel(provider: ProviderMode, model
 	return model.defaultReasoningLevel;
 }
 
+type ModelPickItem = vscode.QuickPickItem & { id?: string; custom?: boolean };
+
 export async function pickModel(provider: ProviderMode): Promise<string | undefined> {
-	const current = getSelectedModelId(provider);
-	const picked = await vscode.window.showQuickPick(
-		modelsForProvider(provider).map(m => ({
+	const quickPick = vscode.window.createQuickPick<ModelPickItem>();
+	quickPick.title = 'ZCode model';
+	quickPick.placeholder = 'Select model (ZCode defaults)';
+	const renderItems = (): void => {
+		const current = getSelectedModelId(provider);
+		const items: ModelPickItem[] = modelsForProvider(provider).map(m => ({
 			label: m.label,
 			description: m.id === current ? 'current' : undefined,
 			detail: `Thinking: ${m.reasoningLevels.map(l => REASONING_LABELS[l] ?? l).join(' / ')}`,
 			id: m.id,
-		})),
-		{ title: 'ZCode model', placeHolder: 'Select model (ZCode defaults)' },
-	);
-	return picked?.id;
+		}));
+		if (provider === 'qianwen') {
+			// The marketplace (qianwenai.com/models) proxies far more ids than any
+			// built-in list; /models covers the account, manual entry covers the rest.
+			items.push({
+				label: '$(symbol-parameter) 输入模型 ID…',
+				detail: '手动填市场页或 /models 接口里的任意模型 ID（qianwenai.com/models）',
+				custom: true,
+			});
+		}
+		quickPick.items = items;
+	};
+	renderItems();
+	if (provider === 'qianwen') {
+		// Fresh list from GET /models with the stored key; cached entries stay
+		// selectable while the refresh is in flight.
+		quickPick.busy = true;
+		void refreshQianwenCatalogFromConfig().then(() => renderItems()).finally(() => { quickPick.busy = false; });
+	}
+	const disposables: vscode.Disposable[] = [];
+	const picked = await new Promise<ModelPickItem | undefined>(resolve => {
+		disposables.push(
+			quickPick.onDidAccept(() => resolve(quickPick.selectedItems[0])),
+			quickPick.onDidHide(() => resolve(undefined)),
+		);
+		quickPick.show();
+	});
+	disposables.forEach(d => d.dispose());
+	quickPick.dispose();
+	if (!picked) {
+		return undefined;
+	}
+	if (picked.custom) {
+		const typed = await vscode.window.showInputBox({
+			title: '千问模型 ID',
+			prompt: '市场页或 /models 接口里的模型 ID，例如 qwen4-max、qwen3.8-flash。',
+			placeHolder: 'qwen4-max',
+			ignoreFocusOut: true,
+			validateInput: value => /^[\w.:-]{1,120}$/u.test(value.trim()) ? undefined : '模型 ID 只能包含字母、数字、点、下划线、连字符或冒号。',
+		});
+		if (!typed?.trim()) {
+			return undefined;
+		}
+		return addQianwenCustomModel(typed);
+	}
+	return picked.id;
 }
 
 export async function pickReasoningLevel(provider: ProviderMode, modelId?: string): Promise<string | undefined> {

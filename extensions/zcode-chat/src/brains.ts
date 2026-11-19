@@ -5,19 +5,20 @@
 
 import * as vscode from 'vscode';
 
-/** Top-level AI brain — ZCode, Cursor, and DeepSeek are peers. */
-export type ActiveBrain = 'zcode' | 'cursor' | 'deepseek';
+/** Top-level AI brain — ZCode, Cursor, DeepSeek, and Qianwen are peers. */
+export type ActiveBrain = 'zcode' | 'cursor' | 'deepseek' | 'qianwen';
 
-export const BRAINS: readonly ActiveBrain[] = ['zcode', 'cursor', 'deepseek'];
+export const BRAINS: readonly ActiveBrain[] = ['zcode', 'cursor', 'deepseek', 'qianwen'];
 
 export const BRAIN_LABELS: Record<ActiveBrain, string> = {
 	zcode: 'ZCode',
 	cursor: 'Cursor',
 	deepseek: 'DeepSeek',
+	qianwen: 'Qianwen',
 };
 
 export function isActiveBrain(value: unknown): value is ActiveBrain {
-	return value === 'zcode' || value === 'cursor' || value === 'deepseek';
+	return value === 'zcode' || value === 'cursor' || value === 'deepseek' || value === 'qianwen';
 }
 
 export function getActiveBrain(): ActiveBrain {
@@ -39,10 +40,12 @@ export async function pickActiveBrain(current?: ActiveBrain): Promise<ActiveBrai
 				? 'Start Plan / BigModel via ZCode credentials'
 				: brain === 'cursor'
 					? 'Official Cursor Agent CLI (ACP)'
-					: 'Official DeepSeek API (api.deepseek.com) with your API key',
+					: brain === 'deepseek'
+						? 'Official DeepSeek API (api.deepseek.com) with your API key'
+						: 'Qwen OpenAI-compatible API (maas.qianwenaiapi.com) with your API key',
 			brain,
 		})),
-		{ title: 'AI brain', placeHolder: 'ZCode, Cursor, and DeepSeek are peers' },
+		{ title: 'AI brain', placeHolder: 'ZCode, Cursor, DeepSeek, and Qianwen are peers' },
 	);
 	return picked?.brain;
 }

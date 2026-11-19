@@ -30,6 +30,7 @@ export const IDE_CHAT_STORE_VERSION = 1;
 export const IDE_CHAT_SOURCE_ZCODE = 'zcode';
 export const IDE_CHAT_SOURCE_CURSOR = 'cursor';
 export const IDE_CHAT_SOURCE_DEEPSEEK = 'deepseek';
+export const IDE_CHAT_SOURCE_QIANWEN = 'qianwen';
 
 export type IdeChatSource =
 	| typeof IDE_CHAT_SOURCE_ZCODE
@@ -847,5 +848,6 @@ export interface IdeChatExtensionApi {
 		zcode: typeof IDE_CHAT_SOURCE_ZCODE;
 		cursor: typeof IDE_CHAT_SOURCE_CURSOR;
 		deepseek: typeof IDE_CHAT_SOURCE_DEEPSEEK;
+		qianwen: typeof IDE_CHAT_SOURCE_QIANWEN;
 	};
 }

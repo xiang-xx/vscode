@@ -66,6 +66,13 @@ interface Pending {
 const PROMPT_IDLE_TIMEOUT_MS = 10 * 60_000;
 /** Absolute ceiling so a wedged prompt cannot hang forever. */
 const PROMPT_MAX_TIMEOUT_MS = 60 * 60_000;
+/**
+ * cursor_login validates the stored Cursor credentials against Cursor's
+ * backend; proxies and slow networks regularly push it past 20s. Give it a
+ * generous budget and one fresh-process retry before surfacing the error.
+ */
+const AUTH_TIMEOUT_MS = 60_000;
+const START_ATTEMPTS = 2;
 
 /**
  * Transport failures the Cursor CLI labels RetriableError.
@@ -113,6 +120,8 @@ export function formatCursorTransportFailure(attempts: number, last: string): st
 
 export class CursorAcpClient {
 	private child?: ChildProcessWithoutNullStreams;
+	/** Marks the current child as intentionally killed so its exit is not treated as a crash. */
+	private retireChild?: () => void;
 	private nextId = 1;
 	private readonly pending = new Map<number, Pending>();
 	private sessionId?: string;
@@ -139,6 +148,39 @@ export class CursorAcpClient {
 		if (this.child) {
 			return;
 		}
+		let lastError: unknown;
+		for (let attempt = 1; attempt <= START_ATTEMPTS; attempt++) {
+			try {
+				await this.spawnChild();
+				await this.request('initialize', {
+					protocolVersion: 1,
+					clientCapabilities: {
+						fs: { readTextFile: false, writeTextFile: false },
+						terminal: false,
+					},
+					clientInfo: { name: 'zcode-chat-acp', version: '0.1.0' },
+				});
+				await this.request('authenticate', { methodId: 'cursor_login' }, AUTH_TIMEOUT_MS);
+				return;
+			} catch (err) {
+				lastError = err;
+				this.teardownChild();
+				const msg = err instanceof Error ? err.message : String(err);
+				// A missing/misconfigured binary, a bad cwd, a crashed process, or
+				// dispose() during start: respawning cannot fix these. Skip the retry.
+				if (this.closed || /binary unavailable|^spawn |Cursor ACP cwd/i.test(msg)) {
+					break;
+				}
+			}
+		}
+		throw new Error(formatAuthenticateFailure(lastError));
+	}
+
+	/**
+	 * Spawn the agent child and wire its stdio. Split from start() so a failed
+	 * authenticate can retry on a fresh process.
+	 */
+	private async spawnChild(): Promise<void> {
 		const cwd = await assertDirectory(this.options.cwd, 'Cursor ACP cwd');
 		const resolved = await resolveAgentBinary();
 		const configured = getCursorAgentPath();
@@ -175,32 +217,57 @@ export class CursorAcpClient {
 			throw new Error(formatSpawnError(msg, bin, cwd));
 		}
 
-		this.child.on('error', (err) => {
+		const child = this.child;
+		// Set when this child is killed on purpose (start retry, dispose()): its
+		// exit must not be reported as a crash, and its late output ignored.
+		let retired = false;
+		this.retireChild = () => {
+			retired = true;
+			if (this.child === child) {
+				this.child = undefined;
+			}
+		};
+
+		child.on('error', (err) => {
+			if (retired) {
+				return;
+			}
 			const msg = err instanceof Error ? err.message : String(err);
 			this.failAll(new Error(formatSpawnError(msg, bin, cwd)));
 		});
-		this.child.on('close', (code) => {
+		child.on('close', (code) => {
+			if (retired) {
+				return;
+			}
 			this.closed = true;
 			this.failAll(new Error(`Cursor agent exited (code ${code ?? '?'})`));
 		});
 
-		this.child.stderr.on('data', (chunk: Buffer) => {
+		child.stderr.on('data', (chunk: Buffer) => {
 			this.options.onLog?.(chunk.toString('utf8'));
 		});
 
-		const rl = readline.createInterface({ input: this.child.stdout });
-		rl.on('line', line => void this.onLine(line));
-
-		await this.request('initialize', {
-			protocolVersion: 1,
-			clientCapabilities: {
-				fs: { readTextFile: false, writeTextFile: false },
-				terminal: false,
-			},
-			clientInfo: { name: 'zcode-chat-acp', version: '0.1.0' },
+		const rl = readline.createInterface({ input: child.stdout });
+		rl.on('line', line => {
+			if (this.closed || this.child !== child) {
+				return;
+			}
+			void this.onLine(line);
 		});
+	}
 
-		await this.request('authenticate', { methodId: 'cursor_login' }, 20_000);
+	/** Kill the current child without marking the client permanently closed. */
+	private teardownChild(): void {
+		const child = this.child;
+		this.retireChild?.();
+		this.retireChild = undefined;
+		if (!child) {
+			return;
+		}
+		try {
+			child.stdin.end();
+		} catch { /* ignore */ }
+		child.kill('SIGTERM');
 	}
 
 	async newSession(): Promise<string> {
@@ -268,11 +335,7 @@ export class CursorAcpClient {
 	dispose(): void {
 		this.closed = true;
 		this.failAll(new Error('ACP client disposed'));
-		try {
-			this.child?.stdin.end();
-		} catch { /* ignore */ }
-		this.child?.kill('SIGTERM');
-		this.child = undefined;
+		this.teardownChild();
 	}
 
 	private request(
@@ -454,6 +517,21 @@ export class CursorAcpClient {
 		}
 		this.pending.clear();
 	}
+}
+
+/**
+ * Wraps a failed start() for the chat timeline. Must not contain "cancel" or
+ * "abort": the chat panel treats those substrings as a user stop. Common
+ * causes: a stale Cursor CLI login (cursor_login then waits for an interactive
+ * flow that never completes over ACP stdio) or an auth round-trip stalled by a
+ * proxy / slow network.
+ */
+function formatAuthenticateFailure(err: unknown): string {
+	const msg = err instanceof Error ? err.message : String(err);
+	if (/authenticate/i.test(msg)) {
+		return `${msg} — usually a stale Cursor login or a proxy blocking the auth check. Run \`agent login\` in a terminal (or set CURSOR_API_KEY) and retry; if already logged in, check the proxy.`;
+	}
+	return msg;
 }
 
 function formatSpawnError(message: string, bin: string, cwd: string): string {

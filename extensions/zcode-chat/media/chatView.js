@@ -32,6 +32,7 @@
 	const modelBtn = document.getElementById('modelBtn');
 	const thoughtBtn = document.getElementById('thoughtBtn');
 	const paceBtn = document.getElementById('paceBtn');
+	const quickActionsBtn = document.getElementById('quickActionsBtn');
 	const providerLabel = document.getElementById('providerLabel');
 	const modelLabel = document.getElementById('modelLabel');
 	const thoughtLabel = document.getElementById('thoughtLabel');
@@ -1613,7 +1614,7 @@
 
 	function patchUserRow(el, item, actions) {
 		const bubble = el.querySelector('.user-bubble');
-		const key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
+		const key = (item.text || '') + '|' + JSON.stringify(item.attachments || []) + '|' + (item.origin || '');
 		if (!bubble || bubble.dataset.key !== key) {
 			return false;
 		}
@@ -1912,9 +1913,16 @@
 			}
 			const row = mark(document.createElement('div'), item.id);
 			row.className = 'user-row';
+			if (item.origin === 'feishu') {
+				const via = document.createElement('div');
+				via.className = 'user-origin-chip';
+				via.textContent = '📱 来自飞书';
+				via.title = '这条来自飞书（手机）';
+				row.appendChild(via);
+			}
 			const bubble = document.createElement('div');
 			bubble.className = 'user-bubble';
-			bubble.dataset.key = (item.text || '') + '|' + JSON.stringify(item.attachments || []);
+			bubble.dataset.key = (item.text || '') + '|' + JSON.stringify(item.attachments || []) + '|' + (item.origin || '');
 			if (item.text) {
 				const textEl = document.createElement('div');
 				textEl.className = 'user-text';
@@ -4233,6 +4241,7 @@
 			model: modelBtn,
 			pace: paceBtn,
 			thought: thoughtBtn,
+			quickActions: quickActionsBtn,
 			cursorMode: cursorModeBtn,
 			cursorModel: cursorModelBtn,
 		};
@@ -4243,7 +4252,7 @@
 		if (anchor) {
 			const r = anchor.getBoundingClientRect();
 			pickerMenu.style.left =
-				Math.max(8, Math.min(r.left, window.innerWidth - 160)) + 'px';
+				Math.max(8, Math.min(r.left, window.innerWidth - pickerMenu.offsetWidth - 8)) + 'px';
 			pickerMenu.style.bottom = window.innerHeight - r.top + 6 + 'px';
 		}
 	}
@@ -4622,6 +4631,10 @@
 
 
 
+	// Qianwen brain: model choice goes through the same composer Model pill
+	// picker as ZCode/DeepSeek; the picker's last entry opens manual
+	// marketplace-id entry (the /models listing lags the market page).
+
 	function render(next) {
 		const wasBusy = busy;
 		const prevState = state;
@@ -4686,19 +4699,28 @@
 		const brain = next.brain || 'zcode';
 		document.body.dataset.brain = brain;
 		if (timelineRoot) timelineRoot.dataset.brain = brain;
-		// DeepSeek is a peer brain: it shares the ZCode toolbar (model / pace /
-		// thinking) but has no sub-providers, so the provider pill is hidden and
-		// an API-key shortcut appears until a key is configured.
-		if (zcodePills) zcodePills.hidden = brain !== 'zcode' && brain !== 'deepseek';
-		if (cursorPills) cursorPills.hidden = brain !== 'cursor';
-		if (providerBtn) providerBtn.style.display = brain === 'deepseek' ? 'none' : '';
-		const deepseekKeyPill = document.getElementById('deepseekKeyPill');
-		if (deepseekKeyPill) deepseekKeyPill.hidden = !(brain === 'deepseek' && next.signedIn === false);
-		if (brainLabel) {
-			const brainMatch = (next.brains || []).find((item) => item.id === brain);
-			brainLabel.textContent = (brainMatch && brainMatch.label)
-				|| (brain === 'cursor' ? 'Cursor' : brain === 'deepseek' ? 'DeepSeek' : 'ZCode');
-		}
+	// DeepSeek and Qianwen are peer brains: they share the ZCode toolbar
+	// (model / pace / thinking) but have no sub-providers, so the provider
+	// pill is hidden and an API-key shortcut appears until a key is configured.
+	if (zcodePills) zcodePills.hidden = brain !== 'zcode' && brain !== 'deepseek' && brain !== 'qianwen';
+	if (cursorPills) cursorPills.hidden = brain !== 'cursor';
+	if (providerBtn) providerBtn.style.display = (brain === 'deepseek' || brain === 'qianwen') ? 'none' : '';
+	const deepseekKeyPill = document.getElementById('deepseekKeyPill');
+	if (deepseekKeyPill) deepseekKeyPill.hidden = !((brain === 'deepseek' || brain === 'qianwen') && next.signedIn === false);
+	const deepseekKeyBtn = document.getElementById('deepseekKeyBtn');
+	if (deepseekKeyBtn) {
+		const qianwen = brain === 'qianwen';
+		const text = qianwen ? '设置千问 API Key' : '设置 DeepSeek API Key';
+		const labelEl = deepseekKeyBtn.querySelector('.label');
+		if (labelEl) labelEl.textContent = text;
+		deepseekKeyBtn.title = text;
+		deepseekKeyBtn.setAttribute('aria-label', text);
+	}
+	if (brainLabel) {
+		const brainMatch = (next.brains || []).find((item) => item.id === brain);
+		brainLabel.textContent = (brainMatch && brainMatch.label)
+			|| (brain === 'cursor' ? 'Cursor' : brain === 'deepseek' ? 'DeepSeek' : brain === 'qianwen' ? 'Qianwen' : 'ZCode');
+	}
 
 		providerLabel.textContent =
 			(next.providers || []).find((p) => p.id === next.provider)?.label || next.provider;
@@ -4717,7 +4739,7 @@
 		if (accountBtn) {
 			accountBtn.textContent = next.signedIn
 				? next.accountLabel
-				: (brain === 'cursor' ? 'Cursor login' : brain === 'deepseek' ? '设置 DeepSeek API Key' : 'Sign in');
+				: (brain === 'cursor' ? 'Cursor login' : brain === 'deepseek' ? '设置 DeepSeek API Key' : brain === 'qianwen' ? '设置千问 API Key' : 'Sign in');
 		}
 
 		if (scheduleTipEl) {
@@ -4832,7 +4854,8 @@
 		deepseekKeyBtn.addEventListener('click', (e) => {
 			e.stopPropagation();
 			closeMenus();
-			vscode.postMessage({ type: 'setDeepseekApiKey' });
+			const type = (state && state.brain) === 'qianwen' ? 'setQianwenApiKey' : 'setDeepseekApiKey';
+			vscode.postMessage({ type });
 		});
 	}
 	providerBtn.addEventListener('click', (e) => {
@@ -4845,9 +4868,19 @@
 	modelBtn.addEventListener('click', (e) => {
 		e.stopPropagation();
 		if (!state) return;
-		openPicker('model', state.models, state.model, (id) =>
-			vscode.postMessage({ type: 'setModel', model: id }),
-		);
+		const items = [...(state.models || [])];
+		// Qianwen: append the manual marketplace-id entry — the /models listing
+		// lags the market page, so any id can be added by hand.
+		if ((state.brain || 'zcode') === 'qianwen') {
+			items.push({ id: '__qianwen_custom__', label: '＋ 输入模型 ID…' });
+		}
+		openPicker('model', items, state.model, (id) => {
+			if (id === '__qianwen_custom__') {
+				vscode.postMessage({ type: 'addQianwenModel' });
+				return;
+			}
+			vscode.postMessage({ type: 'setModel', model: id });
+		});
 	});
 	if (paceBtn) {
 		paceBtn.addEventListener('click', (e) => {
@@ -4865,6 +4898,21 @@
 			vscode.postMessage({ type: 'setReasoningLevel', reasoningLevel: id }),
 		);
 	});
+	if (quickActionsBtn) {
+		quickActionsBtn.addEventListener('click', (e) => {
+			e.stopPropagation();
+			const actions = (state && state.quickActions) || [];
+			const items = actions.map((a) => ({ id: a.id, label: a.label }));
+			items.push({ id: '__configure__', label: '⚙ 编辑快捷功能配置…' });
+			openPicker('quickActions', items, '', (id) => {
+				if (id === '__configure__') {
+					vscode.postMessage({ type: 'openQuickActionsConfig' });
+					return;
+				}
+				vscode.postMessage({ type: 'runQuickAction', id });
+			});
+		});
+	}
 	if (cursorModeBtn) {
 		cursorModeBtn.addEventListener('click', (e) => {
 			e.stopPropagation();

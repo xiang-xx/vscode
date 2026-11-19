@@ -80,6 +80,7 @@ import {
 	setSelectedReasoningLevel,
 } from './models';
 import { filterSkills, listLocalSkills, prepareComposerTurn } from './localSkills';
+import { loadQuickActions, openQuickActionsConfigFile, watchQuickActionsConfig, type QuickActionDefinition } from './quickActions';
 import {
 	claimManualPlan,
 	fetchAccountQuota,
@@ -93,6 +94,7 @@ import {
 } from './planBilling';
 import { buildPromptPreamble } from './promptContext';
 import { prepareDeepseekProvider, resolveDeepseekApiKey } from './deepseekProvider';
+import { addQianwenCustomModel, prepareQianwenProvider, resolveQianwenApiKey } from './qianwenProvider';
 import {
 	getProviderMode,
 	isProviderMode,
@@ -456,6 +458,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.syncRouterDispatchFiles();
 			this.pushState();
 		});
+		// ~/.zcode/quick-actions.* changed on disk (first-run seeding or the
+		// user saving the file) → re-read and push so the ⚡ dropdown is fresh.
+		watchQuickActionsConfig(() => this.pushState());
 		try {
 			getAuthService().onDidChangeSession(() => {
 				void this.refreshBilling();
@@ -575,9 +580,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.deepseekAccountLabel = key ? 'DeepSeek · API Key 已设置' : 'DeepSeek · 未设置 API Key';
 	}
 
+	/** Qianwen brain account chip: whether an API key is configured. */
+	private qianwenAccountLabel = 'Qianwen · 未设置 API Key';
+
+	private async refreshQianwenMeta(): Promise<void> {
+		const key = await resolveQianwenApiKey();
+		this.qianwenAccountLabel = key ? 'Qianwen · API Key 已设置' : 'Qianwen · 未设置 API Key';
+	}
+
 	/** Resolve the provider a brain runs on: DeepSeek brain pins the official API. */
 	private brainProvider(brain: ActiveBrain): ProviderMode {
-		return brain === 'deepseek' ? 'deepseek' : getProviderMode();
+		if (brain === 'deepseek' || brain === 'qianwen') {
+			return brain;
+		}
+		return getProviderMode();
 	}
 
 	/** Resolve the effective model a brain runs on. */
@@ -598,6 +614,20 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		await this.refreshDeepseekMeta();
 		const modelId = await ensureModelForProvider('deepseek');
 		await ensureReasoningLevelForModel('deepseek', modelId);
+	}
+
+	/**
+	 * Switch onto the Qianwen brain: prompt for an API key when none is set
+	 * (secret storage → QIANWEN_API_KEY → zcode.qianwen.apiKey) and refresh the
+	 * official listing. Model choice happens through the composer Model pill
+	 * picker, same interaction as the ZCode/DeepSeek brains.
+	 */
+	private async applyQianwenBrain(): Promise<void> {
+		await prepareQianwenProvider();
+		await this.refreshQianwenMeta();
+		const modelId = await ensureModelForProvider('qianwen');
+		await ensureReasoningLevelForModel('qianwen', modelId);
+		this.pushState();
 	}
 
 	// ===== 后台进程面板（Worker 拉起的后台 job / 常驻终端对用户可见） =====
@@ -1776,8 +1806,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	async switchProvider(): Promise<void> {
 		const brain = getActiveBrain();
-		if (brain === 'cursor' || brain === 'deepseek') {
-			// Cursor and DeepSeek have no sub-providers — the pill opens the brain picker.
+		if (brain === 'cursor' || brain === 'deepseek' || brain === 'qianwen') {
+			// Cursor, DeepSeek and Qianwen have no sub-providers — the pill opens the brain picker.
 			await this.switchBrain();
 			return;
 		}
@@ -1803,6 +1833,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		await setActiveBrain(brain);
 		if (brain === 'deepseek') {
 			await this.applyDeepseekBrain();
+		}
+		if (brain === 'qianwen') {
+			await this.applyQianwenBrain();
 		}
 		await this.refreshCursorMeta();
 	}
@@ -1981,6 +2014,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushState();
 			return;
 		}
+		if (msg.type === 'setQianwenApiKey') {
+			await vscode.commands.executeCommand('zcode.setQianwenApiKey');
+			await this.refreshQianwenMeta();
+			this.pushState();
+			return;
+		}
 		if (msg.type === 'setProvider' && isProviderMode(msg.provider)) {
 			await this.applyProvider(msg.provider);
 			return;
@@ -1993,6 +2032,30 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (msg.type === 'setCursorModel' && typeof msg.model === 'string') {
 			await setCursorModel(msg.model);
 			this.pushState();
+			return;
+		}
+		if (msg.type === 'addQianwenModel') {
+			// 「＋ 输入模型 ID…」 entry at the end of the qianwen model picker:
+			// add any marketplace id the /models listing does not carry yet,
+			// then select it.
+			const value = await vscode.window.showInputBox({
+				title: '添加千问模型',
+				prompt: '输入模型 ID（市场页上的任意模型均可，如 qwen4-max）。添加后会固定出现在模型选择器里。',
+				placeHolder: 'qwen4-max',
+				ignoreFocusOut: true,
+			});
+			const raw = value?.trim();
+			if (!raw) {
+				return;
+			}
+			try {
+				const modelId = await addQianwenCustomModel(raw);
+				await setSelectedModelId(modelId);
+				await ensureReasoningLevelForModel('qianwen', modelId);
+				this.pushState();
+			} catch (error) {
+				void vscode.window.showWarningMessage(error instanceof Error ? error.message : String(error));
+			}
 			return;
 		}
 		if (msg.type === 'setModel' && typeof msg.model === 'string') {
@@ -2031,6 +2094,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (msg.type === 'setAgentPace' && typeof msg.pace === 'string'
 			&& (AGENT_PACES as readonly string[]).includes(msg.pace)) {
 			await setAgentPace(msg.pace as AgentPace);
+			this.pushState();
+			return;
+		}
+		if (msg.type === 'runQuickAction' && typeof msg.id === 'string') {
+			await this.runQuickAction(msg.id);
+			return;
+		}
+		if (msg.type === 'openQuickActionsConfig') {
+			await openQuickActionsConfigFile();
+			// First run just seeded the example file — push immediately so the
+			// ⚡ dropdown shows it on the very next click.
 			this.pushState();
 			return;
 		}
@@ -2432,6 +2506,61 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			await this.handleSend(text);
 		}
+	}
+
+	/**
+	 * Apply a ⚡ quick action from ~/.zcode/quick-actions.json: optionally pin
+	 * brain / model / 思考深度 / 思考范围, then send its prompt to the current
+	 * session (enqueued when busy, same as a normal send).
+	 */
+	private async runQuickAction(id: string): Promise<void> {
+		const action: QuickActionDefinition | undefined = loadQuickActions().find(item => item.id === id);
+		if (!action) {
+			this.pushState();
+			return;
+		}
+		if (action.brain && isActiveBrain(action.brain) && getActiveBrain() !== action.brain) {
+			await this.applyBrain(action.brain);
+		}
+		if (action.model) {
+			const brain = getActiveBrain();
+			if (brain === 'cursor') {
+				await setCursorModel(action.model);
+			} else {
+				const provider = this.brainProvider(brain);
+				const catalog = modelsForProvider(provider);
+				if (catalog.some(m => m.id === action.model)) {
+					await setSelectedModelId(action.model);
+					await ensureReasoningLevelForModel(provider, action.model);
+				} else {
+					void vscode.window.showWarningMessage(`快捷功能「${action.label}」：模型 ${action.model} 不在当前列表里，保留当前模型。`);
+				}
+			}
+		}
+		if (action.reasoningLevel && getActiveBrain() !== 'cursor') {
+			const provider = this.brainProvider(getActiveBrain());
+			const model = modelsForProvider(provider).find(m => m.id === getSelectedModelId(provider));
+			if (model?.reasoningLevels.includes(action.reasoningLevel)) {
+				await setSelectedReasoningLevel(action.reasoningLevel);
+			} else {
+				void vscode.window.showWarningMessage(`快捷功能「${action.label}」：思考深度 ${action.reasoningLevel} 不适用于 ${model?.id ?? '当前模型'}，保留当前设置。`);
+			}
+		}
+		if (action.pace && getActiveBrain() !== 'cursor' && (AGENT_PACES as readonly string[]).includes(action.pace)) {
+			await setAgentPace(action.pace as AgentPace);
+		}
+		const prompt = (action.prompt ?? '').trim();
+		if (prompt) {
+			this.draftText = prompt;
+			this.noteDesktopPetUserMessage(prompt);
+			if (this.busy) {
+				await this.enqueueMessage(prompt);
+			} else {
+				await this.handleSend(prompt);
+			}
+			return;
+		}
+		this.pushState();
 	}
 
 	private async handlePlusAction(actionId: string, slash?: string): Promise<void> {
@@ -3330,7 +3459,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	private async startTurn(runSessionId: string, content: string, display?: { text?: string; attachments?: AttachmentChip[] }, reuseUserId?: string): Promise<void> {
+	private async startTurn(runSessionId: string, content: string, display?: { text?: string; attachments?: AttachmentChip[]; origin?: 'feishu' }, reuseUserId?: string, onStarted?: (userId: string) => void): Promise<void> {
 		// Direct dispatches (router submit / idle worker) are unaffected; only
 		// queued follow-ups have a matching "queued" card waiting to flip.
 		this.promoteQueuedDispatch(runSessionId);
@@ -3342,20 +3471,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// to silently drop the dispatched message then — the Router card showed
 		// "running" but the worker's chat flow never received it. Seed a parked
 		// view from the persisted store so the follow-up actually lands.
-		if (runSessionId !== this.sessionId && !this.parked.has(runSessionId)) {
-			const session = await this.ideChat.getSession(runSessionId).catch(() => undefined);
-			if (!session) {
-				return;
-			}
-			this.parked.set(runSessionId, {
-				items: (session.timeline ?? []).map(item => ({ ...item })),
-				todos: [...(session.todos ?? [])],
-				persisted: true,
-				draftText: '',
-				attachments: [],
-				queue: [],
-				queuePaused: false,
-			});
+		if (!await this.ensureParkedView(runSessionId)) {
+			return;
 		}
 		// Worker follow-ups: prior round's edits are already on disk (auto-applied).
 		// Accept them out of the working set so File Changed / live dispatch files
@@ -3378,7 +3495,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			const userId = reused ? reused.id : newItemId('user');
 			sentUserId = userId;
 			if (!reused) {
-				chat.items.push({ id: userId, kind: 'user', text: displayText, attachments: attachmentRefs });
+				chat.items.push({ id: userId, kind: 'user', text: displayText, attachments: attachmentRefs, ...(display?.origin ? { origin: display.origin } : {}) });
 			}
 			this.fileEdits.beginCheckpoint(userId, runSessionId);
 			// New user turn: drop the previous Tasks panel so it does not stay
@@ -3407,6 +3524,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (this.maybeCompact(runSessionId)) {
 			this.pushState();
 		}
+		// Fires before the model call below — the phone bridge arms its
+		// completion watcher with the exact user-item id of this turn so a
+		// desktop-typed follow-up in the same session is never pushed to Feishu.
+		onStarted?.(sentUserId);
 
 		const snapshot = runSessionId === this.sessionId
 			? this.captureView()
@@ -3575,6 +3696,53 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				void this.flushQueue(runSessionId);
 			}
 		}
+	}
+
+	/**
+	 * Make sure a non-active session has a parked in-memory view so notes /
+	 * turns can land on it (seeds from the persisted store on first touch).
+ * Returns false when the session no longer exists in the store.
+	 */
+	private async ensureParkedView(sessionId: string): Promise<boolean> {
+		if (sessionId === this.sessionId || this.parked.has(sessionId)) {
+			return true;
+		}
+		const session = await this.ideChat.getSession(sessionId).catch(() => undefined);
+		if (!session) {
+			return false;
+		}
+		this.parked.set(sessionId, {
+			items: (session.timeline ?? []).map(item => ({ ...item })),
+			todos: [...(session.todos ?? [])],
+			persisted: true,
+			draftText: '',
+			attachments: [],
+			queue: [],
+			queuePaused: false,
+		});
+		return true;
+	}
+
+	/**
+	 * Phone-bridge side channel: lands a one-line status row in the worker's
+	 * transcript so the desktop view mirrors what the bridge told Feishu
+	 * (receipts, ask cards, result pushes, notices). Display-only — never part
+	 * of the model history. Invoked through the FeishuPanelAdapter cast.
+	 */
+	async appendBridgeNote(sessionId: string, text: string, tone?: 'info' | 'error'): Promise<void> {
+		if (!await this.ensureParkedView(sessionId)) {
+			return;
+		}
+		const applied = this.mutateChat(sessionId, chat => {
+			chat.items.push({ id: newItemId('status'), kind: 'status', text, tone: tone ?? 'info' });
+		});
+		if (!applied) {
+			return;
+		}
+		if (sessionId === this.sessionId) {
+			this.pushState();
+		}
+		await this.persistSessionById(sessionId);
 	}
 
 	private sessionHasPendingQueue(sessionId: string): boolean {
@@ -4975,6 +5143,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			accountLabel = this.deepseekAccountLabel;
 			signedIn = !/未设置/.test(this.deepseekAccountLabel);
 		}
+		if (brain === 'qianwen') {
+			accountLabel = this.qianwenAccountLabel;
+			signedIn = !/未设置/.test(this.qianwenAccountLabel);
+		}
 
 		const items = this.items.map(item => {
 			if (item.kind === 'work') {
@@ -5036,6 +5208,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			agentPace,
 			agentPaceLabel: AGENT_PACE_LABELS[agentPace],
 			agentPaces: AGENT_PACES.map(id => ({ id, label: AGENT_PACE_LABELS[id] })),
+			quickActions: loadQuickActions().map(a => ({
+				id: a.id,
+				label: a.label,
+				description: a.description,
+			})),
 			bridgeMode: brain === 'cursor' ? 'cursor-acp' : brain === 'deepseek' ? 'agent' : getBridgeMode(),
 			workspaceRoot: workspaceRoot(),
 			items,
@@ -5757,13 +5934,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			<div class="toolbar-left">
 				<button class="icon-btn" id="plus" type="button" title="Add" aria-label="Add">+</button>
 				<button class="pill" id="sceneBtn" type="button" title="选择聊天背景" aria-label="聊天背景" aria-expanded="false" aria-haspopup="listbox"><span class="label">背景</span></button>
-				<button class="pill" id="brainBtn" type="button" title="ZCode / Cursor / DeepSeek" aria-label="ZCode / Cursor / DeepSeek" aria-expanded="false" aria-haspopup="listbox"><span class="label" id="brainLabel">ZCode</span><span class="chev">▾</span></button>
+				<button class="pill" id="brainBtn" type="button" title="ZCode / Cursor / DeepSeek / Qianwen" aria-label="ZCode / Cursor / DeepSeek / Qianwen" aria-expanded="false" aria-haspopup="listbox"><span class="label" id="brainLabel">ZCode</span><span class="chev">▾</span></button>
 				<span id="zcodePills" data-brain-chrome="zcode">
 					<button class="pill" id="providerBtn" type="button" title="Provider"><span class="label" id="providerLabel">Start Plan</span><span class="chev">▾</span></button>
 					<button class="pill" id="modelBtn" type="button" title="Model"><span class="label" id="modelLabel">Model</span><span class="chev">▾</span></button>
 					<button class="pill" id="paceBtn" type="button" title="Agent pace"><span class="label" id="paceLabel">快速</span><span class="chev">▾</span></button>
 					<button class="pill thought" id="thoughtBtn" type="button" title="Thinking intensity"><span class="brain">◎</span><span class="label" id="thoughtLabel">Low</span><span class="chev">▾</span></button>
 				</span>
+				<button class="pill" id="quickActionsBtn" type="button" title="快捷功能（~/.zcode/quick-actions.json 全局定制）" aria-label="快捷功能" aria-expanded="false" aria-haspopup="listbox"><span class="brain">⚡</span><span class="label" id="quickActionsLabel">快捷</span><span class="chev">▾</span></button>
 				<span id="deepseekKeyPill" hidden>
 					<button class="pill" id="deepseekKeyBtn" type="button" title="Set DeepSeek API Key" aria-label="Set DeepSeek API Key"><span class="label">设置 DeepSeek API Key</span></button>
 				</span>

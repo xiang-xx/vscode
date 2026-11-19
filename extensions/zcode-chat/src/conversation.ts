@@ -92,6 +92,9 @@ export type ConversationItem =
 		kind: 'user';
 		text: string;
 		attachments?: UserAttachmentRef[];
+		/** Set when the turn arrived from a phone bridge (Feishu), so the
+		 *  desktop view can badge it; it never changes model-side behavior. */
+		origin?: 'feishu';
 	}
 	| {
 		id: string;

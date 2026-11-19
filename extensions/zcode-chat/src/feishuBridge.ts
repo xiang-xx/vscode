@@ -12,13 +12,14 @@
  * 静默失效，因此传输层整体交给 SDK：它自带 pong 看门狗与无限自动重连。
  * 出站回复仍走 REST（缓存的 tenant_access_token，401 自动刷新）。
  *
- * Single-chat mode: everything — dispatch, follow-ups, results, questions —
- * happens in the bot's 1:1 chat with the user. An earlier revision gave every
- * worker its own Feishu group; the churn of creating/dissolving groups on each
- * dispatch and removal made the phone noisy, so that was rolled back. Nothing
- * creates groups anymore; the old map file survives read-only for the one-off
- * 「清理专属群」 command, and a message landing in a leftover group gets a
- * "group retired, use our 1:1 chat" bounce.
+ * Hybrid mode: dispatch, follow-ups and questions happen in the bot's 1:1
+ * chat; any worker can additionally get a dedicated group on demand (建群 N,
+ * picked from the last 列表). Groups bind by the worker's session UUID —
+ * never by list index — and a 30s sweep dissolves the group as soon as its
+ * worker session disappears. Messages landing in a bound group go straight to
+ * that worker, and results are delivered back into the group. Leftover groups
+ * from the old every-worker-gets-a-group era keep the 「清理专属群」 one-off
+ * cleanup command; a message landing in an unbound group gets a bounce.
  *
  * Phone commands (single chat with the bot):
  *   帮助 | help
@@ -28,6 +29,8 @@
  *   取消 | cancel        — unbind; free text then spawns a NEW worker
  *   新 <任务> | new <任务> — spawn a fresh worker
  *   状态 | status        — bridge connection + in-flight turns
+ *   建群 N | 群 N        — dedicated Feishu group for worker #N (bound by UUID)
+ *   解散 N               — dissolve worker #N's dedicated group
  *   清理专属群           — dissolve leftover groups from the group era
  *   <任意文本>           — follow-up to the bound worker, else spawns a new one
  *
@@ -106,7 +109,14 @@ function readConfig(): FeishuConfig {
  */
 export interface FeishuPanelAdapter {
 	createWorkerSession(opts: { title?: string; message?: string }): Promise<string>;
-	startTurn?(sessionId: string, content: string, display?: { text?: string }): Promise<void>;
+	/**
+	 * Runs one agent turn. `onStarted` fires synchronously-ish once the user
+	 * row is stamped (before the model call) with that row's id — the bridge
+	 * uses it to attribute the turn (phone vs desktop) when deciding what to
+	 * push back to Feishu. `display.origin === 'feishu'` badges the row on the
+	 * desktop view.
+	 */
+	startTurn?(sessionId: string, content: string, display?: { text?: string; attachments?: unknown[]; origin?: 'feishu' }, reuseUserId?: string, onStarted?: (userId: string) => void): Promise<void>;
 	mirrorWorkerFollowUpToRouter?(text: string, sessionId: string, queued?: boolean): Promise<void>;
 	ensureRouterSession?(): Promise<string>;
 	runs?: Map<string, unknown>;
@@ -118,6 +128,11 @@ export interface FeishuPanelAdapter {
 	 * worker). Store-only stamps never reach an open board.
 	 */
 	upsertRouterDispatchCard?(routerId: string, card: ConversationItem): Promise<void>;
+	/**
+	 * Mirrors a bridge-side line (receipt / ask card / result push notice)
+	 * into the worker's transcript so the desktop shows the Feishu side too.
+	 */
+	appendBridgeNote?(sessionId: string, text: string, tone?: 'info' | 'error'): Promise<void>;
 }
 
 // ---------------------------------------------------------------- tiny utils
@@ -233,10 +248,10 @@ function mdForFeishuCard(md: string): string {
 // ---------------------------------------------------------------- legacy worker groups
 
 /**
- * Leftovers from the per-worker-group era (rolled back): sessionId → Feishu
- * group bindings, one file per runtime. Read-only now — nothing creates or
- * reuses these groups; the file exists only so 「清理专属群」 can dissolve
- * them on demand.
+ * sessionId → Feishu group binding. sessionId is the worker's UUID, so
+ * deleting another worker can never rewire a binding (list index would). The
+ * legacy file is read-only (「清理专属群」); live opt-in bindings live in
+ * their own file below.
  */
 interface WorkerGroupEntry {
 	sessionId: string;
@@ -264,6 +279,36 @@ function dropLegacyGroupMap(): void {
 		fs.unlinkSync(legacyGroupMapPath());
 	} catch {
 		// already gone
+	}
+}
+
+// ---------------------------------------------------------------- opt-in task groups
+
+/**
+ * Current-era worker groups: created on demand (建群 N), keyed by the
+ * worker's session UUID, dissolved automatically once the worker session is
+ * gone. One file per runtime, same slot as the legacy map.
+ */
+function taskGroupMapPath(): string {
+	const name = zcodeRuntimeEnv() === 'dev' ? 'feishu-task-groups-dev.json' : 'feishu-task-groups.json';
+	return path.join(os.homedir(), '.zcode', name);
+}
+
+function loadTaskGroups(): WorkerGroupEntry[] {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(taskGroupMapPath(), 'utf8')) as { entries?: WorkerGroupEntry[] };
+		return Array.isArray(parsed.entries) ? parsed.entries.filter(e => e && e.sessionId && e.chatId) : [];
+	} catch {
+		return [];
+	}
+}
+
+function saveTaskGroups(entries: WorkerGroupEntry[]): void {
+	try {
+		fs.mkdirSync(path.dirname(taskGroupMapPath()), { recursive: true });
+		fs.writeFileSync(taskGroupMapPath(), JSON.stringify({ entries }, undefined, 2));
+	} catch {
+		// best effort — worst case a dissolved group lingers and 解散 N removes it
 	}
 }
 
@@ -409,9 +454,28 @@ class FeishuRestClient {
 	}
 
 	/**
-	 * Dissolve a bot-owned group from the retired per-worker-group era. Only
-	 * the explicit 「清理专属群」 command calls this — nothing creates groups
-	 * anymore.
+	 * Create a bot-owned group for a single worker (opt-in via 建群 N). The
+	 * bot owns the group so the bridge can dissolve it without anyone's help
+	 * once the worker session disappears.
+	 */
+	async createGroup(name: string): Promise<string> {
+		const json = await this.post('/open-apis/im/v1/chats', { chat_mode: 'group', name });
+		const chatId = asString(asRecord(json.data)?.chat_id);
+		if (!chatId) {
+			throw new Error('create group response missing chat_id');
+		}
+		return chatId;
+	}
+
+	/** Put the requesting user into a bot-created group (needs im:chat.member). */
+	async addGroupMember(chatId: string, openId: string): Promise<void> {
+		await this.post(`/open-apis/im/v1/chats/${chatId}/members?user_id_type=open_id`, { id_list: [openId] });
+	}
+
+	/**
+	 * Dissolve a bot-owned group — its worker was deleted (auto sweep /
+	 * 解散 N), or it is a leftover from the retired per-worker-group era
+	 * (「清理专属群」).
 	 */
 	async deleteGroup(chatId: string): Promise<void> {
 		await this.request('DELETE', `/open-apis/im/v1/chats/${chatId}?user_id_type=open_id`);
@@ -740,6 +804,9 @@ interface TurnWatchEntry {
 	stableCount: number;
 	/** Timeline length at watch start — only items after this belong to the watched turn. */
 	baseTimelineLength: number;
+	/** User-row id of the phone-initiated turn (from startTurn's onStarted).
+	 *  Empty for legacy callers — then any turn's outcome is pushed as before. */
+	turnUserId: string;
 	/** One-shot flag: the "agent is waiting for your answer" notice already went out. */
 	askNotified: boolean;
 	timer: ReturnType<typeof setInterval>;
@@ -779,6 +846,7 @@ class CompletionWatcher {
 			existing.stableCount = 0;
 			existing.startedAt = Date.now();
 			existing.askNotified = false;
+			existing.turnUserId = '';
 			// Baseline refresh is async-read below via rebase(); the sync path
 			// covers it by ignoring pre-existing terminal items on the next tick.
 			void this.rebase(existing);
@@ -792,11 +860,25 @@ class CompletionWatcher {
 			lastSignature: '',
 			stableCount: 0,
 			baseTimelineLength: Number.MAX_SAFE_INTEGER,
+			turnUserId: '',
 			askNotified: false,
 			timer: setInterval(() => void this.tick(entry), 4000),
 		};
 		this.entries.set(sessionId, entry);
 		void this.rebase(entry);
+	}
+
+	/**
+	 * Latch the user-row id of the turn the phone started (startTurn's
+	 * onStarted). With it, outcomes of turns typed on the desktop are
+	 * recognized as foreign and silently dropped instead of being pushed
+	 * to Feishu.
+	 */
+	setTurnUser(sessionId: string, userId: string): void {
+		const entry = this.entries.get(sessionId);
+		if (entry) {
+			entry.turnUserId = userId;
+		}
 	}
 
 	/** Record the current timeline length so only this turn's items are judged. */
@@ -846,11 +928,41 @@ class CompletionWatcher {
 				: entry.baseTimelineLength);
 			const ageMinutes = (Date.now() - entry.startedAt) / 60_000;
 
+			// Turn ownership: the user row that owns the row at `idx` is the
+			// nearest `user` item at or before it. When it is not the row the
+			// phone sent, the desktop took the session over — nothing of this
+			// turn may be pushed to Feishu.
+			const ownerUserIdBefore = (idx: number): string | undefined => {
+				for (let i = idx; i >= 0; i--) {
+					const row = items[i];
+					if (row?.kind === 'user') {
+						return (row as { id?: string }).id;
+					}
+				}
+				return undefined;
+			};
+			const idxOf = (row: unknown): number => items.findIndex(r => r === row);
+			const foreignTurn = (idx: number): boolean => {
+				if (!entry.turnUserId) {
+					return false;
+				}
+				const owner = ownerUserIdBefore(idx);
+				return !!owner && owner !== entry.turnUserId;
+			};
+
 			// 1. Agent blocked on an askUser card — the phone must know, and when
 			//    the persisted row carries structured options it can answer it.
 			const pendingAskRow = [...items].reverse()
 				.find(row => row?.kind === 'question' && (row as { status?: string }).status === 'pending');
 			if (pendingAskRow && !entry.askNotified) {
+				const askIdx = idxOf(pendingAskRow);
+				if (foreignTurn(askIdx)) {
+					// Desktop-initiated turn is asking — that question stays on
+					// the desktop; the phone is not part of that conversation.
+					this.opts.log(`watch ${entry.sessionId.slice(0, 8)}: desktop turn is asking — watch dropped`);
+					this.drop(entry.sessionId);
+					return;
+				}
 				entry.askNotified = true;
 				this.opts.onAwaitingUser({
 					sessionId: entry.sessionId,
@@ -865,6 +977,11 @@ class CompletionWatcher {
 			const errStatus = [...items].reverse().find(row => row?.kind === 'status'
 				&& (row as { tone?: string }).tone === 'error') as { text?: string } | undefined;
 			if (errStatus) {
+				if (foreignTurn(idxOf(errStatus))) {
+					this.opts.log(`watch ${entry.sessionId.slice(0, 8)}: desktop turn failed — not pushed`);
+					this.drop(entry.sessionId);
+					return;
+				}
 				this.finish(entry, `❌ 任务失败：${(errStatus.text ?? '未知错误').trim()}`);
 				return;
 			}
@@ -876,6 +993,13 @@ class CompletionWatcher {
 			const messages = session.messages ?? [];
 			const last = messages.length ? messages[messages.length - 1] : undefined;
 			if (lastWork && lastWork.running === false) {
+				if (foreignTurn(idxOf(lastWork))) {
+					// The finished turn was typed on the desktop — its reply is
+					// desktop-only by design ("电脑端聊的内容不推送到飞书").
+					this.opts.log(`watch ${entry.sessionId.slice(0, 8)}: desktop turn finished — not pushed`);
+					this.drop(entry.sessionId);
+					return;
+				}
 				const stopped = [...items].reverse().find(row => row?.kind === 'status') as { text?: string } | undefined;
 				if (stopped && /已停止/.test(stopped.text ?? '')) {
 					this.finish(entry, `⏹ 任务被停止（未完成）。可回复内容继续追问。`);
@@ -899,6 +1023,15 @@ class CompletionWatcher {
 					entry.stableCount = 0;
 				}
 				if (entry.stableCount >= 3 && !lastWork) {
+					if (entry.turnUserId) {
+						const wholeTimeline = session.timeline ?? [];
+						const lastUser = [...wholeTimeline].reverse().find(row => row?.kind === 'user') as { id?: string } | undefined;
+						if (lastUser?.id && lastUser.id !== entry.turnUserId) {
+							this.opts.log(`watch ${entry.sessionId.slice(0, 8)}: desktop turn (legacy path) — not pushed`);
+							this.drop(entry.sessionId);
+							return;
+						}
+					}
 					this.finish(entry, last.content.trim());
 					return;
 				}
@@ -994,10 +1127,12 @@ function helpText(): string {
 			? '当前连着的是 DEV。DEV 和正式窗口共用这一条长连接：手机上看到的、以及新派发的任务，都属于现在拿着连接的那一边。'
 			: '当前连着的是正式窗口。DEV 和正式窗口共用这一条长连接：手机上看到的、以及新派发的任务，都属于现在拿着连接的那一边。',
 		'',
-		'与机器人的这个单聊就是唯一入口，所有任务都在这里进行：',
+		'与机器人的这个单聊是主入口：派发、追问都在这里；需要专注聊某个任务时，再给它建专属群：',
 		'新 <任务> —— 派发新 Worker（例：新 总结 icard-server 最近的提交）',
 		'列表 —— 查看当前 Worker（与 VS Code 首页面板同源）',
 		'选 N —— 绑定列表里的第 N 个 Worker，之后发文本=追问它',
+		'建群 N —— 给列表里的第 N 个 Worker 建专属群：群内直接聊它，结果回群里，删除任务自动解散',
+		'解散 N —— 手动解散第 N 个 Worker 的专属群',
 		'当前 —— 查看现在绑定的是哪个任务',
 		'取消 —— 解除绑定，此后发文本=派发新 Worker',
 		'状态 —— 桥连接与任务监控状态',
@@ -1006,11 +1141,14 @@ function helpText(): string {
 		'每张结果卡片都标着任务名，结尾提示当前绑定；不确定自己在哪个任务下时，看最近一张结果卡或发「当前」。',
 		'',
 		'任务完成后只推送最终结果；中间过程在电脑上的 Router 主页查看。',
+		'飞书里的问答与回执都会同步进电脑端对应任务的会话（消息带 📱 标记）；',
+		'在电脑端 Chat 面板里直接发起的追问只留在电脑上，不会推送到飞书。',
 		'',
 		'Worker 中途向你提问时会收到一张问题卡片：直接点卡片上的选项按钮作答；',
 		'多选题先点选各项再点【提交答案】；需要自由文字的问题直接回复一条消息即可。',
 		'',
-		'旧版给每个 Worker 建过专属群，现已停用；残留的群回复「清理专属群」可一次性解散。',
+		'专属群按任务 UUID 绑定，列表序号变化不影响已有群；任务删除后群自动解散。',
+		'旧版给每个 Worker 自动建的专属群已停用；残留的群回复「清理专属群」可一次性解散。',
 	].join('\n');
 }
 
@@ -1026,6 +1164,9 @@ class FeishuBridge implements vscode.Disposable {
 	/** openId → bound worker display identity, so acks/状态 can name the task without a store read. */
 	private readonly selectionMeta = new Map<string, { sessionId: string; title: string }>();
 	private readonly lastListing = new Map<string, Array<{ sessionId: string; title: string }>>();
+	/** sessionId (worker UUID) → opt-in dedicated group. Never keyed by list index. */
+	private readonly groups = new Map<string, WorkerGroupEntry>();
+	private sweepTimer: ReturnType<typeof setInterval> | undefined;
 	private readonly seenMessages = new Set<string>();
 	private readonly seenOrder: string[] = [];
 	private lockHeartbeat: ReturnType<typeof setInterval> | undefined;
@@ -1073,9 +1214,9 @@ class FeishuBridge implements vscode.Disposable {
 		this.rest = new FeishuRestClient(config.appId, secret, line => this.log(line));
 		this.watcher = new CompletionWatcher({
 			store,
-			onResult: result => void this.pushResult(result),
+			onResult: result => void this.deliverTurnResult(result),
 			onTimeout: result => {
-				void this.pushTextTo(result.sessionId, result.openId, `⚠️「${truncate(result.title, 40)}」已停止监控：${result.note}。中间状态请在电脑上的 Router 主页查看；也可以直接再发一次任务。`).catch(err => this.log(`reply failed: ${errText(err)}`));
+				void this.deliverNotice(result.sessionId, result.openId, `⚠️「${truncate(result.title, 40)}」已停止监控：${result.note}。中间状态请在电脑上的 Router 主页查看；也可以直接再发一次任务。`).catch(err => this.log(`reply failed: ${errText(err)}`));
 			},
 			onAwaitingUser: result => {
 				void this.handleAskPending(result).catch(err => this.log(`问题卡片推送失败：${errText(err)}`));
@@ -1090,8 +1231,17 @@ class FeishuBridge implements vscode.Disposable {
 			onLog: line => this.log(line),
 		});
 		this.stream.start();
+		this.groups.clear();
+		for (const entry of loadTaskGroups()) {
+			this.groups.set(entry.sessionId, entry);
+		}
+		// Worker deletion has no push event — poll the store and dissolve the
+		// group as soon as its session disappears (also reconciles deletions
+		// that happened while this bridge was offline).
+		this.sweepTimer = setInterval(() => void this.sweepDeletedWorkers(), 30_000);
+		void this.sweepDeletedWorkers();
 		const startedAs = zcodeRuntimeLabel();
-		this.log(`飞书桥启动${startedAs ? `（${startedAs}）` : ''}：聊天记录 ${store.rootDir}，单聊模式（不再为每个 Worker 建群），appId=${config.appId}，白名单=${config.allowOpenIds.length ? config.allowOpenIds.join(',') : '空（任何人都不可用）'}。传输层为官方 SDK 长连接（自动心跳、自动重连、断线期间手机消息会丢失，重发即可）。`);
+		this.log(`飞书桥启动${startedAs ? `（${startedAs}）` : ''}：聊天记录 ${store.rootDir}，单聊为主、按需专属群（建群 N 创建，绑定 Worker UUID，任务删除自动解散，当前 ${this.groups.size} 个），appId=${config.appId}，白名单=${config.allowOpenIds.length ? config.allowOpenIds.join(',') : '空（任何人都不可用）'}。传输层为官方 SDK 长连接（自动心跳、自动重连、断线期间手机消息会丢失，重发即可）。`);
 		this.notifyLegacyGroups();
 	}
 
@@ -1108,6 +1258,10 @@ class FeishuBridge implements vscode.Disposable {
 	}
 
 	stop(): void {
+		if (this.sweepTimer) {
+			clearInterval(this.sweepTimer);
+			this.sweepTimer = undefined;
+		}
 		this.stream?.close();
 		this.stream = undefined;
 		this.watcher?.dispose();
@@ -1130,7 +1284,7 @@ class FeishuBridge implements vscode.Disposable {
 		const mark = zcodeRuntimeLabel();
 		const owner = this.config.allowOpenIds[0];
 		const bound = owner ? this.bindingLabel(owner) : undefined;
-		return `飞书桥${mark ? `（${mark}）` : ''}：${connection}，监控中任务 ${watched} 个，手机当前绑定：${bound ?? '未绑定（发文本=派发新任务）'}，appId=${this.config.appId || '未配置'}，白名单 ${this.config.allowOpenIds.length} 人。DEV 和正式窗口不会同时在线。详见输出面板 “ZCode 飞书桥”。`;
+		return `飞书桥${mark ? `（${mark}）` : ''}：${connection}，监控中任务 ${watched} 个，专属群 ${this.groups.size} 个，手机当前绑定：${bound ?? '未绑定（发文本=派发新任务）'}，appId=${this.config.appId || '未配置'}，白名单 ${this.config.allowOpenIds.length} 人。DEV 和正式窗口不会同时在线。详见输出面板 “ZCode 飞书桥”。`;
 	}
 
 	/**
@@ -1150,6 +1304,211 @@ class FeishuBridge implements vscode.Disposable {
 
 	private entriesSnapshot(): string[] {
 		return this.watcher?.watchedIds() ?? [];
+	}
+
+	// ---------------- opt-in dedicated groups ----------------
+
+	private groupByChatId(chatId: string): WorkerGroupEntry | undefined {
+		for (const entry of this.groups.values()) {
+			if (entry.chatId === chatId) {
+				return entry;
+			}
+		}
+		return undefined;
+	}
+
+	private persistGroups(): void {
+		saveTaskGroups([...this.groups.values()]);
+	}
+
+	/**
+	 * Dissolve a bound group and forget the binding. The binding is only
+	 * dropped after Feishu confirms the deletion, so a failed call retries on
+	 * the next sweep instead of silently orphaning the group.
+	 */
+	private async dissolveGroup(sessionId: string, reason: string): Promise<void> {
+		const entry = this.groups.get(sessionId);
+		if (!entry || !this.rest) {
+			return;
+		}
+		try {
+			await this.rest.deleteGroup(entry.chatId);
+		} catch (err) {
+			this.log(`解散群失败（chat_id=${entry.chatId}），下轮重试：${errText(err)}`);
+			return;
+		}
+		this.groups.delete(sessionId);
+		this.persistGroups();
+		const owner = this.config?.allowOpenIds[0];
+		if (owner && this.rest) {
+			await this.rest.sendText(PushTarget.p2p(owner), `「${truncate(entry.title, 40)}」${FeishuBridge.workerTag(sessionId)}（${reason}），其专属群已解散。`)
+				.catch(err => this.log(`解散通知失败：${errText(err)}`));
+		}
+	}
+
+	/** Worker deletion has no event hook — poll the store for every bound group. */
+	private async sweepDeletedWorkers(): Promise<void> {
+		if (!this.store || !this.groups.size) {
+			return;
+		}
+		for (const entry of [...this.groups.values()]) {
+			let sessionExists = true;
+			try {
+				sessionExists = !!(await this.store.getSession(entry.sessionId));
+			} catch {
+				sessionExists = true; // store read failed — retry next sweep
+			}
+			if (!sessionExists) {
+				this.log(`任务 ${entry.sessionId.slice(0, 8)} 已删除，自动解散其专属群`);
+				await this.dissolveGroup(entry.sessionId, '任务已删除');
+			}
+		}
+	}
+
+	/** 建群 N — the number only locates the worker in the last 列表; the binding itself is the session UUID. */
+	private async createGroupFor(openId: string, n: number): Promise<void> {
+		const listing = this.lastListing.get(openId);
+		if (!listing?.length) {
+			await this.reply(openId, '先发「列表」查看当前 Worker，再发「建群 N」给第 N 个建专属群。');
+			return;
+		}
+		const entry = listing[n - 1];
+		if (!entry) {
+			await this.reply(openId, `列表里没有第 ${n} 个 Worker（最近一次列表共 ${listing.length} 个）。重新发「列表」确认序号。`);
+			return;
+		}
+		if (this.groups.has(entry.sessionId)) {
+			await this.reply(openId, `「${truncate(entry.title, 40)}」${FeishuBridge.workerTag(entry.sessionId)} 已有专属群，直接在群里发消息即可。`);
+			return;
+		}
+		try {
+			let alive = false;
+			try {
+				alive = !!(await this.store?.getSession(entry.sessionId));
+			} catch {
+				alive = true;
+			}
+			if (!alive) {
+				await this.reply(openId, `「${truncate(entry.title, 40)}」已不存在（可能刚被删除）。发「列表」刷新后再试。`);
+				return;
+			}
+			const name = `ZCode ${FeishuBridge.workerTag(entry.sessionId)} ${truncate(entry.title, 30)}`;
+			const chatId = await this.rest!.createGroup(name);
+			this.groups.set(entry.sessionId, { sessionId: entry.sessionId, chatId, title: entry.title, createdAt: Date.now() });
+			this.persistGroups();
+			try {
+				await this.rest!.addGroupMember(chatId, openId);
+			} catch (err) {
+				this.log(`拉用户进群失败：${errText(err)}`);
+				await this.dissolveGroup(entry.sessionId, '建群后拉人失败');
+				await this.reply(openId, `群建好了但把你拉进群失败（${errText(err)}）。请给飞书应用开通 im:chat.member 相关权限后重试「建群 ${n}」。`);
+				return;
+			}
+			await this.rest!.sendText(PushTarget.group(chatId),
+				`这个群已绑定任务「${truncate(entry.title, 40)}」${FeishuBridge.workerTag(entry.sessionId)}：在这里发消息=直接追问它，结果会回复到本群。删除该任务后本群自动解散。`)
+				.catch(err => this.log(`群欢迎语失败：${errText(err)}`));
+			await this.reply(openId, `已建好「${name}」并把你拉了进去。之后在群里直接聊这个任务；发「解散 ${n}」可手动解散。`);
+		} catch (err) {
+			this.log(`建群失败：${errText(err)}`);
+			await this.reply(openId, `建群失败：${errText(err)}。请确认飞书应用已开通 im:chat（创建群）权限。`);
+		}
+	}
+
+	/** 解散 N — manual counterpart of the auto sweep. */
+	private async dissolveGroupFor(openId: string, n: number): Promise<void> {
+		const listing = this.lastListing.get(openId);
+		const entry = listing?.[n - 1];
+		if (!entry) {
+			await this.reply(openId, '先发「列表」，再发「解散 N」。');
+			return;
+		}
+		if (!this.groups.has(entry.sessionId)) {
+			await this.reply(openId, `「${truncate(entry.title, 40)}」没有专属群。`);
+			return;
+		}
+		await this.dissolveGroup(entry.sessionId, '手动解散');
+		await this.reply(openId, `已解散「${truncate(entry.title, 40)}」的专属群。`);
+	}
+
+	/** Free text in a bound group = follow-up to that worker; the ack and the result stay in the group. */
+	private async groupFollowUp(openId: string, binding: WorkerGroupEntry, text: string): Promise<void> {
+		let alive = true;
+		try {
+			alive = !!(await this.store?.getSession(binding.sessionId));
+		} catch {
+			alive = true;
+		}
+		if (!alive) {
+			await this.dissolveGroup(binding.sessionId, '任务已删除');
+			await this.rest?.sendText(PushTarget.group(binding.chatId), '该任务已删除，本群已解散；请在与机器人的单聊里重新派发或选择其他任务。').catch(() => undefined);
+			return;
+		}
+		const mirror = this.panel?.mirrorWorkerFollowUpToRouter;
+		if (!mirror) {
+			await this.rest?.sendText(PushTarget.group(binding.chatId), '当前面板不支持追问，请升级后重试。').catch(() => undefined);
+			return;
+		}
+		try {
+			await mirror.call(this.panel, text, binding.sessionId);
+		} catch (err) {
+			this.log(`群追问失败：${errText(err)}`);
+			await this.rest?.sendText(PushTarget.group(binding.chatId), `追问失败：${errText(err)}`).catch(() => undefined);
+			return;
+		}
+		// The mirror above only lands a dispatch card on the desktop board —
+		// without the startTurn call the agent never actually ran and the group
+		// waited 15 minutes for a timeout notice.
+		if (!this.panel?.startTurn) {
+			await this.rest?.sendText(PushTarget.group(binding.chatId), '当前版本的 ChatPanel 没有暴露执行入口，请升级后重试。').catch(() => undefined);
+			return;
+		}
+		this.watcher?.watch(binding.sessionId, binding.title, openId);
+		const fired = this.firePhoneTurn(binding.sessionId, text, {
+			onBusy: () => this.rest?.sendText(PushTarget.group(binding.chatId),
+				`⏳「${truncate(binding.title, 40)}」还在处理上一个任务，完成后会推送；这条没有发出，请稍后重发。`)
+				.catch(() => undefined),
+			onFail: message => this.rest?.sendText(PushTarget.group(binding.chatId),
+				`❌ 发给「${truncate(binding.title, 40)}」失败：${truncate(message, 500)}`)
+				.catch(() => undefined),
+		});
+		if (!fired) {
+			await this.rest?.sendText(PushTarget.group(binding.chatId), '当前版本的 ChatPanel 没有暴露执行入口，请升级后重试。').catch(() => undefined);
+			return;
+		}
+		this.note(binding.sessionId, '📱 上一条来自飞书专属群，结果将回复到该群');
+		this.watcher?.pollNow(binding.sessionId);
+		await this.rest?.sendText(PushTarget.group(binding.chatId),
+			`已发给「${truncate(binding.title, 40)}」${FeishuBridge.workerTag(binding.sessionId)}，完成后回复到本群。`)
+			.catch(err => this.log(`群回执失败：${errText(err)}`));
+	}
+
+	/**
+	 * Final turn result → the worker's dedicated group when one is bound
+	 * (keyed by the worker UUID), else the owner's 1:1 chat.
+	 */
+	private deliverTurnResult(result: { sessionId: string; title: string; openId: string; content: string }): void {
+		const binding = this.groups.get(result.sessionId);
+		if (binding && this.rest) {
+			void this.rest.sendCard(PushTarget.group(binding.chatId), {
+				header: `${truncate(binding.title, 40)} ${FeishuBridge.workerTag(binding.sessionId)}`,
+				template: 'turquoise',
+				markdown: mdForFeishuCard(result.content),
+			}).then(() => this.note(result.sessionId, '📱 结果已推送飞书专属群'))
+				.catch(err => this.log(`群结果卡片失败：${errText(err)}`));
+			return;
+		}
+		void this.pushResult(result);
+	}
+
+	/** Watcher notices (timeout etc.) follow the same group-first routing. */
+	private async deliverNotice(sessionId: string, openId: string, text: string): Promise<void> {
+		this.note(sessionId, `📱 飞书通知：${truncate(text, 160)}`);
+		const binding = this.groups.get(sessionId);
+		if (binding && this.rest) {
+			await this.rest.sendText(PushTarget.group(binding.chatId), text);
+			return;
+		}
+		await this.pushTextTo(sessionId, openId, text);
 	}
 
 	private acquireLock(): boolean {
@@ -1227,12 +1586,18 @@ class FeishuBridge implements vscode.Disposable {
 		if (!text) {
 			return;
 		}
-		// Worker groups are retired — bounce stragglers back to the 1:1 chat.
+		// Bound dedicated group → straight to that worker; unbound group → bounce.
 		if (message.chatType === 'group') {
-			this.log(`忽略旧专属群消息（chat_id=${message.chatId}）：${truncate(text, 80)}`);
+			const binding = this.groupByChatId(message.chatId);
+			if (binding) {
+				this.log(`群消息（${binding.title}）：${truncate(text, 80)}`);
+				await this.groupFollowUp(message.openId, binding, text);
+				return;
+			}
+			this.log(`忽略未绑定群消息（chat_id=${message.chatId}）：${truncate(text, 80)}`);
 			await this.rest?.sendText(PushTarget.group(message.chatId),
-				'这个专属群已停用：任务改在【与机器人的单聊】里进行。回到单聊发「帮助」查看用法；发「清理专属群」可解散残留的群。')
-				.catch(err => this.log(`旧群回复失败：${errText(err)}`));
+				'这个群没有绑定的任务：在【与机器人的单聊】里发「列表」，再对某个任务发「建群 N」。旧版专属群发「清理专属群」可解散。')
+				.catch(err => this.log(`群回复失败：${errText(err)}`));
 			return;
 		}
 		this.log(`收到：${truncate(text, 120)}`);
@@ -1273,6 +1638,16 @@ class FeishuBridge implements vscode.Disposable {
 			this.selection.delete(openId);
 			this.selectionMeta.delete(openId);
 			await this.reply(openId, '已解除绑定。此后发送文本=派发新 Worker。');
+			return;
+		}
+		const groupMatch = /^(?:建群|群)\s*(\d+)$/.exec(text);
+		if (groupMatch) {
+			await this.createGroupFor(openId, Number(groupMatch[1]));
+			return;
+		}
+		const ungroupMatch = /^(?:解散群|解散)\s*(\d+)$/.exec(text);
+		if (ungroupMatch) {
+			await this.dissolveGroupFor(openId, Number(ungroupMatch[1]));
 			return;
 		}
 		if (/^(清理专属群|清理群|清理旧群)$/.test(text)) {
@@ -1651,10 +2026,22 @@ class FeishuBridge implements vscode.Disposable {
 				await this.reply(openId, '当前版本的 ChatPanel 没有暴露执行入口，Worker 已创建但未启动。请更新后重试。');
 				return;
 			}
-			await this.panel.startTurn(sessionId, task, { text: task });
+			// Fire-and-forget + immediate receipt: awaiting the full turn used to
+			// hold both the phone ack and the Feishu event stream until the task
+			// finished, and the watcher (ask cards, stall reports) only armed
+			// after the run — i.e. never when it mattered.
+			this.watcher?.watch(sessionId, title, openId);
+			const fired = this.firePhoneTurn(sessionId, task, {
+				onBusy: () => this.reply(openId, `⏳ Worker 刚建好就已在跑别的回合，这条没有发出。稍后重发一次即可。`),
+				onFail: message => this.reply(openId, `❌ 任务启动失败：${truncate(message, 500)}`),
+			});
+			if (!fired) {
+				await this.reply(openId, '当前版本的 ChatPanel 没有暴露执行入口，Worker 已创建但未启动。请更新后重试。');
+				return;
+			}
+			this.note(sessionId, '📱 本任务由飞书单聊派发，结果将推送回飞书');
 			this.selection.set(openId, sessionId);
 			this.selectionMeta.set(openId, { sessionId, title });
-			this.watcher?.watch(sessionId, title, openId);
 			this.watcher?.pollNow(sessionId);
 			this.log(`已派发 Worker ${sessionId.slice(0, 8)}「${title}」`);
 			const mark = zcodeRuntimeLabel();
@@ -1681,6 +2068,7 @@ class FeishuBridge implements vscode.Disposable {
 		const snapshot = result.ask;
 		if (!snapshot || !snapshot.questions.length || !this.panel?.resolveAsk) {
 			// No structured options (or old panel) — card buttons cannot work.
+			this.note(result.sessionId, `📱 飞书收到等待提示：${truncate(result.question, 120)}`);
 			await this.pushTextTo(result.sessionId, result.openId, `⏸「${truncate(result.title, 40)}」在等你回答：${truncate(result.question, 200)}\n这个问题没有可点选项，请打开电脑上的 Chat 面板作答；答完继续执行，结果仍会推送。`).catch(err => this.log(`reply failed: ${errText(err)}`));
 			return;
 		}
@@ -1698,6 +2086,7 @@ class FeishuBridge implements vscode.Disposable {
 		};
 		this.askDrafts.set(snapshot.id, draft);
 		this.sweepAskDrafts();
+		this.note(result.sessionId, `📱 已向飞书发送问题卡片：${truncate(result.question, 120)}`);
 		await this.pushAskCard(draft, false);
 	}
 
@@ -1854,6 +2243,9 @@ class FeishuBridge implements vscode.Disposable {
 
 	private finalizeAsk(draft: FeishuAskDraft, result: FeishuAskResult, notice: string): void {
 		this.askDrafts.delete(draft.snapshot.id);
+		// The answer itself stays on the desktop question card; this line marks
+		// that it was given from Feishu so the transcript reads end-to-end.
+		this.note(draft.sessionId, `📱 飞书侧已作答：${truncate(notice.split('\n')[0], 140)}`);
 		try {
 			this.panel?.resolveAsk?.(draft.snapshot.id, result);
 		} catch (err) {
@@ -1976,6 +2368,7 @@ class FeishuBridge implements vscode.Disposable {
 		}
 		const runs = this.panel.runs;
 		if (runs instanceof Map && runs.has(sessionId)) {
+			this.note(sessionId, '📱 飞书发来追问，但上一轮还没结束，已退回');
 			await replyAt(`⏳「${truncate(title, 40)}」还在处理上一个任务，完成后会推送；这条没有发出，请稍后重发。`).catch(() => undefined);
 			return;
 		}
@@ -1985,16 +2378,19 @@ class FeishuBridge implements vscode.Disposable {
 			await this.panel.mirrorWorkerFollowUpToRouter(text, sessionId).catch(err =>
 				this.log(`mirror follow-up failed: ${errText(err)}`));
 		}
-		try {
-			await this.panel.startTurn(sessionId, text, { text });
-		} catch (err) {
-			const message = errText(err);
-			this.log(`续聊失败 ${sessionId.slice(0, 8)}：${message}`);
-			await replyAt(`❌ 发给「${truncate(title, 40)}」失败：${truncate(message, 500)}`).catch(() => undefined);
+		// Fire without awaiting the run: receipt goes out now, and the watcher
+		// stays armed during the run (ask cards / stalls reach the phone).
+		this.watcher?.watch(sessionId, title, openId);
+		const fired = this.firePhoneTurn(sessionId, text, {
+			onBusy: () => replyAt(`⏳「${truncate(title, 40)}」还在处理上一个任务，完成后会推送；这条没有发出，请稍后重发。`),
+			onFail: message => replyAt(`❌ 发给「${truncate(title, 40)}」失败：${truncate(message, 500)}`),
+		});
+		if (!fired) {
+			await replyAt('当前版本的 ChatPanel 没有暴露续聊入口，请改为派发新 Worker。').catch(() => undefined);
 			return;
 		}
+		this.note(sessionId, '📱 上一条来自飞书单聊，结果将推送回飞书');
 		this.selectionMeta.set(openId, { sessionId, title });
-		this.watcher?.watch(sessionId, title, openId);
 		this.watcher?.pollNow(sessionId);
 		this.log(`续聊 ${sessionId.slice(0, 8)}：${truncate(text, 80)}`);
 		await replyAt(`➡️ 已发给「${truncate(title, 40)}」${FeishuBridge.workerTag(sessionId)}，完成后在这里推送结果。`).catch(() => undefined);
@@ -2042,6 +2438,7 @@ class FeishuBridge implements vscode.Disposable {
 				{ text: '📍 当前', value: { t: 'cmd', c: '当前' } },
 			],
 		});
+		this.note(result.sessionId, mark ? `📱 结果已推送飞书单聊（${mark}）` : '📱 结果已推送飞书单聊');
 	}
 
 	private async reply(openId: string, text: string): Promise<void> {
@@ -2049,6 +2446,53 @@ class FeishuBridge implements vscode.Disposable {
 			return;
 		}
 		await this.rest.sendText(PushTarget.p2p(openId), text);
+	}
+
+	/** Mirror a bridge-side line into the worker's desktop transcript (status row). */
+	private note(sessionId: string, text: string, tone?: 'info' | 'error'): void {
+		void this.panel?.appendBridgeNote?.(sessionId, text, tone)
+			.catch(err => this.log(`bridge note failed: ${errText(err)}`));
+	}
+
+	/**
+	 * Fire one phone-initiated turn without awaiting the whole run:
+	 *  - the phone gets its receipt at once (the old `await startTurn` held the
+	 *    ack back until the task finished and blocked the event stream);
+	 *  - the completion watcher is armed DURING the run, so mid-run ask cards
+	 *    and stalls actually reach the phone;
+	 *  - `onStarted` latches the turn's user-row id — outcomes of turns typed
+	 *    on the desktop are then recognized as foreign and never pushed.
+	 * Returns false when the panel cannot start it (busy / missing entry).
+	 */
+	private firePhoneTurn(sessionId: string, text: string, opts: { onBusy: () => Promise<void> | void; onFail: (message: string) => Promise<void> | void }): boolean {
+		const startTurn = this.panel?.startTurn;
+		if (!startTurn) {
+			return false;
+		}
+		const runs = this.panel?.runs;
+		if (runs instanceof Map && runs.has(sessionId)) {
+			void opts.onBusy();
+			return true; // reported by caller; nothing started here
+		}
+		let started = false;
+		void Promise.resolve(startTurn.call(this.panel, sessionId, text, { text, origin: 'feishu' }, undefined, userId => {
+			started = true;
+			this.watcher?.setTurnUser(sessionId, userId);
+		})).then(
+			() => {
+				if (!started) {
+					// Resolved without ever starting (session gone / empty text).
+					this.watcher?.drop(sessionId);
+					this.log(`turn on ${sessionId.slice(0, 8)} never started`);
+				}
+			},
+			err => {
+				this.watcher?.drop(sessionId);
+				this.log(`turn failed ${sessionId.slice(0, 8)}：${errText(err)}`);
+				void opts.onFail(errText(err));
+			},
+		);
+		return true;
 	}
 }
 

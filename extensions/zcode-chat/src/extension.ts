@@ -19,12 +19,14 @@ import { getFileEditSession, resetFileEditSession } from './fileEditSession';
 import {
 	IDE_CHAT_SOURCE_CURSOR,
 	IDE_CHAT_SOURCE_DEEPSEEK,
+	IDE_CHAT_SOURCE_QIANWEN,
 	IDE_CHAT_SOURCE_ZCODE,
 	IdeChatStore,
 	type IdeChatExtensionApi,
 } from './ideChatStore';
 import { ensureModelForProvider, ensureReasoningLevelForModel, getSelectedModelId, getSelectedReasoningLevel } from './models';
 import { bindDeepseekSecrets, isRetiredDeepseekModel, prepareDeepseekProvider, promptDeepseekApiKey } from './deepseekProvider';
+import { bindQianwenSecrets, prepareQianwenProvider, promptQianwenApiKey } from './qianwenProvider';
 import { getProviderMode, isProviderMode, PROVIDER_LABELS, setProviderMode } from './providers';
 import { stampZcodeRuntime } from './runtimeEnv';
 import { searchChatSessions, type SessionSearchMatch } from './sessionSearch';
@@ -50,6 +52,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 
 	registerPluginCommands(context);
 	bindDeepseekSecrets(context.secrets);
+	bindQianwenSecrets(context.secrets);
 
 	const auth = new ZCodeAuthService(context.secrets);
 	setAuthService(auth);
@@ -116,6 +119,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			}
 		}
 	}
+	// Same idea for the Qianwen brain: never send another brain's model id to
+	// the Qwen endpoint; pin a catalog id before the first turn.
+	if (getActiveBrain() === 'qianwen') {
+		const modelId = await ensureModelForProvider('qianwen');
+		await ensureReasoningLevelForModel('qianwen', modelId);
+	}
 
 	const panel = registerChatPanel(context, ideChat, fileEdits);
 	registerChatParticipant(context);
@@ -139,6 +148,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			const thinking = getSelectedReasoningLevel('deepseek', model);
 			providerStatus.text = `$(sparkle) DeepSeek · ${model}`;
 			providerStatus.tooltip = `${BRAIN_LABELS.deepseek} · thinking ${thinking}\n${getBridgeStatusText()}`;
+		} else if (brain === 'qianwen') {
+			const model = getSelectedModelId('qianwen');
+			const thinking = getSelectedReasoningLevel('qianwen', model);
+			providerStatus.text = `$(sparkle) Qianwen · ${model}`;
+			providerStatus.tooltip = `${BRAIN_LABELS.qianwen} · thinking ${thinking}\n${getBridgeStatusText()}`;
 		} else {
 			const mode = getProviderMode();
 			const model = getSelectedModelId(mode);
@@ -320,6 +334,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 				panel.refresh();
 			}
 		}),
+		vscode.commands.registerCommand('zcode.setQianwenApiKey', async () => {
+			const key = await promptQianwenApiKey();
+			if (key) {
+				void vscode.window.showInformationMessage('千问 API Key 已保存。');
+				// Pull the model listing with the fresh key, then repaint.
+				await prepareQianwenProvider().catch(() => undefined);
+				panel.refresh();
+			}
+		}),
 		vscode.commands.registerCommand('zcode.setFeishuSecret', async () => {
 			const value = await vscode.window.showInputBox({
 				password: true,
@@ -367,6 +390,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 				await vscode.commands.executeCommand('zcode.setDeepseekApiKey');
 				return;
 			}
+			if (brain === 'qianwen') {
+				// The Qianwen brain's "account" is its API key.
+				await vscode.commands.executeCommand('zcode.setQianwenApiKey');
+				return;
+			}
 			await auth.showAccountMenu();
 		}),
 		vscode.commands.registerCommand('zcode.signIn', async () => {
@@ -394,6 +422,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<IdeCha
 			zcode: IDE_CHAT_SOURCE_ZCODE,
 			cursor: IDE_CHAT_SOURCE_CURSOR,
 			deepseek: IDE_CHAT_SOURCE_DEEPSEEK,
+			qianwen: IDE_CHAT_SOURCE_QIANWEN,
 		},
 	};
 }

@@ -5,13 +5,13 @@
 
 import * as vscode from 'vscode';
 
-/** Start Plan, BigModel Coding Plan, and the official DeepSeek Messages API. */
-export type ProviderMode = 'startPlan' | 'bigmodel' | 'deepseek';
+/** Start Plan, BigModel Coding Plan, the official DeepSeek Messages API, and Qianwen. */
+export type ProviderMode = 'startPlan' | 'bigmodel' | 'deepseek' | 'qianwen';
 
 /**
- * Picker list for the ZCode brain. DeepSeek is a peer brain now (zcode.activeBrain),
- * so it is not offered as a ZCode sub-provider anymore; the id stays in the type so
- * stored sessions (and the deepseek brain) keep resolving.
+ * Picker list for the ZCode brain. DeepSeek / Qianwen are peer brains now
+ * (zcode.activeBrain), so they are not offered as ZCode sub-providers anymore;
+ * the ids stay in the type so stored sessions (and the peer brains) keep resolving.
  */
 export const PROVIDER_MODES: readonly ProviderMode[] = ['startPlan', 'bigmodel'];
 
@@ -19,16 +19,18 @@ export const PROVIDER_LABELS: Record<ProviderMode, string> = {
 	startPlan: 'ZCode Start Plan',
 	bigmodel: 'BigModel',
 	deepseek: 'DeepSeek',
+	qianwen: 'Qianwen',
 };
 
 export const PROVIDER_HINTS: Record<ProviderMode, string> = {
 	startPlan: 'Uses your ZCode account JWT (Start Plan quota / discount).',
 	bigmodel: 'Uses BigModel Coding Plan API key → /api/coding/paas/v4 (not the pay-as-you-go wallet).',
 	deepseek: 'Official DeepSeek Messages API (api.deepseek.com). API key as x-api-key. Thinking: off / low / high / max.',
+	qianwen: 'Qwen OpenAI-compatible API (maas.qianwenaiapi.com/compatible-mode/v1). API key as Bearer. Thinking: off / high.',
 };
 
 export function isProviderMode(value: unknown): value is ProviderMode {
-	return value === 'startPlan' || value === 'bigmodel' || value === 'deepseek';
+	return value === 'startPlan' || value === 'bigmodel' || value === 'deepseek' || value === 'qianwen';
 }
 
 /**
@@ -43,7 +45,7 @@ export function normalizeProviderMode(value: unknown): ProviderMode {
 	if (value === 'glm') {
 		return 'bigmodel';
 	}
-	if (value === 'startPlan' || value === 'bigmodel') {
+	if (value === 'startPlan' || value === 'bigmodel' || value === 'qianwen') {
 		return value;
 	}
 	return 'startPlan';

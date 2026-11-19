@@ -15,6 +15,7 @@ import { getProviderMode, PROVIDER_HINTS, PROVIDER_LABELS, type ProviderMode } f
 import { getAgentPace, type AgentPace } from './agentPace';
 import type { SessionAwareness } from './sessionAwareness';
 import { resolveDeepseekApiKey } from './deepseekProvider';
+import { resolveQianwenApiKey } from './qianwenProvider';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
 import { resolveBigModelCodingApiKey } from './bigmodelCodingPlan';
 
@@ -87,6 +88,17 @@ export function getBridgeStatusText(): string {
 			PROVIDER_HINTS.deepseek,
 		].join('\n');
 	}
+	if (brain === 'qianwen') {
+		const model = getSelectedModelId('qianwen');
+		const reasoningLevel = getSelectedReasoningLevel('qianwen', model);
+		return [
+			`Brain: ${BRAIN_LABELS.qianwen}`,
+			`Model: ${model} · thinking ${reasoningLevel}`,
+			`Bridge: agent (Qwen OpenAI-compatible API, ${'https://maas.qianwenaiapi.com/compatible-mode/v1'})`,
+			'Auth: Bearer — ZCode: Set Qianwen API Key, zcode.qianwen.apiKey, or QIANWEN_API_KEY',
+			PROVIDER_HINTS.qianwen,
+		].join('\n');
+	}
 	const provider = getProviderMode();
 	const model = getSelectedModelId(provider);
 	const reasoningLevel = getSelectedReasoningLevel(provider, model);
@@ -109,7 +121,8 @@ export function getBridgeStatusText(): string {
 /**
  * Routes by top-level brain. ZCode uses BigModel/Start Plan tool loop (or stub/http);
  * Cursor uses official `agent acp`; DeepSeek runs the same tool loop against the
- * official DeepSeek API with the deepseek provider pinned.
+ * official DeepSeek API with the deepseek provider pinned; Qianwen does the same
+ * against the OpenAI-compatible Qwen endpoint.
  */
 export async function completeChatTurn(
 	request: ChatTurnRequest,
@@ -121,6 +134,9 @@ export async function completeChatTurn(
 	}
 	if (brain === 'deepseek') {
 		return completeViaAgent({ ...request, provider: 'deepseek' }, token, 'deepseek');
+	}
+	if (brain === 'qianwen') {
+		return completeViaAgent({ ...request, provider: 'qianwen' }, token, 'qianwen');
 	}
 	const bridgeMode = getBridgeMode();
 	if (bridgeMode === 'http') {
@@ -296,6 +312,9 @@ export async function getCursorBrainStatusLine(): Promise<string> {
 async function resolveHttpApiKey(provider: ProviderMode): Promise<string | undefined> {
 	if (provider === 'deepseek') {
 		return resolveDeepseekApiKey();
+	}
+	if (provider === 'qianwen') {
+		return resolveQianwenApiKey();
 	}
 	if (provider === 'bigmodel') {
 		return (await loadCodingPlanApiKey('bigmodel'))

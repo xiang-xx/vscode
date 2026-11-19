@@ -465,6 +465,16 @@ button {
 	font-size: var(--zcode-chat-font-size);
 	color: var(--vscode-foreground);
 }
+/* Phone-bridge badge above a user bubble from Feishu. */
+.user-origin-chip {
+	margin-left: auto;
+	margin-bottom: 2px;
+	font-size: 10px;
+	line-height: 1.4;
+	color: var(--vscode-descriptionForeground);
+	opacity: .85;
+	user-select: none;
+}
 /* Router dispatch receipt — same right-side bubble as a user turn. */
 .dispatch-row {
 	display: block;

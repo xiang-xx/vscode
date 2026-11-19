@@ -43,12 +43,14 @@
           "enum": [
             "zcode",
             "cursor",
-            "deepseek"
+            "deepseek",
+            "qianwen"
           ],
           "enumDescriptions": [
             "%config.activeBrain.zcode%",
             "%config.activeBrain.cursor%",
-            "%config.activeBrain.deepseek%"
+            "%config.activeBrain.deepseek%",
+            "%config.activeBrain.qianwen%"
           ],
           "description": "%config.activeBrain%"
         },
@@ -104,6 +106,22 @@
           "type": "string",
           "default": "",
           "description": "%config.deepseek.apiKey%"
+        },
+        "zcode.qianwen.baseUrl": {
+          "type": "string",
+          "default": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+          "description": "%config.qianwen.baseUrl%"
+        },
+        "zcode.qianwen.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "%config.qianwen.apiKey%"
+        },
+        "zcode.qianwen.customModels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "%config.qianwen.customModels%"
         },
         "zcode.reasoningLevel": {
           "type": "string",
@@ -312,6 +330,12 @@
         "icon": "$(key)"
       },
       {
+        "command": "zcode.setQianwenApiKey",
+        "title": "%command.setQianwenApiKey%",
+        "category": "%command.category%",
+        "icon": "$(key)"
+      },
+      {
         "command": "zcode.setFeishuSecret",
         "title": "设置飞书机器人 App Secret",
         "category": "%command.category%",
@@ -437,9 +461,14 @@
           "group": "1_more@3"
         },
         {
-          "command": "zcode.manageAccount",
+          "command": "zcode.setQianwenApiKey",
           "when": "view == zcode.chatView",
           "group": "1_more@4"
+        },
+        {
+          "command": "zcode.manageAccount",
+          "when": "view == zcode.chatView",
+          "group": "1_more@5"
         }
       ]
     },

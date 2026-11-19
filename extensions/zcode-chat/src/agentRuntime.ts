@@ -55,6 +55,18 @@ import {
 	resolveDeepseekApiKey,
 	type DeepseekParsedTurn,
 } from './deepseekProvider';
+import {
+	applyQianwenStreamEvent,
+	buildQianwenBody,
+	createQianwenAccumulator,
+	finishQianwenTurn,
+	parseQianwenCompletion,
+	qianwenChatUrl,
+	qianwenHeaders,
+	qianwenHttpError,
+	resolveQianwenApiKey,
+	type QianwenParsedTurn,
+} from './qianwenProvider';
 
 /** Match ZCode Read default line budget. */
 const READ_DEFAULT_MAX_LINES = 2_000;
@@ -70,7 +82,7 @@ const BIGMODEL_CODING_CHAT_URL = 'https://open.bigmodel.cn/api/coding/paas/v4/ch
 const START_PLAN_ANTHROPIC_URL = 'https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages';
 const MAX_TOOL_TURNS_FALLBACK = 96;
 
-type ProviderApiKind = 'openai' | 'anthropic' | 'deepseek';
+type ProviderApiKind = 'openai' | 'anthropic' | 'deepseek' | 'qianwen';
 
 interface ToolCall {
 	id: string;
@@ -454,11 +466,12 @@ function activeTools() {
  * base URL cannot leave the model describing itself as another product's agent.
  */
 function providerEndpoint(brain: ActiveBrain | undefined, provider: ProviderMode): string | undefined {
-	if (brain !== 'deepseek' && provider !== 'deepseek') {
+	if (brain !== 'deepseek' && brain !== 'qianwen' && provider !== 'deepseek' && provider !== 'qianwen') {
 		return undefined;
 	}
 	try {
-		return new URL(deepseekMessagesUrl()).host;
+		const url = brain === 'qianwen' || provider === 'qianwen' ? qianwenChatUrl() : deepseekMessagesUrl();
+		return new URL(url).host;
 	} catch {
 		// Invalid configured base URL is reported when the request is made.
 		return undefined;
@@ -896,6 +909,16 @@ async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKe
 		return { url: deepseekMessagesUrl(), apiKey, api: 'deepseek' };
 	}
 
+	if (provider === 'qianwen') {
+		const apiKey = await resolveQianwenApiKey();
+		if (!apiKey) {
+			throw new Error(
+				'千问需要 API Key。在命令面板运行 “ZCode: Set Qianwen API Key”，或设置环境变量 QIANWEN_API_KEY。',
+			);
+		}
+		return { url: qianwenChatUrl(), apiKey, api: 'qianwen' };
+	}
+
 	if (provider === 'startPlan') {
 		try {
 			const jwt = getAuthService().getSession()?.zcodeJwtToken?.trim();
@@ -936,6 +959,11 @@ function annotateProviderError(message: string, provider: ProviderMode): Error {
 	if (provider === 'deepseek') {
 		return new Error(
 			`${message}\n（当前是 DeepSeek 官方接口。请到 platform.deepseek.com 确认余额，或检查 API Key。）`,
+		);
+	}
+	if (provider === 'qianwen') {
+		return new Error(
+			`${message}\n（当前是千问 OpenAI 兼容接口。请到 qianwenaiapi.com 控制台确认余额，或检查 API Key。）`,
 		);
 	}
 	return new Error(
@@ -1210,7 +1238,12 @@ async function streamAnthropicMessages(options: {
 			}
 		}
 
-		if (content && toolCalls.size === 0) {
+		// Catch up the final text even when tool calls follow: the live emission
+		// above is throttled to 80ms and suppressed once tool blocks start, so a
+		// tool-ending round would otherwise permanently drop the last tail of
+		// the streamed sentence. The panel ignores shorter follow-ups, so this
+		// is a pure tail completion.
+		if (content) {
 			options.onAssistant(content);
 		}
 		const calls = [...toolCalls.values()]
@@ -1400,10 +1433,189 @@ async function streamDeepseekMessages(options: {
 		}
 
 		const parsed = finishDeepseekTurn(state);
-		if (parsed.content && !parsed.toolCalls.length) {
+		// Unconditional catch-up: the live emission is throttled (80ms) and
+		// suppressed once tool calls appear, so a tool-ending round would
+		// otherwise permanently drop the streamed sentence's tail.
+		if (parsed.content) {
 			options.onAssistant(parsed.content);
 		}
 		return deepseekTurn(parsed);
+	} finally {
+		cancel.dispose();
+	}
+}
+
+function qianwenTurn(parsed: QianwenParsedTurn): {
+	content: string;
+	reasoning: string;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+} {
+	const calls = parsed.toolCalls.filter(call => call.name).map(call => ({
+		id: call.id,
+		type: 'function' as const,
+		function: { name: call.name, arguments: call.arguments || '{}' },
+	}));
+	return {
+		content: parsed.content,
+		reasoning: parsed.reasoning,
+		tool_calls: calls.length ? calls : undefined,
+		usageTokens: parsed.usageTokens,
+	};
+}
+
+async function completeQianwenChat(options: {
+	url: string;
+	apiKey: string;
+	model: string;
+	reasoningLevel: string;
+	messages: ChatCompletionMessage[];
+	token: vscode.CancellationToken;
+	onReasoning: (text: string) => void;
+	onAssistant: (text: string) => void;
+}): Promise<{
+	content: string;
+	reasoning: string;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+}> {
+	const controller = new AbortController();
+	const cancel = options.token.onCancellationRequested(() => controller.abort());
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			redirect: 'error',
+			headers: qianwenHeaders(options.apiKey, false),
+			body: JSON.stringify(buildQianwenBody({
+				model: options.model,
+				reasoningLevel: options.reasoningLevel,
+				messages: options.messages,
+				tools: activeTools(),
+				stream: false,
+			})),
+			signal: controller.signal,
+		});
+		const raw = await response.text();
+		if (!response.ok) {
+			throw qianwenHttpError(response.status, raw);
+		}
+		let data: unknown;
+		try {
+			data = JSON.parse(raw) as unknown;
+		} catch {
+			throw new Error(`千问返回的不是 JSON (${response.status}): ${raw.slice(0, 300)}`);
+		}
+		const parsed = parseQianwenCompletion(data);
+		if (parsed.reasoning) {
+			options.onReasoning(parsed.reasoning);
+		}
+		if (parsed.content && !parsed.toolCalls.length) {
+			options.onAssistant(parsed.content);
+		}
+		return qianwenTurn(parsed);
+	} finally {
+		cancel.dispose();
+	}
+}
+
+async function streamQianwenChat(options: {
+	url: string;
+	apiKey: string;
+	model: string;
+	reasoningLevel: string;
+	messages: ChatCompletionMessage[];
+	token: vscode.CancellationToken;
+	onReasoning: (text: string) => void;
+	onAssistant: (text: string) => void;
+}): Promise<{
+	content: string;
+	reasoning: string;
+	tool_calls?: ToolCall[];
+	usageTokens?: number;
+}> {
+	const controller = new AbortController();
+	const cancel = options.token.onCancellationRequested(() => controller.abort());
+	try {
+		const response = await fetch(options.url, {
+			method: 'POST',
+			redirect: 'error',
+			headers: qianwenHeaders(options.apiKey, true),
+			body: JSON.stringify(buildQianwenBody({
+				model: options.model,
+				reasoningLevel: options.reasoningLevel,
+				messages: options.messages,
+				tools: activeTools(),
+				stream: true,
+			})),
+			signal: controller.signal,
+		});
+		if (!response.ok || !response.body) {
+			const raw = await response.text().catch(() => '');
+			throw qianwenHttpError(response.status, raw);
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		const state = createQianwenAccumulator();
+		let buffer = '';
+		let lastReasoningEmit = 0;
+		let lastContentEmit = 0;
+
+		const consume = (chunk: string) => {
+			for (const line of chunk.split('\n')) {
+				const trimmed = line.trim();
+				if (!trimmed.startsWith('data:')) {
+					continue;
+				}
+				const payload = trimmed.slice(5).trim();
+				if (!payload || payload === '[DONE]') {
+					continue;
+				}
+				let json: unknown;
+				try {
+					json = JSON.parse(payload) as unknown;
+				} catch {
+					continue;
+				}
+				const update = applyQianwenStreamEvent(state, json);
+				if (!update) {
+					continue;
+				}
+				const now = Date.now();
+				if (update.reasoning && now - lastReasoningEmit > 80) {
+					options.onReasoning(update.reasoning);
+					lastReasoningEmit = now;
+				}
+				if (update.content && !update.hasTools && now - lastContentEmit > 80) {
+					options.onAssistant(update.content);
+					lastContentEmit = now;
+				}
+			}
+		};
+
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			const splitAt = buffer.lastIndexOf('\n');
+			if (splitAt >= 0) {
+				consume(buffer.slice(0, splitAt));
+				buffer = buffer.slice(splitAt + 1);
+			}
+		}
+		buffer += decoder.decode();
+		if (buffer.trim()) {
+			consume(buffer);
+		}
+
+		const parsed = finishQianwenTurn(state);
+		// Unconditional catch-up (same tail-drop fix as the other streams).
+		if (parsed.content) {
+			options.onAssistant(parsed.content);
+		}
+		return qianwenTurn(parsed);
 	} finally {
 		cancel.dispose();
 	}
@@ -1434,6 +1646,18 @@ async function streamOrCompleteChat(options: {
 				throw error;
 			}
 			return completeDeepseekMessages(options);
+		}
+	}
+
+	if (options.api === 'qianwen') {
+		try {
+			return await streamQianwenChat(options);
+		} catch (error) {
+			if (options.token.isCancellationRequested) {
+				throw error;
+			}
+			// Non-stream fallback keeps thinking off (Qwen only streams thinking).
+			return completeQianwenChat(options);
 		}
 	}
 
@@ -1701,8 +1925,10 @@ async function streamChatCompletions(options: {
 			}))
 			.filter(c => c.function.name);
 
-		// Final answer streams only when this completion has no tools.
-		if (content && !calls.length) {
+		// Catch up even when tool calls follow: live emission above is throttled
+		// to 80ms and suppressed once tool deltas arrive, so a tool-ending round
+		// would otherwise permanently drop the last tail of the streamed text.
+		if (content) {
 			options.onAssistant(content);
 		}
 
