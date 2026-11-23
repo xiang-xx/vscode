@@ -56,9 +56,27 @@ interface CustomerInfoOrganization {
 type TokenExchange =
 	| { kind: 'ok'; token: string; expiresAtMs: number }
 	| { kind: 'revoked' }
-	| { kind: 'failed' };
+	| { kind: 'failed' }
+	| { kind: 'unauthorized' };
+
+/**
+ * Why the last resolve attempt failed. Chat surfaces this so an expired OAuth
+ * session (token exchange now returns 401) is not reported as "no credential".
+ */
+export type BigModelCodingFailure = 'no-oauth' | 'unauthorized' | 'exchange-failed' | 'no-project' | 'key-unavailable';
 
 let cached: CachedToken | undefined;
+let lastFailure: BigModelCodingFailure | undefined;
+let lastFailureDetail: string | undefined;
+
+export function bigModelCodingPlanFailure(): BigModelCodingFailure | undefined {
+	return lastFailure;
+}
+
+/** Technical reason behind the last failure (e.g. an unreadable keychain entry). */
+export function bigModelCodingPlanFailureDetail(): string | undefined {
+	return lastFailureDetail;
+}
 
 /**
  * Resolve a credential for `https://open.bigmodel.cn/api/coding/paas/v4`:
@@ -70,9 +88,24 @@ export async function resolveBigModelCodingApiKey(): Promise<string | undefined>
 	if (cached && cached.expiresAtMs - TOKEN_MIN_TTL_MS > Date.now()) {
 		return cached.token;
 	}
+	lastFailure = undefined;
+	lastFailureDetail = undefined;
 	const store = await readRawCredentialStore();
-	const oauth = decryptStoreValue(store, 'oauth:bigmodel:access_token');
+	const rawAccess = store['oauth:bigmodel:access_token'];
+	let oauth: string | undefined;
+	if (rawAccess) {
+		try {
+			oauth = createZCodeCipher().decrypt(rawAccess).trim() || undefined;
+		} catch (error) {
+			// The store is sealed with a key we cannot reach (OS keychain locked,
+			// managed secret missing). Re-login would not fix it either.
+			lastFailure = 'key-unavailable';
+			lastFailureDetail = (error as Error).message;
+			return undefined;
+		}
+	}
 	if (!oauth) {
+		lastFailure = 'no-oauth';
 		return undefined;
 	}
 	let found = findProjectKeyLocation(store);
@@ -80,7 +113,12 @@ export async function resolveBigModelCodingApiKey(): Promise<string | undefined>
 	for (let attempt = 0; attempt < 2; attempt++) {
 		if (!found) {
 			const ensured = await ensureProjectKeyLocation(oauth, store);
+			if (ensured === 'unauthorized') {
+				lastFailure = 'unauthorized';
+				return undefined;
+			}
 			if (!ensured) {
+				lastFailure = 'no-project';
 				return undefined;
 			}
 			found = { key: ensured.key, location: ensured.location };
@@ -88,10 +126,17 @@ export async function resolveBigModelCodingApiKey(): Promise<string | undefined>
 		const exchange = await exchangeProjectToken(oauth, found.location);
 		if (exchange.kind === 'ok') {
 			cached = { token: exchange.token, expiresAtMs: exchange.expiresAtMs };
+			lastFailure = undefined;
 			return exchange.token;
+		}
+		if (exchange.kind === 'unauthorized') {
+			// The stored OAuth access token is dead; only a fresh sign-in helps.
+			lastFailure = 'unauthorized';
+			return undefined;
 		}
 		if (exchange.kind === 'failed') {
 			// Transient or unexpected: keep the pointer, fail this send.
+			lastFailure = 'exchange-failed';
 			return undefined;
 		}
 		// Revoked server-side: drop the stale pointer and re-resolve once.
@@ -99,6 +144,7 @@ export async function resolveBigModelCodingApiKey(): Promise<string | undefined>
 		cached = undefined;
 		found = undefined;
 	}
+	lastFailure = 'exchange-failed';
 	return undefined;
 }
 
@@ -111,12 +157,17 @@ async function exchangeProjectToken(oauth: string, location: ProjectKeyLocation)
 	const url = `${BIGMODEL_ORIGIN}/api/biz/v1/organization/${encodeURIComponent(location.organizationId)}`
 		+ `/projects/${encodeURIComponent(location.projectId)}`
 		+ `/api_keys/${encodeURIComponent(location.apiKeyId)}/access_tokens`;
+	// The desktop sends the client identity in the request **body**; the service
+	// rejects header-only values with `clientType: clientType must not be blank`.
 	const response = await requestJson(url, 'POST', { Authorization: `Bearer ${oauth}` }, {
 		clientType: CLIENT_TYPE,
 		clientVersion: CLIENT_VERSION,
 	});
 	if (response?.status === 404) {
 		return { kind: 'revoked' };
+	}
+	if (response?.status === 401 || response?.parsed?.code === 401) {
+		return { kind: 'unauthorized' };
 	}
 	if (!response || response.parsed?.code !== 200) {
 		return { kind: 'failed' };
@@ -141,8 +192,11 @@ async function exchangeProjectToken(oauth: string, location: ProjectKeyLocation)
 async function ensureProjectKeyLocation(
 	oauth: string,
 	store: Record<string, string>,
-): Promise<{ key: string; location: ProjectKeyLocation } | undefined> {
+): Promise<{ key: string; location: ProjectKeyLocation } | 'unauthorized' | undefined> {
 	const info = await requestJson(`${BIGMODEL_ORIGIN}/api/biz/customer/getCustomerInfo`, 'GET', { Authorization: `Bearer ${oauth}` });
+	if (info?.status === 401 || info?.parsed?.code === 401) {
+		return 'unauthorized';
+	}
 	const organizations = (info?.parsed?.data as { organizations?: CustomerInfoOrganization[] } | undefined)?.organizations;
 	if (!Array.isArray(organizations)) {
 		return undefined;
@@ -349,11 +403,14 @@ async function requestJson(
 				...(body === undefined ? {} : { body: JSON.stringify(body) }),
 				signal: controller.signal,
 			});
-			if (!response.ok && response.status !== 404) {
+			if (!response.ok && response.status !== 404 && response.status !== 401) {
 				return undefined;
 			}
 			if (response.status === 404) {
 				return { status: 404 };
+			}
+			if (response.status === 401) {
+				return { status: 401 };
 			}
 			return { status: response.status, parsed: await response.json() as { code?: number; data?: unknown } };
 		} finally {

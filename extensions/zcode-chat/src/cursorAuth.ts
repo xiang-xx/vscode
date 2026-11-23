@@ -32,6 +32,48 @@ export async function resolveAgentBinary(): Promise<{ path: string; exists: bool
 	}
 }
 
+/**
+ * Environment for every `agent` child (acp server, `status`, `--list-models`).
+ *
+ * The CLI reads only `HTTPS_PROXY` / `https_proxy` (uppercase wins) and hands
+ * that URL to undici's ProxyAgent. undici cannot speak SOCKS, so a
+ * `socks5://` value in ALL_PROXY is worse than useless: the channels that
+ * consult it end up going direct, and a direct TLS handshake to
+ * api2.cursor.sh stalls ~5s and then aborts with
+ * "[aborted] Client network socket disconnected before secure TLS connection
+ * was established" — the exact failure this extension used to report as
+ * "connection dropped after 5 attempts".
+ */
+export function buildCursorAgentEnv(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { ...process.env };
+	const httpConfig = vscode.workspace.getConfiguration('http');
+	if (httpConfig.get<string>('proxySupport') !== 'off') {
+		const proxy = httpConfig.get<string>('proxy')?.trim();
+		if (proxy && !env.HTTPS_PROXY && !env.https_proxy && !env.HTTP_PROXY && !env.http_proxy) {
+			env.HTTPS_PROXY = proxy;
+			env.HTTP_PROXY = proxy;
+		}
+	}
+
+	const proxy = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy;
+	if (proxy) {
+		env.HTTPS_PROXY = proxy;
+		env.https_proxy = proxy;
+		env.HTTP_PROXY = proxy;
+		env.http_proxy = proxy;
+		// A SOCKS ALL_PROXY makes the CLI's undici channels bypass the HTTP
+		// proxy; drop it so the working path is the only path.
+		delete env.ALL_PROXY;
+		delete env.all_proxy;
+	}
+	// Node >= 24: make core http/https/http2 honor the env proxy too, not just
+	// the undici fetch() calls the CLI wires up by hand.
+	env.NODE_USE_ENV_PROXY = env.NODE_USE_ENV_PROXY || '1';
+	env.NO_PROXY = env.NO_PROXY || 'localhost,127.0.0.1,::1';
+	env.no_proxy = env.no_proxy || env.NO_PROXY;
+	return env;
+}
+
 function runAgent(args: string[], timeoutMs = 15_000): Promise<{ code: number | null; stdout: string; stderr: string }> {
 	return new Promise(async (resolve) => {
 		const { path: bin, exists } = await resolveAgentBinary();
@@ -40,7 +82,7 @@ function runAgent(args: string[], timeoutMs = 15_000): Promise<{ code: number | 
 			return;
 		}
 		const child = spawn(bin, args, {
-			env: { ...process.env },
+			env: buildCursorAgentEnv(),
 			stdio: ['ignore', 'pipe', 'pipe'],
 		});
 		let stdout = '';

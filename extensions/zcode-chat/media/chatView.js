@@ -3357,6 +3357,20 @@
 		return `${meta.model || ''}:${meta.reasoningLevel || ''}:${meta.pace || ''}`;
 	}
 
+	/** Output speed for the turn: `~26.4 t/s…` while it streams, then the peak
+	 *  it reached (`峰值 31.2 t/s`). Both are estimates from streamed text —
+	 *  no brain reports per-token timing — measured over streaming time only,
+	 *  so tool waits and waits for the user do not drag the number down. */
+	function outputSpeedLabel(meta) {
+		if (!meta || !(meta.tokensPerSec > 0)) {
+			return '';
+		}
+		const value = meta.tokensPerSec >= 100
+			? String(Math.round(meta.tokensPerSec))
+			: meta.tokensPerSec.toFixed(1).replace(/\.0$/, '');
+		return meta.speedLive ? `~${value} t/s…` : `峰值 ${value} t/s`;
+	}
+
 	function userMetaLabel(meta) {
 		if (!meta) {
 			return '';
@@ -3370,6 +3384,10 @@
 		}
 		if (meta.pace) {
 			parts.push(meta.pace);
+		}
+		const speed = outputSpeedLabel(meta);
+		if (speed) {
+			parts.push(speed);
 		}
 		return parts.join(' · ');
 	}
@@ -3436,6 +3454,42 @@
 			}
 			syncDispatchReceipt(receiptEl, item);
 		}
+	}
+
+	/**
+	 * Repaints the current turn's meta chip in place when only its speed reading
+	 * changed. Speed refreshes every 5s and must never rebuild the transcript, so
+	 * it stays out of timelineKey and is written straight onto the existing chip.
+	 * Only the last user row is considered — that is the turn being watched — so
+	 * this costs one lookup per render.
+	 */
+	function patchUserMetaSpeeds(items) {
+		const list = items || [];
+		let last = null;
+		for (let i = list.length - 1; i >= 0; i--) {
+			if (list[i].kind === 'user' && list[i].meta) {
+				last = list[i];
+				break;
+			}
+		}
+		if (!last) {
+			return;
+		}
+		const row = timelineEl.querySelector(`.user-row[data-item-id="${CSS.escape(last.id)}"]`);
+		const chip = row && row.querySelector('.user-turn-meta');
+		if (!chip) {
+			return;
+		}
+		const label = userMetaLabel(last.meta);
+		if (!label) {
+			return;
+		}
+		const next = `⚙ ${label}`;
+		if (chip.textContent === next) {
+			return;
+		}
+		chip.textContent = next;
+		chip.title = `本轮发送设置：${label}`;
 	}
 
 	function tryPatchElapsed(items) {
@@ -3806,6 +3860,9 @@
 			timelineHeldItems = items || [];
 			return;
 		}
+		// Turn-meta speed refreshes every 5s: repaint that one chip before any
+		// rebuild decision, so a new reading never forces a transcript rebuild.
+		patchUserMetaSpeeds(items);
 		try {
 			if (tryPatchElapsed(items)) {
 				return;

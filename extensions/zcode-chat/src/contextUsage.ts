@@ -15,6 +15,7 @@ import { deepseekContextWindow } from './deepseekProvider';
  * Ids that do not match stay on the 200K default.
  */
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+	'GLM-5.4': 1_000_000,
 	'GLM-5.3': 1_000_000,
 	'GLM-5.3-Flash': 1_000_000,
 	'GLM-5.2': 1_000_000,

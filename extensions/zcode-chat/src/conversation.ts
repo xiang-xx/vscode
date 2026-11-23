@@ -92,6 +92,13 @@ export interface UserTurnMeta {
 	model?: string;
 	reasoningLevel?: string;
 	pace?: string;
+	/** Peak generation speed for this turn in tokens per second. Estimated from
+	 *  the streamed reply over streaming time only — tool waits and waits for the
+	 *  user are excluded — so it stays comparable across brains (Cursor reports
+	 *  no usage at all). Absent until a full measurement window has streamed. */
+	tokensPerSec?: number;
+	/** True while the reply is still streaming, so the chip reads as live. */
+	speedLive?: boolean;
 }
 
 export type ConversationItem =

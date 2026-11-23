@@ -69,11 +69,12 @@ export function getBridgeEndpoint(): string {
 export function getBridgeStatusText(): string {
 	const brain = getActiveBrain();
 	if (brain === 'cursor') {
+		const model = getCursorModel() || '(CLI default)';
 		return [
 			`Brain: ${BRAIN_LABELS.cursor}`,
+			`Model: ${model} · thinking ${getSelectedReasoningLevel(getProviderMode(), model)}`,
 			`Mode: ${getCursorAgentMode()}`,
-			`Model: ${getCursorModel() || '(CLI default)'}`,
-			`Bridge: cursor-acp (agent acp)`,
+			'Bridge: agent acp (official Cursor CLI)',
 			'Auth: Cursor CLI (`agent login` / CURSOR_API_KEY)',
 		].join('\n');
 	}

@@ -21,6 +21,12 @@ export interface ZCodeModelOption {
 
 const START_PLAN_MODELS: readonly ZCodeModelOption[] = [
 	{
+		id: 'glm-5.4',
+		label: 'GLM-5.4',
+		reasoningLevels: ['low', 'high', 'max'],
+		defaultReasoningLevel: 'low',
+	},
+	{
 		id: 'GLM-5.3-Flash',
 		label: 'GLM-5.3-Flash',
 		reasoningLevels: ['low', 'high', 'max'],
@@ -41,6 +47,12 @@ const START_PLAN_MODELS: readonly ZCodeModelOption[] = [
 ];
 
 const BIGMODEL_MODELS: readonly ZCodeModelOption[] = [
+	{
+		id: 'glm-5.4',
+		label: 'GLM-5.4',
+		reasoningLevels: ['low', 'high', 'max'],
+		defaultReasoningLevel: 'low',
+	},
 	{
 		id: 'GLM-5.3',
 		label: 'GLM-5.3',
@@ -87,7 +99,13 @@ export function modelsForProvider(provider: ProviderMode): readonly ZCodeModelOp
 
 export function findModel(provider: ProviderMode, modelId: string | undefined): ZCodeModelOption {
 	const models = modelsForProvider(provider);
-	return models.find(m => m.id === modelId) ?? models[0]!;
+	if (!modelId) {
+		return models[0]!;
+	}
+	// Ids are stored in mixed case by users (`glm-5.4`) and upper case by the
+	// catalog; match either so a hand-written setting is not silently replaced.
+	const wanted = modelId.trim().toLowerCase();
+	return models.find(m => m.id.toLowerCase() === wanted) ?? models[0]!;
 }
 
 export function getSelectedModelId(provider: ProviderMode): string {
@@ -99,8 +117,9 @@ export function getSelectedModelId(provider: ProviderMode): string {
 export async function ensureModelForProvider(provider: ProviderMode): Promise<string> {
 	const raw = vscode.workspace.getConfiguration('zcode').get<string>('model');
 	const models = modelsForProvider(provider);
-	if (raw && models.some(m => m.id === raw)) {
-		return raw;
+	const match = raw ? models.find(m => m.id.toLowerCase() === raw.trim().toLowerCase()) : undefined;
+	if (match) {
+		return match.id;
 	}
 	const next = models[0]!.id;
 	await setSelectedModelId(next);

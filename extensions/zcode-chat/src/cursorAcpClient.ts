@@ -72,7 +72,7 @@ const PROMPT_MAX_TIMEOUT_MS = 60 * 60_000;
  * generous budget and one fresh-process retry before surfacing the error.
  */
 const AUTH_TIMEOUT_MS = 60_000;
-const START_ATTEMPTS = 2;
+const START_ATTEMPTS = 3;
 
 /**
  * Transport failures the Cursor CLI labels RetriableError.
@@ -106,6 +106,26 @@ export function isCursorTransportDump(text: string): boolean {
 }
 
 /**
+ * ACP replies put the actionable text in `error.data.details` and leave
+ * `error.message` as a bare "Internal error". Keeping only the message threw
+ * away every transport reason ("[aborted] Client network socket disconnected
+ * before secure TLS connection was established"), so the retry regex never
+ * matched and a single proxy blip ended the turn.
+ */
+function formatAcpError(error: { message?: string; code?: number; data?: unknown }): string {
+	const head = error.message || `ACP error ${error.code ?? '?'}`;
+	const data = error.data as { details?: unknown } | undefined;
+	const details = typeof data?.details === 'string' ? data.details.trim() : '';
+	if (details && !head.includes(details)) {
+		return `${head}: ${details}`;
+	}
+	return head;
+}
+
+/** A direct (unproxied) TLS attempt to api2.cursor.sh stalls ~5s and then aborts. */
+const DIRECT_TLS_DROP_RE = /Client network socket disconnected|before secure TLS connection/i;
+
+/**
  * Shown after retries are exhausted. Must not contain "cancel" or "abort":
  * the chat panel treats those substrings as a user stop.
  */
@@ -115,7 +135,10 @@ export function formatCursorTransportFailure(attempts: number, last: string): st
 		.replace(/\[canceled\]/gi, '[stream closed]')
 		.replace(/cancel(?:led|ed|lation)?/gi, 'dropped')
 		.replace(/abort(?:ed)?/gi, 'dropped');
-	return `Cursor Agent connection dropped after ${attempts} attempts. ${safe}`;
+	const hint = DIRECT_TLS_DROP_RE.test(last)
+		? ' The TLS handshake to api2.cursor.sh never completed — set Settings › http.proxy (or check your VPN) and retry.'
+		: '';
+	return `Cursor Agent connection dropped after ${attempts} attempts. ${safe}${hint}`;
 }
 
 export class CursorAcpClient {
@@ -170,6 +193,12 @@ export class CursorAcpClient {
 				// dispose() during start: respawning cannot fix these. Skip the retry.
 				if (this.closed || /binary unavailable|^spawn |Cursor ACP cwd/i.test(msg)) {
 					break;
+				}
+				// cursor_login is a network round-trip that loses the TLS handshake
+				// about one time in five behind a proxy. Space the attempts out so a
+				// respawn does not land in the same bad window.
+				if (attempt < START_ATTEMPTS) {
+					await new Promise(resolve => setTimeout(resolve, 800 * attempt));
 				}
 			}
 		}
@@ -438,7 +467,7 @@ export class CursorAcpClient {
 			method?: string;
 			params?: unknown;
 			result?: unknown;
-			error?: { message?: string; code?: number };
+			error?: { message?: string; code?: number; data?: unknown };
 		};
 		try {
 			msg = JSON.parse(trimmed);
@@ -454,7 +483,7 @@ export class CursorAcpClient {
 			}
 			this.pending.delete(msg.id);
 			if (msg.error) {
-				waiter.reject(new Error(msg.error.message || `ACP error ${msg.error.code}`));
+				waiter.reject(new Error(formatAcpError(msg.error)));
 			} else {
 				waiter.resolve(msg.result);
 			}
@@ -523,12 +552,19 @@ export class CursorAcpClient {
  * Wraps a failed start() for the chat timeline. Must not contain "cancel" or
  * "abort": the chat panel treats those substrings as a user stop. Common
  * causes: a stale Cursor CLI login (cursor_login then waits for an interactive
- * flow that never completes over ACP stdio) or an auth round-trip stalled by a
- * proxy / slow network.
+ * flow that never completes over ACP stdio), or the auth round-trip losing its
+ * TLS handshake when the proxy is missing or SOCKS-only.
  */
 function formatAuthenticateFailure(err: unknown): string {
-	const msg = err instanceof Error ? err.message : String(err);
-	if (/authenticate/i.test(msg)) {
+	const raw = err instanceof Error ? err.message : String(err);
+	const msg = raw
+		.replace(/\[aborted\]/gi, '[stream closed]')
+		.replace(/cancel(?:led|ed|lation)?/gi, 'dropped')
+		.replace(/abort(?:ed)?/gi, 'dropped');
+	if (DIRECT_TLS_DROP_RE.test(raw)) {
+		return `Cursor Agent could not reach api2.cursor.sh (${msg}). The TLS handshake never completed — set Settings › http.proxy to an HTTP/HTTPS proxy (a SOCKS-only proxy cannot be used here) or fix your VPN, then retry.`;
+	}
+	if (/authenticate/i.test(raw)) {
 		return `${msg} — usually a stale Cursor login or a proxy blocking the auth check. Run \`agent login\` in a terminal (or set CURSOR_API_KEY) and retry; if already logged in, check the proxy.`;
 	}
 	return msg;

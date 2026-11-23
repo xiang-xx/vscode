@@ -31,7 +31,7 @@ import {
 	type AcpSessionUpdate,
 } from './cursorAcpClient';
 import { sharedMcpServers } from './chatPlugins';
-import { getCursorAuthStatus, promptCursorLogin } from './cursorAuth';
+import { buildCursorAgentEnv as editorProxyEnv, getCursorAuthStatus, promptCursorLogin } from './cursorAuth';
 import { getFileEditSession } from './fileEditSession';
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 
@@ -296,18 +296,20 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 	});
 
 	try {
-		options.onProgress?.({ type: 'status', text: `Cursor Agent · ${root}` });
+		const pace = options.agentPace ?? getAgentPace();
+		// Same status line shape as the other brains (model · pace · root).
+		options.onProgress?.({ type: 'status', text: `${model || 'Cursor Agent'} · ${pace} · ${root}` });
 
 		const originalPrompt = buildPrompt(
 			options.messages,
 			options.sessionAwareness,
 			options.promptPreamble,
-			options.agentPace ?? getAgentPace(),
+			pace,
 			options.reasoningLevel,
 		);
 		let promptText = originalPrompt;
 		let sessionId: string | undefined;
-		options.onProgress?.({ type: 'status', text: 'Cursor Agent is working…' });
+		options.onProgress?.({ type: 'status', text: 'Thinking…' });
 
 		// ACP does not set enableAgentRetries (interactive `agent` and `agent -p` do),
 		// so a VPN/proxy blip ends the turn on the first RetriableError. Resume the
@@ -345,19 +347,18 @@ export async function runCursorAgent(options: CursorAgentRunOptions): Promise<Cu
 				}
 				options.onProgress?.({
 					type: 'status',
-					text: `Connection dropped, resuming Cursor Agent (${attempt + 1}/${CURSOR_TRANSPORT_ATTEMPTS})…`,
+					text: `Connection dropped, retrying (${attempt + 1}/${CURSOR_TRANSPORT_ATTEMPTS})…`,
 				});
 				await delayWithCancel(options.token, transportRetryDelayMs(attempt));
 				sessionId = client.activeSessionId || sessionId;
-				if (client.isRunning && sessionId) {
-					await client.cancel(5_000);
-					throwIfCancelled(options.token);
-					promptText = CURSOR_RESUME_NOTE;
-				} else if (!client.isClosed) {
-					// Handshake failed before a session existed. Drop the child so
-					// the next attempt starts a clean CLI instead of reusing it.
-					client.dispose();
-				}
+				// A client that just reported a transport drop is wedged: its
+				// connection is dead while the process still looks alive, so
+				// re-prompting it fails again within milliseconds and burns every
+				// attempt in one bad window. Kill the child and let the next attempt
+				// open a fresh TLS connection, resuming the same chat via
+				// session/load (sessionId is kept above).
+				client.dispose();
+				options.onProgress?.({ type: 'status', text: 'Continuing…' });
 			}
 		}
 
@@ -516,22 +517,10 @@ function delayWithCancel(token: vscode.CancellationToken, ms: number): Promise<v
  * Pass the editor proxy through to the agent child. Dock-launched Code often
  * has no HTTPS_PROXY, so the CLI's HTTP/2 stream bypasses a rule-mode VPN and
  * dies with "Connection stalled" / "Stream ended without turnEnded".
- * HTTP/1.1 (cli-config network.useHttp1ForAgent) is what actually honors this.
+ * The details (SOCKS vs HTTP, NODE_USE_ENV_PROXY) live in buildCursorAgentEnv.
  */
 function buildCursorAgentEnv(): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv = { ...process.env };
-	const httpConfig = vscode.workspace.getConfiguration('http');
-	if (httpConfig.get<string>('proxySupport') !== 'off') {
-		const proxy = httpConfig.get<string>('proxy')?.trim();
-		if (proxy && !env.HTTPS_PROXY && !env.https_proxy && !env.HTTP_PROXY && !env.http_proxy) {
-			env.HTTPS_PROXY = proxy;
-			env.HTTP_PROXY = proxy;
-		}
-	}
-	if (env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || env.ALL_PROXY || env.all_proxy) {
-		env.NODE_USE_ENV_PROXY = env.NODE_USE_ENV_PROXY || '1';
-	}
-	return env;
+	return editorProxyEnv();
 }
 
 async function reopenCursorSession(

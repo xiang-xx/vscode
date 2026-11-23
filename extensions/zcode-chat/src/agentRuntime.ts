@@ -42,7 +42,8 @@ import { cachedPluginToolDefs, callPluginTool, refreshPluginTools } from './chat
 import { formatSessionAwareness, type SessionAwareness } from './sessionAwareness';
 import { normalizeToolArgs, normalizeToolName } from './toolNormalize';
 import { loadCodingPlanApiKey } from './zcodeCredentialsStore';
-import { resolveBigModelCodingApiKey } from './bigmodelCodingPlan';
+import { bigModelCodingPlanFailure, bigModelCodingPlanFailureDetail, resolveBigModelCodingApiKey } from './bigmodelCodingPlan';
+import { ensureSessionRenewed, lastRenewalDetail, renewIfExpiringSoon, type RenewalResult } from './oauthRenewal';
 import {
 	applyDeepseekStreamEvent,
 	buildDeepseekBody,
@@ -933,14 +934,61 @@ async function resolveAuth(provider: ProviderMode): Promise<{ url: string; apiKe
 		);
 	}
 
+	// There is no silent token refresh upstream, so a doomed request is renewed
+	// up front instead of failing halfway through a reply.
+	await renewIfExpiringSoon('bigmodel').catch(() => undefined);
+
 	// Standalone pasted API key first; otherwise the OAuth project-token
 	// exchange the ZCode desktop itself uses for Coding Plan requests.
-	const codingKey = await loadCodingPlanApiKey('bigmodel')
+	let codingKey = await loadCodingPlanApiKey('bigmodel')
 		?? await resolveBigModelCodingApiKey().catch(() => undefined);
+	let renewalNote: string | undefined;
+
+	if (!codingKey && bigModelCodingPlanFailure() === 'unauthorized') {
+		// The OAuth token is dead. Re-authorize once, then retry the exchange.
+		const renewal = await ensureSessionRenewed({ force: true, provider: 'bigmodel' })
+			.catch(() => ({ renewed: false } as RenewalResult));
+		if (renewal.renewed) {
+			await getAuthService().refreshFromDesktop().catch(() => undefined);
+			codingKey = await resolveBigModelCodingApiKey().catch(() => undefined);
+			if (!codingKey) {
+				renewalNote = '刚刚自动续期成功，但服务端仍然拒绝新令牌。';
+			}
+		} else {
+			renewalNote = `已尝试自动续期，但没有成功：${renewal.detail ?? lastRenewalDetail() ?? '原因未知'}`;
+		}
+	}
+
 	if (codingKey) {
 		return { url: BIGMODEL_CODING_CHAT_URL, apiKey: codingKey, api: 'openai' };
 	}
 
+	const failure = bigModelCodingPlanFailure();
+	if (failure === 'key-unavailable') {
+		const detail = bigModelCodingPlanFailureDetail();
+		throw new Error(
+			'ZCode 凭据库读不出来（凭据用系统钥匙串或托管密钥加密，本 IDE 拿不到那把钥匙）。'
+			+ (detail ? `\n技术原因：${detail}` : '')
+			+ '\n请解锁登录钥匙串后重试；若仍失败，在 ZCode 桌面端重新登录一次（桌面端会重建凭据库）。',
+		);
+	}
+	if (failure === 'unauthorized') {
+		throw new Error(
+			'BigModel 登录令牌已过期（Coding Plan 换取项目密钥时返回 401）。'
+			+ (renewalNote ? `\n${renewalNote}` : '\n自动续期没有启动（设置里关掉了 zcode.auth.autoRenew，或刚续过一次）。')
+			+ '\n请重试；仍失败就在 ZCode 桌面端或用本 IDE 的「ZCode: Sign in」重新登录 BigModel。',
+		);
+	}
+	if (failure === 'exchange-failed') {
+		throw new Error(
+			'BigModel 登录有效，但换取 Coding Plan 项目密钥失败（服务端返回异常或网络中断）。稍后重试；若持续失败请在 ZCode 桌面端确认 Coding Plan 套餐已连接。',
+		);
+	}
+	if (failure === 'no-project') {
+		throw new Error(
+			'BigModel 账号里找不到可用的默认机构/项目。请在 bigmodel.cn 控制台创建一个项目，或先在 ZCode 桌面端打开一次 Coding Plan 页面，再回到这里重试。',
+		);
+	}
 	throw new Error(
 		'No BigModel Coding Plan credential found: no standalone API key in ~/.zcode/v2/credentials.json, and the OAuth project-token exchange failed. Sign in with BigModel in ZCode desktop (or this IDE) and ensure Coding Plan is connected.',
 	);

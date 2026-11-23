@@ -14,6 +14,7 @@ import {
 	type ZCodeStoredSession,
 } from './zcodeCredentialsStore';
 import { resetBigModelCodingPlanCache } from './bigmodelCodingPlan';
+import { authorizeSession } from './oauthRenewal';
 
 const SECRET_KEY = 'zcode.session.v1';
 
@@ -51,22 +52,26 @@ export class ZCodeAuthService {
 		return this.session;
 	}
 
-	async signIn(provider?: ZCodeOAuthProvider): Promise<ZCodeStoredSession> {
+	async signIn(provider?: ZCodeOAuthProvider, options?: { force?: boolean }): Promise<ZCodeStoredSession> {
 		await this.waitUntilReady();
 		// A new login (possibly a different account) must not keep serving the
 		// previous account's cached Coding Plan project token.
 		resetBigModelCodingPlanCache();
 
-		// Prefer already-logged-in ZCode desktop credentials on this machine.
-		const existing = await loadZCodeDesktopSession().catch(() => undefined);
-		if (existing && (!provider || existing.provider === provider)) {
-			this.session = existing;
-			await this.secrets.store(SECRET_KEY, JSON.stringify(existing));
-			this._onDidChangeSession.fire();
-			void vscode.window.showInformationMessage(
-				`Using ZCode desktop login (${existing.accountLabel} · ${existing.provider}).`,
-			);
-			return existing;
+		// Prefer already-logged-in ZCode desktop credentials on this machine —
+		// unless the caller knows the stored token is dead (`force`), in which
+		// case reusing it would just reproduce the failure that led here.
+		if (!options?.force) {
+			const existing = await loadZCodeDesktopSession().catch(() => undefined);
+			if (existing && (!provider || existing.provider === provider)) {
+				this.session = existing;
+				await this.secrets.store(SECRET_KEY, JSON.stringify(existing));
+				this._onDidChangeSession.fire();
+				void vscode.window.showInformationMessage(
+					`Using ZCode desktop login (${existing.accountLabel} · ${existing.provider}).`,
+				);
+				return existing;
+			}
 		}
 
 		const picked = provider ?? await this.pickProvider();
@@ -74,14 +79,16 @@ export class ZCodeAuthService {
 			throw new vscode.CancellationError();
 		}
 
-		const session = await vscode.window.withProgress(
-			{
-				location: vscode.ProgressLocation.Notification,
-				title: `Signing in to ZCode (${picked})…`,
-				cancellable: true,
-			},
-			async (_progress, token) => loginWithZCodeCliPolling(picked, token),
-		);
+		const session = options?.force
+			? await authorizeSession(picked)
+			: await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: `Signing in to ZCode (${picked})…`,
+					cancellable: true,
+				},
+				async (_progress, token) => loginWithZCodeCliPolling(picked, token),
+			);
 
 		await saveZCodeDesktopSession(session);
 		this.session = session;
@@ -139,6 +146,7 @@ export class ZCodeAuthService {
 					description: `${this.session.provider} · signed in`,
 					id: 'noop' as const,
 				},
+				{ label: '$(sync) Renew sign-in (re-authorize)', id: 'renew' as const },
 				{ label: '$(refresh) Reload from ZCode desktop', id: 'reload' as const },
 				{ label: '$(sign-out) Sign out (this IDE only)', id: 'out-ide' as const },
 				{ label: '$(trash) Sign out (IDE + ZCode desktop credentials)', id: 'out-all' as const },
@@ -146,6 +154,12 @@ export class ZCodeAuthService {
 			{ title: 'ZCode account' },
 		);
 		if (!action || action.id === 'noop') {
+			return;
+		}
+		if (action.id === 'renew') {
+			// No upstream refresh endpoint exists, so "renew" means a fresh
+			// authorization. It must not silently reuse the stored token.
+			await this.signIn(this.session.provider, { force: true });
 			return;
 		}
 		if (action.id === 'reload') {

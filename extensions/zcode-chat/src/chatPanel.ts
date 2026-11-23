@@ -81,6 +81,7 @@ import {
 	setSelectedReasoningLevel,
 } from './models';
 import { filterSkills, listLocalSkills, prepareComposerTurn } from './localSkills';
+import { OutputSpeedMeter } from './outputSpeed';
 import { loadQuickActions, openQuickActionsConfigFile, watchQuickActionsConfig, type QuickActionDefinition, type TurnOverrides } from './quickActions';
 import {
 	claimManualPlan,
@@ -284,6 +285,17 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private cursorAccountLabel = 'Cursor · checking…';
 	/** Last provider-reported total tokens for the active session (if any). */
 	private reportedUsageTokens?: number;
+	/**
+	 * Live output-speed sampling, one entry per running turn. Keyed by session
+	 * because Workers stream concurrently and a shared meter would blend them.
+	 * Entries exist only while a turn runs; the finished reading lives on the
+	 * turn's meta chip instead, so no timer survives the turn.
+	 */
+	private readonly outputSpeedBySession = new Map<string, {
+		meter: OutputSpeedMeter;
+		lastPushAt: number;
+		published?: number;
+	}>();
 	private claimOffer: ClaimOffer | null = null;
 	private claimError: string | undefined;
 	private claimBusy = false;
@@ -2611,7 +2623,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 					void vscode.window.showWarningMessage(`快捷功能「${action.label}」：思考深度 ${action.reasoningLevel} 不适用于 ${model?.id ?? '当前模型'}，保留当前设置。`);
 				}
 			}
-			if (action.pace && getActiveBrain() !== 'cursor' && (AGENT_PACES as readonly string[]).includes(action.pace)) {
+			// Cursor honors pace too (it rides the prompt contract), so the persistent
+			// path must not drop it — the per-turn overrides path already applies it.
+			if (action.pace && (AGENT_PACES as readonly string[]).includes(action.pace)) {
 				await setAgentPace(action.pace as AgentPace);
 			}
 			this.pushState();
@@ -2646,8 +2660,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				overrides.model = action.model;
 			} else {
 				const provider = this.brainProvider(brain ?? getActiveBrain());
-				if (modelsForProvider(provider).some(m => m.id === action.model)) {
-					overrides.model = action.model;
+				const matched = modelsForProvider(provider)
+					.find(m => m.id.toLowerCase() === action.model!.trim().toLowerCase());
+				if (matched) {
+					overrides.model = matched.id;
 				} else {
 					void vscode.window.showWarningMessage(`快捷功能「${action.label}」：模型 ${action.model} 不在当前列表里，本次回复按当前模型发送。`);
 				}
@@ -2852,6 +2868,8 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.resolveAsk(run.pendingAsk.id, { outcome: 'cancelled' });
 		}
 		this.notifyRouterWorkerAwaiting(sessionId, prompt.title || 'ask user');
+		// Waiting on the user's answer is not generation time.
+		this.pauseOutputSpeed(sessionId);
 		return new Promise(resolve => {
 			const cancel = token.onCancellationRequested(() => {
 				this.resolveAsk(prompt.id, { outcome: 'cancelled' });
@@ -3607,6 +3625,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			pace: (overrides?.pace as AgentPace | undefined) ?? getAgentPace(),
 		};
 
+		this.beginOutputSpeed(runSessionId);
 		this.mutateChat(runSessionId, chat => {
 			// Starting work again re-arms auto-drain; a prior stop/error pause
 			// must not stick across the new turn (and its queued follow-ups).
@@ -3768,6 +3787,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 					chat.queuePaused = true;
 				}
 			});
+			this.finishOutputSpeed(runSessionId);
 			if (runSessionId === this.sessionId) {
 				this.stopElapsedTimer();
 			}
@@ -4593,10 +4613,15 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			.map(m => `${m.role === 'user' ? '用户' : '助手'}: ${m.content.replace(/\s+/g, ' ').slice(0, 400)}`)
 			.join('\n');
 		const brain = getActiveBrain();
+		// A title is not worth a full Cursor ACP turn: it spawns the CLI, spends
+		// plan quota, and rides the exact transport that drops — so the failure was
+		// invisible (.catch swallows it) while the retries still churned. Keep the
+		// provisional title derived from the first message instead.
+		if (brain === 'cursor') {
+			return;
+		}
 		const provider = this.brainProvider(brain);
-		const model = brain === 'cursor'
-			? (getCursorModel() || undefined)
-			: getSelectedModelId(provider);
+		const model = getSelectedModelId(provider);
 		const cancel = new vscode.CancellationTokenSource();
 		try {
 			// Silent side call: no progress handler, no UI rows — title only.
@@ -4651,6 +4676,11 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private applyProgress(sessionId: string, event: AgentProgressEvent): void {
+		if (event.type === 'assistant') {
+			// Sampled before the transcript mutation below: the meter only needs
+			// the text, and the live push is throttled internally.
+			this.noteOutputSpeed(sessionId, event.text);
+		}
 		if (event.type === 'usage') {
 			if (event.totalTokens > 0) {
 				this.reportedUsageTokens = event.totalTokens;
@@ -4670,6 +4700,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// Any real turn progress proves the worker is alive — clears sticky "疑似卡死".
 		this.notifyRouterWorkerActivity(sessionId, event.type);
 		if (event.type === 'tool_start') {
+			// The turn now blocks on the tool: stop charging that wall time to the
+			// model's output rate, or a long command would read as a slow model.
+			this.pauseOutputSpeed(sessionId);
 			this.noteRouterToolStart(sessionId);
 		} else if (event.type === 'tool_end') {
 			this.noteRouterToolEnd(sessionId);
@@ -4959,6 +4992,93 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 		const [row] = chat.items.splice(idx, 1);
 		chat.items.push(row);
+	}
+
+	/** Live readings are pushed at most this often: 5s keeps the chip useful
+	 *  without repainting the transcript per token. */
+	private static readonly SPEED_PUSH_MS = 5000;
+
+	/** Meta of the most recent user turn — the chip that shows model + settings. */
+	private turnMetaFor(items: readonly ConversationItem[]): UserTurnMeta | undefined {
+		for (let i = items.length - 1; i >= 0; i--) {
+			const item = items[i];
+			if (item.kind === 'user' && item.meta) {
+				return item.meta;
+			}
+		}
+		return undefined;
+	}
+
+	/** Arms speed sampling for a new turn; any previous reading is dropped. */
+	private beginOutputSpeed(sessionId: string): void {
+		this.outputSpeedBySession.set(sessionId, { meter: new OutputSpeedMeter(), lastPushAt: 0 });
+	}
+
+	/** Feeds streamed reply text to the meter, pushing a live reading at most
+	 *  once per SPEED_PUSH_MS. Nothing runs between updates — no timer. */
+	private noteOutputSpeed(sessionId: string, text: string): void {
+		const run = this.outputSpeedBySession.get(sessionId);
+		if (!run) {
+			return;
+		}
+		const now = Date.now();
+		run.meter.note(text, now);
+		if (now - run.lastPushAt < ZCodeChatViewProvider.SPEED_PUSH_MS) {
+			return;
+		}
+		const sample = run.meter.sample();
+		if (!sample) {
+			return;
+		}
+		run.lastPushAt = now;
+		this.publishOutputSpeed(sessionId, run, sample.tokensPerSec, true);
+	}
+
+	/** Ends the current streaming segment: the turn is blocked on a tool or on
+	 *  the user, and that wall time must not count against the model's rate. */
+	private pauseOutputSpeed(sessionId: string): void {
+		this.outputSpeedBySession.get(sessionId)?.meter.pause();
+	}
+
+	/**
+	 * Stops sampling a finished turn: the last reading stays on the chip and the
+	 * per-turn budget is released, so a completed task costs nothing afterwards.
+	 */
+	private finishOutputSpeed(sessionId: string): void {
+		const run = this.outputSpeedBySession.get(sessionId);
+		if (!run) {
+			return;
+		}
+		this.outputSpeedBySession.delete(sessionId);
+		const sample = run.meter.sample();
+		if (sample) {
+			this.publishOutputSpeed(sessionId, run, sample.tokensPerSec, false);
+		}
+	}
+
+	/** Writes a reading onto the turn's meta chip and repaints only if visible. */
+	private publishOutputSpeed(
+		sessionId: string,
+		run: { published?: number },
+		tokensPerSec: number,
+		live: boolean,
+	): void {
+		const rounded = Math.round(tokensPerSec * 10) / 10;
+		if (!live && run.published === rounded) {
+			return;
+		}
+		run.published = rounded;
+		const applied = this.mutateChat(sessionId, chat => {
+			const meta = this.turnMetaFor(chat.items);
+			if (!meta) {
+				return;
+			}
+			meta.tokensPerSec = rounded;
+			meta.speedLive = live;
+		});
+		if (applied && sessionId === this.sessionId) {
+			this.pushState();
+		}
 	}
 
 	private startElapsedTimer(): void {

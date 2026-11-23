@@ -94,7 +94,7 @@
         },
         "zcode.model": {
           "type": "string",
-          "default": "GLM-5.3-Flash",
+          "default": "glm-5.4",
           "description": "%config.model%"
         },
         "zcode.deepseek.baseUrl": {
@@ -181,6 +181,11 @@
           "type": "string",
           "default": "https://zcode.z.ai",
           "description": "%config.oauth.apiOrigin%"
+        },
+        "zcode.auth.autoRenew": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.auth.autoRenew%"
         },
         "zcode.unsplashAccessKey": {
           "type": "string",
