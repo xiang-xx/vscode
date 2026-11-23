@@ -93,23 +93,58 @@ export async function getCursorAuthStatus(): Promise<CursorAuthStatus> {
 	};
 }
 
+/**
+ * `agent --list-models` hits api2.cursor.sh over the network, so proxies
+ * intermittently kill the TLS handshake (`[aborted] Client network socket
+ * disconnected...`, exit 1). Retry a few times before surfacing the failure,
+ * and never mine model ids out of the error text (the old parser happily
+ * turned "Failed to load models: ..." into a bogus model named "Failed").
+ */
+const LIST_MODELS_ATTEMPTS = 3;
+
 export async function listCursorModels(): Promise<string[]> {
-	const result = await runAgent(['--list-models'], 20_000);
-	const text = `${result.stdout}\n${result.stderr}`;
-	if (/authentication required|not logged in/i.test(text)) {
-		return [];
+	let lastText = '';
+	for (let attempt = 1; attempt <= LIST_MODELS_ATTEMPTS; attempt++) {
+		const result = await runAgent(['--list-models'], 20_000);
+		const text = `${result.stdout}\n${result.stderr}`;
+		if (/authentication required|not logged in/i.test(text)) {
+			return [];
+		}
+		if (result.code === 0) {
+			return parseModelLines(text);
+		}
+		lastText = text;
+		if (attempt < LIST_MODELS_ATTEMPTS) {
+			await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+		}
 	}
+	const firstLine = lastText.split(/\r?\n/).map(l => l.trim()).find(l => l) || '';
+	const reason = firstLine || (lastText ? 'empty output' : 'no output from agent CLI');
+	throw new Error(`agent --list-models failed: ${reason.slice(0, 300)}`);
+}
+
+function parseModelLines(text: string): string[] {
 	const models: string[] = [];
-	for (const line of text.split(/\r?\n/)) {
-		const trimmed = line.trim();
-		if (!trimmed || /^error/i.test(trimmed) || /^usage:/i.test(trimmed)) {
+	for (const raw of text.split(/\r?\n/)) {
+		// Cursor embeds zero-width/bidi noise in its output; strip before parsing.
+		const line = raw.replace(/[\u200B-\u200D\uFEFF\u2060\u202A-\u202E]/g, '').trim();
+		if (!line || /^error/i.test(line) || /^usage:/i.test(line)) {
 			continue;
 		}
-		// Typical lines: "model-id" or "model-id - description"
-		const id = trimmed.split(/\s+/)[0];
-		if (id && /^[a-zA-Z0-9][\w.\[\]=,-]*$/.test(id) && id.length > 1) {
-			models.push(id);
+		// Header/footer prose lines that are not model rows.
+		if (/^available models$/i.test(line) || /^tip\b/i.test(line)) {
+			continue;
 		}
+		// Model rows are "model-id - Label" (or a bare id with no spaces).
+		const id = line.split(/\s+/)[0];
+		if (!id || id.length <= 1 || !/^[a-zA-Z0-9][\w.\[\]=,-]*$/.test(id)) {
+			continue;
+		}
+		const rest = line.slice(id.length).trim();
+		if (rest && !rest.startsWith('-')) {
+			continue;
+		}
+		models.push(id);
 	}
 	return [...new Set(models)];
 }

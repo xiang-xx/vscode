@@ -8,6 +8,7 @@
 export type ChromeBrowserDataImportError =
 	| 'chrome_profile_not_found'
 	| 'chrome_profile_ambiguous'
+	| 'chrome_profile_access_denied'
 	| 'chrome_executable_not_found'
 	| 'chrome_cookie_access_denied'
 	| 'chrome_cookie_elevation_required'

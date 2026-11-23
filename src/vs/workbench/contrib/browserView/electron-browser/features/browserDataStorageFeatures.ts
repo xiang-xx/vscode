@@ -18,7 +18,7 @@ import type { ServicesAccessor } from '../../../../../platform/instantiation/com
 import { DisposableStore } from '../../../../../base/common/lifecycle.js';
 import { INotificationService, Severity } from '../../../../../platform/notification/common/notification.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
-import { isWindows } from '../../../../../base/common/platform.js';
+import { isMacintosh, isWindows } from '../../../../../base/common/platform.js';
 
 export const CONTEXT_BROWSER_STORAGE_SCOPE = new RawContextKey<string>('browserStorageScope', '', localize('browser.storageScope', "The storage scope of the current browser view"));
 
@@ -216,7 +216,11 @@ class ImportChromeBrowserDataAction extends Action2 {
 			? localize('browser.importChrome.accessDenied', "Chrome cookie access was denied (Keychain / OS permission). No data was imported.")
 			: error === 'chrome_profile_not_found' || error === 'chrome_executable_not_found'
 				? localize('browser.importChrome.notFound', "Could not find a local Chrome profile to import from.")
-				: error === 'chrome_cookie_protection_unsupported'
+				: error === 'chrome_profile_access_denied'
+					? isMacintosh
+						? localize('browser.importChrome.profileAccessDenied.mac', "Chrome was found, but macOS blocked access to its profile data. Grant this app Full Disk Access (System Settings > Privacy & Security > Full Disk Access), restart the app, then sync again.")
+						: localize('browser.importChrome.profileAccessDenied', "Chrome was found, but the operating system denied access to its profile data. Check permissions on Chrome's user data directory, then sync again.")
+					: error === 'chrome_cookie_protection_unsupported'
 					? localize('browser.importChrome.protected', "Some Chrome cookies are App-Bound protected and could not be imported. LocalStorage may still have been imported.")
 					: localize('browser.importChrome.failed', "Chrome data import failed ({0}).", error);
 		notificationService.notify({ severity: Severity.Warning, message });

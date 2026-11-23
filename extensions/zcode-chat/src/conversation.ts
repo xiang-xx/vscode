@@ -86,12 +86,21 @@ export interface RouterDispatchFile {
 	removed: number;
 }
 
+/** Effective model settings stamped on a user message at send time, so the
+ *  timeline can show 模型 / 思考深度 under every sent message. */
+export interface UserTurnMeta {
+	model?: string;
+	reasoningLevel?: string;
+	pace?: string;
+}
+
 export type ConversationItem =
 	| {
 		id: string;
 		kind: 'user';
 		text: string;
 		attachments?: UserAttachmentRef[];
+		meta?: UserTurnMeta;
 		/** Set when the turn arrived from a phone bridge (Feishu), so the
 		 *  desktop view can badge it; it never changes model-side behavior. */
 		origin?: 'feishu';

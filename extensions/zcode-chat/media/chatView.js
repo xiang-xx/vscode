@@ -1618,6 +1618,11 @@
 		if (!bubble || bubble.dataset.key !== key) {
 			return false;
 		}
+		const metaEl = el.querySelector('.user-turn-meta');
+		const nextMeta = userMetaKey(item.meta);
+		if ((metaEl ? metaEl.getAttribute('data-meta') || '' : '') !== nextMeta) {
+			return false;
+		}
 		syncRowActions(el, actions.rewind.has(item.id) ? ['rewind'] : [], true);
 		return true;
 	}
@@ -1960,6 +1965,15 @@
 				bubble.appendChild(list);
 			}
 			row.appendChild(bubble);
+			const metaLabel = userMetaLabel(item.meta);
+			if (metaLabel) {
+				const metaEl = document.createElement('div');
+				metaEl.className = 'user-origin-chip user-turn-meta';
+				metaEl.setAttribute('data-meta', userMetaKey(item.meta));
+				metaEl.textContent = `⚙ ${metaLabel}`;
+				metaEl.title = `本轮发送设置：${metaLabel}`;
+				row.appendChild(metaEl);
+			}
 			const actions = document.createElement('div');
 			actions.className = 'turn-actions';
 			actions.hidden = !!(state && state.busy);
@@ -3336,6 +3350,30 @@
 
 	let timelineContentKey = '';
 
+	function userMetaKey(meta) {
+		if (!meta) {
+			return '';
+		}
+		return `${meta.model || ''}:${meta.reasoningLevel || ''}:${meta.pace || ''}`;
+	}
+
+	function userMetaLabel(meta) {
+		if (!meta) {
+			return '';
+		}
+		const parts = [];
+		if (meta.model) {
+			parts.push(meta.model);
+		}
+		if (meta.reasoningLevel) {
+			parts.push(`思考 ${meta.reasoningLevel}`);
+		}
+		if (meta.pace) {
+			parts.push(meta.pace);
+		}
+		return parts.join(' · ');
+	}
+
 	function timelineKey(items) {
 		return (items || []).map((item) => {
 			if (item.kind === 'work') {
@@ -3351,7 +3389,7 @@
 				return `${item.id}|a|${item.streaming ? 1 : 0}|${item.text || ''}`;
 			}
 			if (item.kind === 'user') {
-				return `${item.id}|u|${item.text || ''}|${JSON.stringify(item.attachments || [])}`;
+				return `${item.id}|u|${item.text || ''}|${JSON.stringify(item.attachments || [])}|${userMetaKey(item.meta)}`;
 			}
 			if (item.kind === 'question') {
 				return `${item.id}|q|${item.status || ''}|${JSON.stringify(item.answers || '')}`;
@@ -4927,11 +4965,21 @@
 			e.stopPropagation();
 			if (!state) return;
 			const models = (state.models && state.models.length)
-				? state.models
+				? state.models.slice()
 				: [{ id: '', label: 'CLI default' }];
-			openPicker('cursorModel', models, state.model || '', (id) =>
-				vscode.postMessage({ type: 'setCursorModel', model: id }),
-			);
+			// An empty list (or a failed refresh, even with cached entries left)
+			// usually means the CLI's network call to api2.cursor.sh dropped
+			// (proxy killed the TLS handshake); offer an in-place retry.
+			if (state.cursorModelError || !state.models || !state.models.length) {
+				models.unshift({ id: '__cursor_refresh_models__', label: '⟳ 重新加载模型列表' });
+			}
+			openPicker('cursorModel', models, state.model || '', (id) => {
+				if (id === '__cursor_refresh_models__') {
+					vscode.postMessage({ type: 'refreshCursorModels' });
+					return;
+				}
+				vscode.postMessage({ type: 'setCursorModel', model: id });
+			});
 		});
 	}
 	sendBtn.addEventListener('click', send);

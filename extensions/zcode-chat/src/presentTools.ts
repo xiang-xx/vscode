@@ -33,9 +33,6 @@ export class DeliverableTracker {
 		const abs = path.isAbsolute(trimmed) ? trimmed : path.resolve(root, trimmed);
 		const normRoot = path.resolve(root);
 		const norm = path.resolve(abs);
-		if (norm !== normRoot && !norm.startsWith(normRoot + path.sep)) {
-			return new Error(`path escapes workspace: ${filePath}`);
-		}
 		try {
 			const st = await fs.stat(norm);
 			if (!st.isFile()) {
@@ -50,8 +47,10 @@ export class DeliverableTracker {
 		if (this.items.length >= MAX_DELIVERABLES) {
 			return new Error(`too many deliverables (max ${MAX_DELIVERABLES})`);
 		}
+		const relative = path.relative(normRoot, norm);
 		const item: Deliverable = {
-			label: path.relative(normRoot, norm) || norm,
+			// Outside-workspace deliverables keep their absolute path as the label.
+			label: !relative || relative.startsWith('..') ? norm : relative,
 			absPath: norm,
 			uri: vscode.Uri.file(norm).toString(),
 			description: description.trim(),

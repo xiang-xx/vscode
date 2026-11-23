@@ -67,6 +67,7 @@ import {
 	type DispatchStatus,
 	type TodoItem,
 	type UserAttachmentRef,
+	type UserTurnMeta,
 } from './conversation';
 import { listCursorModels } from './cursorAuth';
 import {
@@ -80,7 +81,7 @@ import {
 	setSelectedReasoningLevel,
 } from './models';
 import { filterSkills, listLocalSkills, prepareComposerTurn } from './localSkills';
-import { loadQuickActions, openQuickActionsConfigFile, watchQuickActionsConfig, type QuickActionDefinition } from './quickActions';
+import { loadQuickActions, openQuickActionsConfigFile, watchQuickActionsConfig, type QuickActionDefinition, type TurnOverrides } from './quickActions';
 import {
 	claimManualPlan,
 	fetchAccountQuota,
@@ -196,6 +197,8 @@ interface QueuedMessage {
 	id: string;
 	text: string;
 	attachments: AttachmentChip[];
+	/** Quick-reply pins waiting for this queued message's turn (one-shot). */
+	overrides?: TurnOverrides;
 }
 
 /** Mutable chat fields shared by the active view and parked background sessions. */
@@ -223,7 +226,7 @@ interface SessionRun {
 		resolve: (result: AskUserResult) => void;
 	};
 	/** Prefer this text on the next idle tick (send-now / interrupt). */
-	pendingForceSend?: { content: string; text: string; attachments: AttachmentChip[] };
+	pendingForceSend?: { content: string; text: string; attachments: AttachmentChip[]; overrides?: TurnOverrides };
 }
 
 function getAttachmentDir(): string {
@@ -274,6 +277,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 
 	private fileChanges: FileChangeView[] = [];
 	private cursorModels: string[] = [];
+	/** Last listCursorModels() failure, surfaced in the model picker as a retry hint. */
+	private cursorModelError = '';
+	/** Last good `agent --list-models` output; survives reloads and offline spells. */
+	private readonly cursorModelsCacheKey = 'zcode.chat.cursorModelsCache';
 	private cursorAccountLabel = 'Cursor · checking…';
 	/** Last provider-reported total tokens for the active session (if any). */
 	private reportedUsageTokens?: number;
@@ -420,6 +427,10 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		return this.isRunning(this.sessionId);
 	}
 
+	// 侧栏可见性：retainContextWhenHidden 下隐藏的 webview 不再接收周期推送，
+	// 否则渲染进程会被一个隐藏面板持续占满一整核（CPU 回归的根因）。
+	private panelVisible = false;
+	private stateDirty = false;
 	private scheduleTipTimer?: ReturnType<typeof setInterval>;
 	private readonly mascotVoice: MascotVoice;
 
@@ -434,6 +445,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		this.seenNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(QUOTA_NOTICE_SEEN_KEY)));
 		this.seenClaimNotices = new Set(readSeenQuotaNotices(this.globalState.get<string[]>(CLAIM_NOTICE_SEEN_KEY)));
 		this.scenePersisted = readPersistedChatScene(this.globalState.get(CHAT_SCENE_STATE_KEY));
+		// Hydrate the last good Cursor model list so the picker is usable even
+		// when the CLI's network call to api2.cursor.sh is flaking at startup.
+		const cachedModels = this.globalState.get<unknown>(this.cursorModelsCacheKey);
+		if (Array.isArray(cachedModels)) {
+			this.cursorModels = [...new Set(cachedModels.filter((id): id is string =>
+				typeof id === 'string' && /^[a-zA-Z0-9][\w.\[\]=,-]*$/.test(id) && id.length > 1))];
+		}
 		this.mascotVoice = new MascotVoice(globalState);
 		// Standalone desktop pet (apps/mascot-desktop): loopback event bridge.
 		// Module singleton, so extra panels reuse the first server; harmless
@@ -567,7 +585,16 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private async refreshCursorMeta(): Promise<void> {
 		this.cursorAccountLabel = await getCursorBrainStatusLine();
 		if (getActiveBrain() === 'cursor') {
-			this.cursorModels = await listCursorModels().catch(() => []);
+			try {
+				this.cursorModels = await listCursorModels();
+				this.cursorModelError = '';
+				if (this.cursorModels.length) {
+					void this.globalState.update(this.cursorModelsCacheKey, this.cursorModels);
+				}
+			} catch (err) {
+				// Keep any cached list selectable; the picker offers a retry entry.
+				this.cursorModelError = err instanceof Error ? err.message : String(err);
+			}
 		}
 		this.pushState();
 	}
@@ -666,6 +693,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		if (!view) {
 			return;
 		}
+		if (!this.panelVisible) {
+			return;
+		}
 		const payload = this.buildJobsPayload();
 		const serialized = JSON.stringify(payload);
 		if (!force && serialized === this.lastJobsPayload) {
@@ -710,6 +740,22 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		_token: vscode.CancellationToken,
 	): void {
 		this.view = webviewView;
+		this.panelVisible = webviewView.visible;
+		webviewView.onDidChangeVisibility(() => {
+			const visible = webviewView.visible;
+			if (visible === this.panelVisible) {
+				return;
+			}
+			this.panelVisible = visible;
+			if (visible) {
+				// 重新可见：把隐藏期间被抑制的推送一次性补齐。
+				this.pushJobsState(true);
+				if (this.stateDirty) {
+					this.stateDirty = false;
+					this.pushState();
+				}
+			}
+		});
 		this.applyWebviewOptions();
 		webviewView.webview.html = this.renderHtml(webviewView.webview);
 		webviewView.webview.onDidReceiveMessage(async (message) => {
@@ -721,6 +767,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			void this.onJobsPanelMessage(message);
 		});
 		this.startJobsFeed();
+		this.startDispatchElapsedTimer();
 		webviewView.onDidDispose(() => {
 			if (this.scheduleTipTimer) {
 				clearInterval(this.scheduleTipTimer);
@@ -735,6 +782,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				clearTimeout(this.draftUsageTimer);
 				this.draftUsageTimer = undefined;
 			}
+			this.stopElapsedTimer();
+			this.stopDispatchElapsedTimer();
+			this.panelVisible = false;
 			for (const sessionId of [...this.routerTurnKeepalives.keys()]) {
 				this.clearRouterTurnKeepalive(sessionId);
 			}
@@ -991,6 +1041,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			}
 			const source = current?.text ?? '';
 			if (!source) {
+				return;
+			}
+			if (!this.panelVisible) {
 				return;
 			}
 			const tail = source.trim().split('\n').slice(-4).join('\n').slice(-400);
@@ -2029,6 +2082,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushState();
 			return;
 		}
+		if (msg.type === 'refreshCursorModels') {
+			await this.refreshCursorMeta();
+			if (this.cursorModelError) {
+				void vscode.window.showWarningMessage(`Cursor 模型列表加载失败：${this.cursorModelError}`);
+			}
+			return;
+		}
 		if (msg.type === 'setCursorModel' && typeof msg.model === 'string') {
 			await setCursorModel(msg.model);
 			this.pushState();
@@ -2509,9 +2569,12 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	/**
-	 * Apply a ⚡ quick action from ~/.zcode/quick-actions.json: optionally pin
-	 * brain / model / 思考深度 / 思考范围, then send its prompt to the current
-	 * session (enqueued when busy, same as a normal send).
+	 * Apply a ⚡ quick action from ~/.zcode/quick-actions.json.
+	 * WITHOUT a prompt it keeps its documented behavior: persistently pin
+	 * brain / model / 思考深度 / 思考范围 in the composer (只切设置).
+	 * WITH a prompt ("快捷回复") the pins become one-shot overrides for that
+	 * single turn — the composer's selection below the input is never touched,
+	 * so a quick reply never rewrites what the user had selected.
 	 */
 	private async runQuickAction(id: string): Promise<void> {
 		const action: QuickActionDefinition | undefined = loadQuickActions().find(item => item.id === id);
@@ -2519,48 +2582,91 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			this.pushState();
 			return;
 		}
-		if (action.brain && isActiveBrain(action.brain) && getActiveBrain() !== action.brain) {
-			await this.applyBrain(action.brain);
+		const prompt = (action.prompt ?? '').trim();
+		if (!prompt) {
+			if (action.brain && isActiveBrain(action.brain) && getActiveBrain() !== action.brain) {
+				await this.applyBrain(action.brain);
+			}
+			if (action.model) {
+				const brain = getActiveBrain();
+				if (brain === 'cursor') {
+					await setCursorModel(action.model);
+				} else {
+					const provider = this.brainProvider(brain);
+					const catalog = modelsForProvider(provider);
+					if (catalog.some(m => m.id === action.model)) {
+						await setSelectedModelId(action.model);
+						await ensureReasoningLevelForModel(provider, action.model);
+					} else {
+						void vscode.window.showWarningMessage(`快捷功能「${action.label}」：模型 ${action.model} 不在当前列表里，保留当前模型。`);
+					}
+				}
+			}
+			if (action.reasoningLevel && getActiveBrain() !== 'cursor') {
+				const provider = this.brainProvider(getActiveBrain());
+				const model = modelsForProvider(provider).find(m => m.id === getSelectedModelId(provider));
+				if (model?.reasoningLevels.includes(action.reasoningLevel)) {
+					await setSelectedReasoningLevel(action.reasoningLevel);
+				} else {
+					void vscode.window.showWarningMessage(`快捷功能「${action.label}」：思考深度 ${action.reasoningLevel} 不适用于 ${model?.id ?? '当前模型'}，保留当前设置。`);
+				}
+			}
+			if (action.pace && getActiveBrain() !== 'cursor' && (AGENT_PACES as readonly string[]).includes(action.pace)) {
+				await setAgentPace(action.pace as AgentPace);
+			}
+			this.pushState();
+			return;
+		}
+		const overrides = this.resolveQuickActionOverrides(action);
+		this.draftText = prompt;
+		this.noteDesktopPetUserMessage(prompt);
+		if (this.busy) {
+			await this.enqueueMessage(prompt, undefined, overrides);
+		} else {
+			await this.handleSend(prompt, undefined, overrides);
+		}
+	}
+
+	/**
+	 * Resolve a quick action's pins into per-turn overrides. Validation mirrors
+	 * the persistent path (unknown model / level → warning + fallback to the
+	 * composer's current selection), but nothing is ever written back into the
+	 * global model / reasoning / pace state.
+	 */
+	private resolveQuickActionOverrides(action: QuickActionDefinition): TurnOverrides {
+		const overrides: TurnOverrides = {};
+		const brain = action.brain && isActiveBrain(action.brain) && action.brain !== getActiveBrain()
+			? action.brain
+			: undefined;
+		if (brain) {
+			overrides.brain = brain;
 		}
 		if (action.model) {
-			const brain = getActiveBrain();
-			if (brain === 'cursor') {
-				await setCursorModel(action.model);
+			if ((brain ?? getActiveBrain()) === 'cursor') {
+				overrides.model = action.model;
 			} else {
-				const provider = this.brainProvider(brain);
-				const catalog = modelsForProvider(provider);
-				if (catalog.some(m => m.id === action.model)) {
-					await setSelectedModelId(action.model);
-					await ensureReasoningLevelForModel(provider, action.model);
+				const provider = this.brainProvider(brain ?? getActiveBrain());
+				if (modelsForProvider(provider).some(m => m.id === action.model)) {
+					overrides.model = action.model;
 				} else {
-					void vscode.window.showWarningMessage(`快捷功能「${action.label}」：模型 ${action.model} 不在当前列表里，保留当前模型。`);
+					void vscode.window.showWarningMessage(`快捷功能「${action.label}」：模型 ${action.model} 不在当前列表里，本次回复按当前模型发送。`);
 				}
 			}
 		}
-		if (action.reasoningLevel && getActiveBrain() !== 'cursor') {
-			const provider = this.brainProvider(getActiveBrain());
-			const model = modelsForProvider(provider).find(m => m.id === getSelectedModelId(provider));
+		if (action.reasoningLevel && (brain ?? getActiveBrain()) !== 'cursor') {
+			const provider = this.brainProvider(brain ?? getActiveBrain());
+			const modelId = overrides.model ?? getSelectedModelId(provider);
+			const model = modelsForProvider(provider).find(m => m.id === modelId);
 			if (model?.reasoningLevels.includes(action.reasoningLevel)) {
-				await setSelectedReasoningLevel(action.reasoningLevel);
+				overrides.reasoningLevel = action.reasoningLevel;
 			} else {
-				void vscode.window.showWarningMessage(`快捷功能「${action.label}」：思考深度 ${action.reasoningLevel} 不适用于 ${model?.id ?? '当前模型'}，保留当前设置。`);
+				void vscode.window.showWarningMessage(`快捷功能「${action.label}」：思考深度 ${action.reasoningLevel} 不适用于 ${model?.id ?? '当前模型'}，本次回复按当前设置发送。`);
 			}
 		}
-		if (action.pace && getActiveBrain() !== 'cursor' && (AGENT_PACES as readonly string[]).includes(action.pace)) {
-			await setAgentPace(action.pace as AgentPace);
+		if (action.pace && (AGENT_PACES as readonly string[]).includes(action.pace)) {
+			overrides.pace = action.pace;
 		}
-		const prompt = (action.prompt ?? '').trim();
-		if (prompt) {
-			this.draftText = prompt;
-			this.noteDesktopPetUserMessage(prompt);
-			if (this.busy) {
-				await this.enqueueMessage(prompt);
-			} else {
-				await this.handleSend(prompt);
-			}
-			return;
-		}
-		this.pushState();
+		return overrides;
 	}
 
 	private async handlePlusAction(actionId: string, slash?: string): Promise<void> {
@@ -2806,7 +2912,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private async enqueueMessage(raw: string, pendingAttachments?: AttachmentChip[]): Promise<void> {
+	private async enqueueMessage(raw: string, pendingAttachments?: AttachmentChip[], overrides?: TurnOverrides): Promise<void> {
 		const chips = pendingAttachments ?? this.attachments;
 		const attachmentBlock = formatAttachmentBlock(chips);
 		const text = `${attachmentBlock}${raw}`.trim();
@@ -2823,6 +2929,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			id: newItemId('queue'),
 			text: raw.trim() || text,
 			attachments: [...chips],
+			...(overrides ? { overrides } : {}),
 		});
 		if (!pendingAttachments) {
 			this.attachments = [];
@@ -2846,12 +2953,13 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 					content: `${formatAttachmentBlock(item.attachments)}${item.text}`.trim(),
 					text: item.text,
 					attachments: item.attachments,
+					overrides: item.overrides,
 				};
 				run.cancel.cancel();
 			}
 			return;
 		}
-		await this.handleSend(item.text, item.attachments);
+		await this.handleSend(item.text, item.attachments, item.overrides);
 	}
 
 	private async flushQueue(sessionId: string | undefined): Promise<void> {
@@ -2877,7 +2985,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		// now that the worker actually picked the task up. promoteQueuedDispatch
 		// ignores the Router's own session id, so this covers both branches.
 		this.promoteQueuedDispatch(sessionId);
-		await this.startTurn(sessionId, `${formatAttachmentBlock(next.attachments)}${next.text}`.trim(), { text: next.text, attachments: next.attachments });
+		await this.startTurn(sessionId, `${formatAttachmentBlock(next.attachments)}${next.text}`.trim(), { text: next.text, attachments: next.attachments }, undefined, undefined, next.overrides);
 	}
 
 	private captureView(): MutableChat {
@@ -3209,7 +3317,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		return true;
 	}
 
-	private async handleSend(text: string, pendingAttachments?: AttachmentChip[]): Promise<void> {
+	private async handleSend(text: string, pendingAttachments?: AttachmentChip[], overrides?: TurnOverrides): Promise<void> {
 		if (!this.sessionId) {
 			return;
 		}
@@ -3225,7 +3333,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				await this.mirrorWorkerFollowUpToRouter(text, this.sessionId, true)
 					.catch(err => console.warn('[zcode-chat] mirror follow-up failed:', err));
 			}
-			await this.enqueueMessage(text, pendingAttachments);
+			await this.enqueueMessage(text, pendingAttachments, overrides);
 			return;
 		}
 		// Router dispatches (new worker or follow-up) never queue: a leaked run
@@ -3334,7 +3442,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		}
 
 		this.safePushState({ clearDraft: true });
-		await this.startTurn(this.sessionId, content, { text: prepared.displayText, attachments });
+		await this.startTurn(this.sessionId, content, { text: prepared.displayText, attachments }, undefined, undefined, overrides);
 	}
 
 	/** Local slash replies (/skill list, unknown skill) stay in the timeline. */
@@ -3459,7 +3567,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	private async startTurn(runSessionId: string, content: string, display?: { text?: string; attachments?: AttachmentChip[]; origin?: 'feishu' }, reuseUserId?: string, onStarted?: (userId: string) => void): Promise<void> {
+	private async startTurn(runSessionId: string, content: string, display?: { text?: string; attachments?: AttachmentChip[]; origin?: 'feishu' }, reuseUserId?: string, onStarted?: (userId: string) => void, overrides?: TurnOverrides): Promise<void> {
 		// Direct dispatches (router submit / idle worker) are unaffected; only
 		// queued follow-ups have a matching "queued" card waiting to flip.
 		this.promoteQueuedDispatch(runSessionId);
@@ -3485,17 +3593,35 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 		const attachmentRefs = this.toAttachmentRefs(display?.attachments);
 		let sentUserId = reuseUserId ?? '';
 
+		// Resolve this turn's effective model settings up front: quick-reply
+		// overrides win, otherwise whatever the composer currently has. The
+		// result is stamped onto the user item so the timeline can show it.
+		const brain = (overrides?.brain as ActiveBrain | undefined) ?? getActiveBrain();
+		const provider = this.brainProvider(brain);
+		const model = overrides?.model
+			?? (brain === 'cursor' ? (getCursorModel() || undefined) : getSelectedModelId(provider));
+		const reasoningLevel = overrides?.reasoningLevel ?? getSelectedReasoningLevel(provider, model ?? getSelectedModelId(provider));
+		const turnMeta: UserTurnMeta = {
+			...(model ? { model } : {}),
+			reasoningLevel,
+			pace: (overrides?.pace as AgentPace | undefined) ?? getAgentPace(),
+		};
+
 		this.mutateChat(runSessionId, chat => {
 			// Starting work again re-arms auto-drain; a prior stop/error pause
 			// must not stick across the new turn (and its queued follow-ups).
 			chat.queuePaused = false;
 			const reused = reuseUserId
-				? chat.items.find(item => item.id === reuseUserId && item.kind === 'user')
+				? chat.items.find((item): item is Extract<ConversationItem, { kind: 'user' }> => item.id === reuseUserId && item.kind === 'user')
 				: undefined;
 			const userId = reused ? reused.id : newItemId('user');
 			sentUserId = userId;
 			if (!reused) {
-				chat.items.push({ id: userId, kind: 'user', text: displayText, attachments: attachmentRefs, ...(display?.origin ? { origin: display.origin } : {}) });
+				chat.items.push({ id: userId, kind: 'user', text: displayText, attachments: attachmentRefs, meta: turnMeta, ...(display?.origin ? { origin: display.origin } : {}) });
+			} else {
+				// Retry reuses the id — restamp so the chip reflects the settings
+				// this new attempt actually runs with.
+				reused.meta = turnMeta;
 			}
 			this.fileEdits.beginCheckpoint(userId, runSessionId);
 			// New user turn: drop the previous Tasks panel so it does not stay
@@ -3536,12 +3662,6 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			return;
 		}
 
-		const brain = getActiveBrain();
-		const provider = this.brainProvider(brain);
-		const model = brain === 'cursor'
-			? (getCursorModel() || undefined)
-			: getSelectedModelId(provider);
-		const reasoningLevel = getSelectedReasoningLevel(provider, model ?? getSelectedModelId(provider));
 		const history: ChatMessage[] = snapshot.items
 			.filter((item): item is Extract<ConversationItem, { kind: 'user' | 'assistant' | 'summary' }> =>
 				item.kind === 'user'
@@ -3591,7 +3711,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				workspaceRoot: workspaceRoot(),
 				initialTodos,
 				sessionAwareness,
-				agentPace: getAgentPace(),
+				agentPace: (overrides?.pace as AgentPace | undefined) ?? getAgentPace(),
 				promptPreamble: buildPromptPreamble(workspaceRoot()),
 				onProgress: event => this.applyProgress(runSessionId, event),
 				askUser: (prompt, token) => this.waitForAsk(runSessionId, prompt, token),
@@ -3691,7 +3811,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				this.mutateChat(runSessionId, chat => {
 					chat.queuePaused = false;
 				});
-				void this.startTurn(runSessionId, force.content, { text: force.text, attachments: force.attachments });
+				void this.startTurn(runSessionId, force.content, { text: force.text, attachments: force.attachments }, undefined, undefined, force.overrides);
 			} else if (!cancelled && !turnFailed && this.sessionHasPendingQueue(runSessionId)) {
 				void this.flushQueue(runSessionId);
 			}
@@ -4844,7 +4964,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	private startElapsedTimer(): void {
 		this.stopElapsedTimer();
 		this.elapsedTimer = setInterval(() => {
-			if (!this.busy || !this.activeWorkId || !this.turnStartedAt) {
+			if (!this.panelVisible || !this.busy || !this.activeWorkId || !this.turnStartedAt) {
 				return;
 			}
 			const chat = this.captureView();
@@ -4909,7 +5029,9 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 				return;
 			}
 			this.tickDispatchLiveOutputs();
-			this.pushState();
+			if (this.panelVisible) {
+				this.pushState();
+			}
 		}, 1000);
 	}
 
@@ -5106,6 +5228,14 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private pushState(extra?: { clearDraft?: boolean; insertText?: string; openPlus?: boolean; focusInput?: boolean }): void {
+		if (!this.panelVisible) {
+			// 隐藏期间只置脏标记，重新可见时补推一次；
+			// 桌面宠物联动不依赖 webview，保持工作。
+			this.shareActivityWithDesktopPet();
+			this.stateDirty = true;
+			return;
+		}
+		this.stateDirty = false;
 		const brain = getActiveBrain();
 		const provider = this.brainProvider(brain);
 		const modelId = getSelectedModelId(provider);
@@ -5194,6 +5324,7 @@ export class ZCodeChatViewProvider implements vscode.WebviewViewProvider {
 			})),
 			model: brain === 'cursor' ? cursorModel : modelId,
 			models: brain === 'cursor' ? cursorModels : models,
+			cursorModelError: this.cursorModelError,
 			cursorMode,
 			cursorModes: [
 				{ id: 'agent' as CursorAgentMode, label: 'Agent' },

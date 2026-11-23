@@ -28,6 +28,19 @@ export interface QuickActionDefinition {
 	prompt?: string;
 }
 
+/**
+ * One-shot per-turn overrides for a quick reply (an action WITH a prompt).
+ * Resolved from the action's pins but never written back into the global
+ * selection — the composer's own 模型 / 思考深度 / 思考范围 stays untouched.
+ */
+export interface TurnOverrides {
+	brain?: string;
+	model?: string;
+	reasoningLevel?: string;
+	/** fast / balanced / thorough */
+	pace?: string;
+}
+
 const MAX_ACTIONS = 30;
 const MAX_FILE_BYTES = 256 * 1024;
 const MAX_LABEL_CHARS = 60;

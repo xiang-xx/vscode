@@ -2076,7 +2076,7 @@ async function executeTool(
 				};
 			}
 			case 'write_file': {
-				const filePath = resolvePath(String(args.path ?? ''), root);
+				const filePath = resolveWorkspacePath(String(args.path ?? ''), root);
 				const pathLabel = rel(filePath, root);
 				const blocked = await assertWritableFresh(filePath, pathLabel, sessionId, readFileState);
 				if (blocked) {
@@ -2109,7 +2109,7 @@ async function executeTool(
 				};
 			}
 			case 'str_replace': {
-				const filePath = resolvePath(String(args.path ?? ''), root);
+				const filePath = resolveWorkspacePath(String(args.path ?? ''), root);
 				const pathLabel = rel(filePath, root);
 				const blocked = await assertWritableFresh(filePath, pathLabel, sessionId, readFileState);
 				if (blocked) {
@@ -2160,7 +2160,7 @@ async function executeTool(
 				};
 			}
 			case 'delete_file': {
-				const filePath = resolvePath(String(args.path ?? ''), root);
+				const filePath = resolveWorkspacePath(String(args.path ?? ''), root);
 				const pathLabel = rel(filePath, root);
 				const uri = vscode.Uri.file(filePath);
 				const blocked = await assertWritableFresh(filePath, pathLabel, sessionId, readFileState);
@@ -2246,14 +2246,23 @@ async function executeTool(
 	}
 }
 
+/**
+ * Resolve a tool path. Read tools may target anywhere on disk; only write
+ * tools are fenced to the workspace via resolveWorkspacePath.
+ */
 function resolvePath(input: string, root: string): string {
 	const trimmed = input.trim();
 	if (!trimmed) {
 		return root;
 	}
 	const absolute = path.isAbsolute(trimmed) ? trimmed : path.resolve(root, trimmed);
+	return path.resolve(absolute);
+}
+
+/** Write tools (write_file/str_replace/delete_file) must stay inside the workspace. */
+function resolveWorkspacePath(input: string, root: string): string {
+	const normalized = resolvePath(input, root);
 	const normalizedRoot = path.resolve(root) + path.sep;
-	const normalized = path.resolve(absolute);
 	if (normalized !== path.resolve(root) && !normalized.startsWith(normalizedRoot)) {
 		throw new Error(`Path escapes workspace: ${input}`);
 	}
@@ -2261,7 +2270,12 @@ function resolvePath(input: string, root: string): string {
 }
 
 function rel(filePath: string, root: string): string {
-	return path.relative(root, filePath) || '.';
+	const relative = path.relative(root, filePath);
+	if (!relative) {
+		return '.';
+	}
+	// Outside-workspace targets keep their absolute path as the label.
+	return relative.startsWith('..') ? filePath : relative;
 }
 
 const DEFAULT_SEARCH_EXCLUDE =
@@ -2660,9 +2674,6 @@ async function executeDiagnostics(
 
 	if (pathArg) {
 		const filePath = resolvePath(pathArg, root);
-		if (!filePath.startsWith(root)) {
-			return { summary: 'path outside workspace', content: `Error: Path outside workspace: ${pathArg}` };
-		}
 		const uri = vscode.Uri.file(filePath);
 		const label = rel(filePath, root);
 		const diags = vscode.languages.getDiagnostics(uri)

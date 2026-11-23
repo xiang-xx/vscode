@@ -475,6 +475,12 @@ button {
 	opacity: .85;
 	user-select: none;
 }
+
+/* Model / 思考深度 chip right under a user bubble: the settings that turn
+ * actually ran with (quick replies pin these for one turn only). */
+.user-turn-meta {
+	margin-bottom: 2px;
+}
 /* Router dispatch receipt — same right-side bubble as a user turn. */
 .dispatch-row {
 	display: block;

@@ -34,7 +34,22 @@ export interface ChromeProfileSource {
 
 export type ChromeProfileDiscoveryResult =
   | { success: true; source: ChromeProfileSource }
-  | { success: false; error: "chrome_profile_not_found" | "chrome_profile_ambiguous" };
+  | {
+      success: false;
+      error:
+        | "chrome_profile_not_found"
+        | "chrome_profile_ambiguous"
+        | "chrome_profile_access_denied";
+    };
+
+/**
+ * stat 对受 macOS TCC 保护的 Chrome 数据目录放行、open/readdir 返回 EPERM。
+ * 只有把这类权限失败与"目录不存在"区分开，才能给用户正确的修复指引。
+ */
+function isOsPermissionFailure(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EPERM" || code === "EACCES";
+}
 
 interface ChromeLocalState {
   profile?: {
@@ -132,6 +147,7 @@ async function resolveFirstExistingPath(paths: string[]): Promise<string | undef
 async function readProfileDirectoryCandidates(userDataDir: string): Promise<{
   lastUsed?: string;
   profiles: string[];
+  accessDenied?: boolean;
 }> {
   let localState: ChromeLocalState = {};
   try {
@@ -147,7 +163,11 @@ async function readProfileDirectoryCandidates(userDataDir: string): Promise<{
     for (const entry of await readdir(userDataDir, { withFileTypes: true })) {
       if (entry.isDirectory() && PROFILE_DIRECTORY_PATTERN.test(entry.name)) names.add(entry.name);
     }
-  } catch {
+  } catch (error) {
+    // 目录存在（stat 已通过）但枚举被系统拒绝：macOS 未授予完全磁盘访问时，
+    // Chrome 数据目录呈 "stat OK / readdir EPERM" 形态。必须显式上报，否则会被
+    // 误报为 chrome_profile_not_found。
+    if (isOsPermissionFailure(error)) return { profiles: [], accessDenied: true };
     return { profiles: [] };
   }
 
@@ -254,9 +274,18 @@ export async function discoverChromeProfile(
     ...standardInstallations,
   ]);
 
+  let sawAccessDeniedInstallation = false;
   for (const installation of installations) {
     if (!(await pathExists(installation.userDataDir))) continue;
-    const { lastUsed, profiles } = await readProfileDirectoryCandidates(installation.userDataDir);
+    const { lastUsed, profiles, accessDenied } = await readProfileDirectoryCandidates(
+      installation.userDataDir,
+    );
+    if (accessDenied) {
+      // Chrome 已安装且数据目录存在，但读取被操作系统拒绝。记录后继续尝试
+      // 其他候选安装（如 Canary/Chromium），全部失败时优先报权限错误。
+      sawAccessDeniedInstallation = true;
+      continue;
+    }
     // 过去只要标准 Default 目录存在就立即返回，即使里面没有 Cookie/LocalStorage，
     // 从而遮蔽同安装的真实 Profile 以及后续 Snap/Flatpak 候选。发现阶段先过滤空 Profile。
     const importableProfiles = await filterImportableProfiles(installation.userDataDir, profiles);
@@ -278,5 +307,10 @@ export async function discoverChromeProfile(
       },
     };
   }
-  return { success: false, error: "chrome_profile_not_found" };
+  return {
+    success: false,
+    error: sawAccessDeniedInstallation
+      ? "chrome_profile_access_denied"
+      : "chrome_profile_not_found",
+  };
 }

@@ -102,18 +102,14 @@ export const LSP_TOOL_DEFS = [
 	},
 ];
 
-function resolveInsideWorkspace(input: string, root: string): string {
+/** LSP tools are read-only: files outside the workspace are allowed. */
+function resolveLspFile(input: string, root: string): string {
 	const trimmed = input.trim();
 	if (!trimmed) {
 		throw new Error('file is required');
 	}
 	const abs = path.isAbsolute(trimmed) ? trimmed : path.resolve(root, trimmed);
-	const normRoot = path.resolve(root);
-	const norm = path.resolve(abs);
-	if (norm !== normRoot && !norm.startsWith(normRoot + path.sep)) {
-		throw new Error(`Path escapes workspace: ${input}`);
-	}
-	return norm;
+	return path.resolve(abs);
 }
 
 function parseSymbolLocation(
@@ -121,7 +117,7 @@ function parseSymbolLocation(
 	root: string,
 ): { uri: vscode.Uri; position: vscode.Position } {
 	const file = String(args.file ?? '');
-	const uri = vscode.Uri.file(resolveInsideWorkspace(file, root));
+	const uri = vscode.Uri.file(resolveLspFile(file, root));
 	const line = Math.max(1, Math.floor(Number(args.line ?? 1)));
 	const character = Math.max(1, Math.floor(Number(args.character ?? 1)));
 	return { uri, position: new vscode.Position(line - 1, character - 1) };
@@ -211,7 +207,7 @@ export async function executeLspTool(
 		}
 		case 'lsp_document_symbols': {
 			const file = String(args.file ?? '');
-			const uri = vscode.Uri.file(resolveInsideWorkspace(file, root));
+			const uri = vscode.Uri.file(resolveLspFile(file, root));
 			const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
 				'vscode.executeDocumentSymbolProvider',
 				uri,
